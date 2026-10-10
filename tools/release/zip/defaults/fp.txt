@@ -1,0 +1,1 @@
+fp=1 hide=body near=0.08 anchor=head turn=smooth turn_speed=90 move=head up=-0.08 forward=-0.10 arm_log=0 arm_attack=1 arm_offset=0,0.04,0.07,-105 arm_rot_l=30,25 hit=1 hit_scale=1.5 hit_reach=2.00 anim_lock=1 anim_smooth=0.25 atk_speed=3.0 face=attack face_dodge=strafe

@@ -1,0 +1,931 @@
+// SPDX-FileCopyrightText: Copyright 2026 bbport contributors
+// SPDX-License-Identifier: MIT
+
+#include "vr_game_ui.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+
+#include "sandbox3d/json.h"
+#include "sandbox3d/model.h"
+
+namespace vrui {
+
+using namespace m3;
+using Label = sb::SwingReadout::Label;
+using Result = sb::SwingReadout::Result;
+
+namespace {
+
+constexpr double kStaleS = 1.0;        // game state older than this: the UI is off
+constexpr double kPendingS = 1.5;      // a swing label without its ticket fades after this
+constexpr double kTicketMatchS = 1.0;  // a ticket opening this soon after a swing belongs to it
+constexpr double kActivityS = 3.0;     // bar "action": shown this long after a swing or a cost
+constexpr float kBodyDeadzone = 30.0f * kDeg;
+constexpr uint32_t kBareFists = 1000000;   // the game's empty hand slot (EquipParamWeapon row)
+constexpr uint32_t kFirstWeapon = 1000000; // lower weapon-category ids are not weapons one holds
+constexpr double kPendingActionS = 8.0;    // an action the host never finished: given up
+
+std::string Fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
+std::string Fmt(const char* format, ...) {
+    char text[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    return text;
+}
+
+uint32_t PadBit(sb::UiInputId id) {
+    using I = sb::UiInputId;
+    switch (id) {
+    case I::A: return BBXR_BTN_CIRCLE;
+    case I::B: return BBXR_BTN_CROSS;
+    case I::X: return BBXR_BTN_SQUARE;
+    case I::Y: return BBXR_BTN_TRIANGLE;
+    case I::DpadUp: return BBXR_BTN_UP;
+    case I::DpadDown: return BBXR_BTN_DOWN;
+    case I::DpadLeft: return BBXR_BTN_LEFT;
+    case I::DpadRight: return BBXR_BTN_RIGHT;
+    case I::Options: return BBXR_BTN_OPTIONS;
+    case I::Touchpad: return BBXR_BTN_TOUCHPAD;
+    default: return 0; // grips and triggers are analog; L3/R3 belong to the filter's own rules
+    }
+}
+
+bool ModifierHeld(sb::UiInputId id, const FrameInput& in) {
+    using I = sb::UiInputId;
+    switch (id) {
+    case I::LeftGrip: return in.squeeze[0] > 0.6f;
+    case I::RightGrip: return in.squeeze[1] > 0.6f;
+    case I::LeftTrigger: return in.trigger[0] > 0.6f;
+    case I::RightTrigger: return in.trigger[1] > 0.6f;
+    default: return PadBit(id) && (in.pad.buttons & PadBit(id));
+    }
+}
+
+bool HasMenuOn(const sb::UiLayout& layout, sb::UiInputId key) {
+    for (const std::string& name : layout.game.active) {
+        if (const sb::UiMenuSpec* m = layout.FindGameMenu(name)) {
+            if (m->open.key == key) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The "game" object of the default layout, as text (for a file written before it existed).
+std::string DefaultGameObject() {
+    const std::string text = sb::DefaultLayoutText();
+    const size_t at = text.find("\"game\": {");
+    if (at == std::string::npos) {
+        return std::string();
+    }
+    int depth = 0;
+    for (size_t i = text.find('{', at); i < text.size(); ++i) {
+        depth += text[i] == '{' ? 1 : text[i] == '}' ? -1 : 0;
+        if (depth == 0) {
+            return text.substr(at, i + 1 - at);
+        }
+    }
+    return std::string();
+}
+
+/// The "game" object's version in a layout text (0: none or no version).
+int GameVersion(const std::string& text, size_t* begin, size_t* end) {
+    const size_t at = text.find("\"game\"");
+    if (at == std::string::npos) {
+        return -1;
+    }
+    const size_t open = text.find('{', at);
+    int depth = 0;
+    size_t close = std::string::npos;
+    for (size_t i = open; open != std::string::npos && i < text.size(); ++i) {
+        depth += text[i] == '{' ? 1 : text[i] == '}' ? -1 : 0;
+        if (depth == 0) {
+            close = i;
+            break;
+        }
+    }
+    if (close == std::string::npos) {
+        return -1;
+    }
+    *begin = at;
+    *end = close + 1;
+    const std::string object = text.substr(open, close + 1 - open);
+    std::string error;
+    const json::Value v = json::Parse(object, &error);
+    return error.empty() ? v["version"].Int(0) : 0;
+}
+
+constexpr int kGameVersion = 2; // the dashboard (one button, one action)
+
+/// Adds the default "game" object to a layout file that has none (written by an older sandbox),
+/// and replaces one older than kGameVersion (the user's tuning of it is kept in a .bak copy).
+void AddGameObject(const std::filesystem::path& path, std::string& log) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return; // UiLayoutFile writes the full defaults
+    }
+    bool ok = false;
+    std::string text = sb::ReadText(path, &ok);
+    if (!ok) {
+        return;
+    }
+    size_t begin = 0, stop = 0;
+    const int version = GameVersion(text, &begin, &stop);
+    if (version >= kGameVersion) {
+        return;
+    }
+    if (version >= 0) {
+        const std::string game = DefaultGameObject();
+        if (game.empty()) {
+            return;
+        }
+        std::filesystem::copy_file(path, path.string() + ".bak",
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        text = text.substr(0, begin) + game + text.substr(stop);
+        std::ofstream file(path, std::ios::binary);
+        file << text;
+        log += "replaced the game's VR UI section (\"game\", version " + std::to_string(version) +
+               " -> " + std::to_string(kGameVersion) + ": the dashboard) in " + path.string() +
+               " (the old file: .bak)\n";
+        return;
+    }
+    const size_t end = text.find_last_of('}');
+    const std::string game = DefaultGameObject();
+    if (end == std::string::npos || game.empty()) {
+        return;
+    }
+    size_t last = end;
+    while (last > 0 && std::isspace(static_cast<unsigned char>(text[last - 1]))) {
+        --last;
+    }
+    text = text.substr(0, last) + ",\n  " + game + "\n" + text.substr(end);
+    std::ofstream file(path, std::ios::binary);
+    file << text;
+    log += "added the game's VR UI section (\"game\") to " + path.string() + "\n";
+}
+
+} // namespace
+
+std::string ItemKey(uint32_t id) {
+    if (id == BBXR_ITEM_NONE) {
+        return std::string();
+    }
+    const uint32_t category = id & 0xF0000000u;
+    const uint32_t row = id & 0x0FFFFFFFu;
+    if (category == BBXR_ITEM_GOODS) {
+        return "goods:" + std::to_string(row);
+    }
+    if (category == 0) {
+        return "weapon:" + std::to_string(row);
+    }
+    return std::string();
+}
+
+uint32_t ItemId(const std::string& key) {
+    if (key.rfind("goods:", 0) == 0) {
+        return BBXR_ITEM_GOODS | (uint32_t(std::strtoul(key.c_str() + 6, nullptr, 10)) & 0x0FFFFFFFu);
+    }
+    if (key.rfind("weapon:", 0) == 0) {
+        return uint32_t(std::strtoul(key.c_str() + 7, nullptr, 10)) & 0x0FFFFFFFu;
+    }
+    return BBXR_ITEM_NONE;
+}
+
+GunRayLook GunRayFor(const sb::UiGameLayout& game, bool in_world, bool aim_valid,
+                     double since_pull_s) {
+    GunRayLook look;
+    look.visible = game.debug_gun_ray && in_world && aim_valid;
+    look.flash = look.visible && since_pull_s >= 0.0 && since_pull_s < kGunRayFlashS;
+    look.width_m = look.flash ? 0.012f : 0.004f;
+    look.alpha = look.visible ? (look.flash ? 1.0f : 0.55f) : 0.0f;
+    return look;
+}
+
+void AimAngles(Vec3 dir, const Quat* head, float* yaw, float* pitch) {
+    auto angles = [](Vec3 d, float* y, float* p) {
+        *y = std::atan2(-d.x, -d.z);
+        *p = std::asin(std::clamp(d.y / std::max(Length(d), 1e-6f), -1.0f, 1.0f));
+    };
+    float y, p;
+    angles(dir, &y, &p);
+    if (head) {
+        float hy, hp;
+        angles(Rotate(*head, {0, 0, -1}), &hy, &hp);
+        y -= hy;
+        p -= hp;
+        while (y > kPi) y -= 2.0f * kPi;
+        while (y < -kPi) y += 2.0f * kPi;
+    }
+    *yaw = y;
+    *pitch = p;
+}
+
+GameUi::GameUi() = default;
+
+GameUi::~GameUi() {
+    Destroy();
+}
+
+bool GameUi::Load(const std::filesystem::path& assets_dir, const sb::Renderer::Device* device,
+                  std::string& log) {
+    assets = assets_dir;
+    AddGameObject(assets / "ui_layouts.json", log);
+    const bool gpu_ok = menus.LoadGame(assets, device, log);
+    hitboxes.Load(assets, log);
+    if (!hud_font.Load(assets / "ui", log)) {
+        log += "game UI: no font in " + (assets / "ui").string() +
+               " (scripts/vr_assets/ui_extract.py): the stamina bar shows, no labels\n";
+    }
+    if (device && gpu_ok) {
+        std::string error;
+        if (hud_gpu.Create(*device, error)) {
+            hud_gpu.SetAccumulateAlpha(true);
+            hud_gpu_ready = true;
+            if (hud_font.Ready() &&
+                !hud_gpu.UploadFont(hud_font.width, hud_font.height, hud_font.pixels)) {
+                log += "game UI: HUD font upload failed: " + hud_gpu.LastError() + "\n";
+            }
+        } else {
+            log += "game UI: HUD: " + error + "\n";
+        }
+    }
+    hud_font.pixels = {};
+    loaded = !device || (gpu_ok && hud_gpu_ready);
+    return loaded;
+}
+
+void GameUi::Destroy() {
+    if (hud_gpu_ready) {
+        hud_gpu.Destroy();
+        hud_gpu_ready = false;
+    }
+    std::string log;
+    if (loaded) {
+        menus.Destroy(nullptr);
+        loaded = false;
+    }
+}
+
+void GameUi::SetGameState(const BbXrGameState& s, double t) {
+    std::scoped_lock lock{mutex};
+    const size_t n = std::min<size_t>(s.size ? s.size : sizeof(s), sizeof(state));
+    state = {};
+    std::memcpy(&state, &s, n);
+    state.size = uint32_t(sizeof(state));
+    state.item_count = std::min<uint32_t>(state.item_count, BBXR_GAME_MAX_ITEMS);
+    state.quick_count = std::min<uint32_t>(state.quick_count, BBXR_GAME_MAX_QUICK);
+    ++state_seq;
+    state_at = t;
+}
+
+void GameUi::PushEvent(const BbXrGameEvent& e, double) {
+    std::scoped_lock lock{mutex};
+    if (events.size() < 256) {
+        events.push_back(e);
+    }
+}
+
+uint32_t GameUi::TakeActions(BbXrUiAction* out, uint32_t capacity) {
+    std::scoped_lock lock{mutex};
+    const uint32_t n = std::min<uint32_t>(capacity, uint32_t(actions.size()));
+    for (uint32_t i = 0; i < n; ++i) {
+        out[i] = actions[i];
+    }
+    actions.erase(actions.begin(), actions.begin() + n);
+    return n;
+}
+
+void GameUi::ApplyState(const BbXrGameState& s, std::string&) {
+    sb::UiLiveData live;
+    if (s.flags & BBXR_GAME_ITEMS) {
+        sb::UiLiveList& owned = live.lists["owned_weapons"];
+        for (uint32_t i = 0; i < s.item_count; ++i) {
+            const std::string key = ItemKey(s.items[i].id);
+            if (key.empty()) {
+                continue;
+            }
+            // Goods have counts and are used; weapons are equipped (the dashboard's weapons tab).
+            if ((s.items[i].id & 0xF0000000u) == BBXR_ITEM_GOODS) {
+                live.inventory.push_back({key, s.items[i].count});
+            } else if (s.items[i].id >= kFirstWeapon && s.items[i].id != kBareFists &&
+                       std::find(owned.items.begin(), owned.items.end(), key) == owned.items.end()) {
+                owned.items.push_back(key);
+            }
+        }
+    }
+    if (s.flags & BBXR_GAME_QUICK) {
+        sb::UiLiveList& quick = live.lists["quick"];
+        for (uint32_t i = 0; i < s.quick_count; ++i) {
+            quick.items.push_back(ItemKey(s.quick[i]));
+        }
+        if (s.quick_active < s.quick_count) {
+            live.selected["quick"] = int(s.quick_active);
+        }
+    }
+    // Equipping and quick-slot assignment go through the game's own command, run by the "VR UI
+    // Equip (HUD input)" hook (src/runtime_vr_ui.c): without it they are shown disabled.
+    if (!(s.flags & BBXR_GAME_CAN_EQUIP)) {
+        const std::string hook =
+            "the game's own equip command runs in the in-game step hook: select the patch \"VR FP "
+            "Camera Heading (in-game step)\" in BB_HOOKS; or use the game's menu (Options)";
+        live.disabled["assign_quick"] = "putting items into quick slots needs the equip hook: " + hook;
+        live.disabled["equip_inventory"] = "equipping from the inventory needs the equip hook: " + hook;
+        live.disabled["clear_quick"] = "emptying a quick slot needs the equip hook: " + hook;
+    }
+    world = sb::UiWorld{};
+    if (s.flags & BBXR_GAME_WEAPONS) {
+        // Bare Fists (1000000) is the game's placeholder for an empty hand slot.
+        const auto weapon_key = [](uint32_t id) {
+            return id == kBareFists ? std::string() : ItemKey(id);
+        };
+        sb::UiLiveList& weapons = live.lists["weapons"];
+        for (uint32_t i = 0; i < 4; ++i) {
+            weapons.items.push_back(weapon_key(s.weapons[i]));
+        }
+        world.weapon[1] = weapon_key(s.weapons[s.weapon_active[0] & 1]);
+        world.weapon[0] = weapon_key(s.weapons[2 + (s.weapon_active[1] & 1)]);
+        live.selected["weapons_right"] = int(s.weapon_active[0] & 1);
+        live.selected["weapons_left"] = 2 + int(s.weapon_active[1] & 1);
+    }
+    menus.SetLiveData(live);
+}
+
+void GameUi::AddTired(std::vector<Haptic>& haptics) {
+    const sb::UiLayout& layout = menus.Layout();
+    haptics.push_back({tired_hand, layout.game.tired.amplitude, layout.game.tired.seconds});
+    tired_second = now + 0.1;
+}
+
+void GameUi::Swings(const FrameInput& in, const BbXrGameState& s, std::vector<Haptic>& haptics) {
+    const sb::UiGameLayout& g = menus.Layout().game;
+    // The right hand's recent speeds: a swing's peak.
+    speed_window[speed_next] = in.pad.hand_speed[1];
+    speed_times[speed_next] = in.time;
+    speed_next = (speed_next + 1) % 24;
+    const uint32_t pressed = in.pad.buttons & ~prev_buttons;
+    const bool gesture = in.ms_since_swing < 200.0;
+    const bool r1 = (pressed & BBXR_BTN_R1) != 0, r2 = (pressed & BBXR_BTN_R2) != 0;
+    if ((r1 || r2) && gesture) {
+        float peak = 0.0f;
+        for (int i = 0; i < 24; ++i) {
+            if (in.time - speed_times[i] < 0.4) {
+                peak = std::max(peak, float(speed_window[i]));
+            }
+        }
+        readout.swing_no++;
+        readout.label_t = in.time;
+        readout.label_speed = peak;
+        readout.label_cost = 0.0f;
+        readout.label_paid = 0.0f;
+        readout.latency_ms = -1.0f;
+        readout.detail.clear();
+        last_activity = in.time;
+        if (filter.Engaged()) {
+            readout.label = Label::Blocked;
+            readout.result = Result::None;
+        } else if ((s.flags & BBXR_GAME_STAMINA) && s.stamina <= 0) {
+            // The game refuses an attack at 0 or below (doc 20 3.2): say so.
+            readout.label = Label::Tired;
+            readout.result = Result::None;
+            readout.refused_at = in.time;
+            AddTired(haptics);
+        } else {
+            readout.label = r2 ? Label::Heavy : Label::Light;
+            readout.result = Result::Pending;
+            const sb::UiPulse& tick = r2 ? g.tick_heavy : g.tick_light;
+            haptics.push_back({1, tick.amplitude, tick.seconds});
+        }
+    }
+    if (tired_second >= 0.0 && in.time >= tired_second) {
+        haptics.push_back({tired_hand, g.tired.amplitude, g.tired.seconds});
+        tired_second = -1.0;
+    }
+    // A swing whose ticket never came (the stamina hooks are off, or the attack had no cost).
+    if (readout.result == Result::Pending && readout.label_cost <= 0.0f &&
+        in.time - readout.label_t > kPendingS) {
+        readout.result = Result::None;
+        readout.detail = "no stamina ticket: BB_VR_STAMINA=defer and the stamina hooks";
+    }
+}
+
+void GameUi::Events(std::vector<Haptic>& haptics, std::string& log) {
+    std::deque<BbXrGameEvent> list;
+    {
+        std::scoped_lock lock{mutex};
+        list.swap(events);
+    }
+    const sb::UiGameLayout& g = menus.Layout().game;
+    for (const BbXrGameEvent& e : list) {
+        hitboxes.OnEvent(e, now);
+        switch (e.kind) {
+        case BBXR_EV_SWING_OPEN: {
+            tickets.push_back({e.c, e.a, now});
+            if (tickets.size() > 8) {
+                tickets.pop_front();
+            }
+            const bool ours = readout.result == Result::Pending && readout.label_cost <= 0.0f &&
+                              now - readout.label_t < kTicketMatchS;
+            if (!ours) {
+                // An attack the gestures did not announce (a trigger R1, a combo follow-up).
+                readout.label = e.a >= 30 ? Label::Heavy : Label::Light;
+                readout.label_t = now;
+                readout.label_speed = 0.0f;
+                readout.latency_ms = -1.0f;
+                readout.detail = "attack";
+                readout.swing_no++;
+            }
+            readout.result = Result::Pending;
+            readout.label_cost = float(e.a);
+            last_activity = now;
+            break;
+        }
+        case BBXR_EV_SWING_HIT:
+        case BBXR_EV_SWING_MISS: {
+            int32_t cost = e.kind == BBXR_EV_SWING_MISS ? e.a : 0;
+            for (auto it = tickets.begin(); it != tickets.end(); ++it) {
+                if (it->id == e.c) {
+                    cost = it->cost;
+                    tickets.erase(it);
+                    break;
+                }
+            }
+            const bool latest = readout.label_cost > 0.0f && readout.result == Result::Pending;
+            if (e.kind == BBXR_EV_SWING_HIT) {
+                readout.charged_at = now;
+                readout.charged_from = readout.stamina;
+                readout.charged_to = readout.stamina - float(e.a);
+                if (latest) {
+                    readout.result = e.b == 1 ? Result::Clang : Result::Hit;
+                    readout.label_paid = float(e.a);
+                    readout.label_t = now;
+                }
+                const bool heavy = readout.label == Label::Heavy || readout.label == Label::Charged;
+                const sb::UiPulse& pulse = heavy ? g.hit_heavy : g.hit_light;
+                haptics.push_back({1, pulse.amplitude, pulse.seconds});
+                log += Fmt("game UI: swing paid %d on %s (ticket %d)\n", int(e.a),
+                           e.b == 1 ? "a wall" : e.b == 2 ? "an object" : "a character",
+                           int(e.c));
+            } else if (latest) {
+                readout.result = Result::Miss;
+                readout.label_t = now;
+            }
+            (void)cost;
+            last_activity = now;
+            break;
+        }
+        case BBXR_EV_ACTION_DONE: {
+            const std::string what = pending.empty() ? std::string("the action") : pending;
+            pending.clear();
+            if (e.b == 0) {
+                static const char* const kWhy[] = {
+                    "", "the item is no longer there",
+                    "the game did not answer the button (a menu or an animation in the way)",
+                    "not possible now (no player, or no button does it)",
+                    "no game-thread hook ran: select the patch \"VR FP Camera Heading (in-game "
+                    "step)\" in BB_HOOKS",
+                    "the game's equip command did not put it there",
+                    "a game menu is open: close it first"};
+                Refuse("Not done: " + what, kWhy[e.c >= 1 && e.c <= 6 ? e.c : 3], log);
+                haptics.push_back({1, menus.Layout().style.haptic_empty.amplitude,
+                                   menus.Layout().style.haptic_empty.seconds});
+            } else {
+                log += "game UI: done: " + what + "\n";
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    if (!pending.empty() && now - pending_at > kPendingActionS) {
+        Refuse("Not done: " + pending, "no answer from the game side in 8 s", log);
+        pending.clear();
+    }
+    float held = 0.0f;
+    for (auto it = tickets.begin(); it != tickets.end();) {
+        if (now - it->t > 3.0) { // the host never closed it (a lost event)
+            it = tickets.erase(it);
+            continue;
+        }
+        held += float(it->cost);
+        ++it;
+    }
+    readout.pending = held;
+}
+
+void GameUi::Refuse(const std::string& what, const std::string& why, std::string& log) {
+    menus.ShowMessage(what, why, 5.0);
+    log += "game UI: " + what + ": " + why + "\n";
+}
+
+uint32_t PressBit(const std::string& name) {
+    static const struct {
+        const char* name;
+        uint32_t bit;
+    } kButtons[] = {{"options", BBXR_BTN_OPTIONS},   {"touchpad", BBXR_BTN_TOUCHPAD},
+                    {"dpad_up", BBXR_BTN_UP},        {"dpad_down", BBXR_BTN_DOWN},
+                    {"dpad_left", BBXR_BTN_LEFT},    {"dpad_right", BBXR_BTN_RIGHT},
+                    {"square", BBXR_BTN_SQUARE},     {"triangle", BBXR_BTN_TRIANGLE},
+                    {"circle", BBXR_BTN_CIRCLE},     {"cross", BBXR_BTN_CROSS},
+                    {"l3", BBXR_BTN_L3},             {"r3", BBXR_BTN_R3}};
+    for (const auto& b : kButtons) {
+        if (name == b.name) {
+            return b.bit;
+        }
+    }
+    return 0;
+}
+
+void GameUi::Act(const sb::UiAction& a, std::string& log) {
+    BbXrUiAction out{};
+    const uint32_t id = ItemId(a.item);
+    if (a.action == "recenter") {
+        if (recenter) {
+            recenter();
+        }
+        log += "game UI: recenter (dashboard)\n";
+        return;
+    }
+    if (a.action.rfind("press:", 0) == 0) {
+        const uint32_t bit = PressBit(a.action.substr(6));
+        if (!bit) {
+            log += "game UI: unknown button in \"" + a.action + "\"\n";
+            return;
+        }
+        out = {BBXR_UI_PRESS, int32_t(bit), 0, 0};
+    } else if (a.action == "select") {
+        if (a.index < 0) {
+            return;
+        }
+        out = {BBXR_UI_SELECT_QUICK, a.index, int32_t(id), 0};
+    } else if (a.action == "equip_item") {
+        // Into the hand's slot held now: 0 left 1, 1 right 1, 2 left 2, 3 right 2.
+        const int side = a.side == 0 ? 0 : 1;
+        const uint32_t held = side ? current.weapon_active[0] & 1 : current.weapon_active[1] & 1;
+        const int slot = side ? (held ? 3 : 1) : (held ? 2 : 0);
+        if (id == BBXR_ITEM_NONE || !(current.flags & BBXR_GAME_WEAPONS)) {
+            Refuse("Cannot equip " + a.item, "no weapon slots read from the game", log);
+            return;
+        }
+        out = {BBXR_UI_EQUIP_ITEM, slot, int32_t(id), 0};
+    } else if (a.action == "assign_quick" || a.action == "assign_use") {
+        int slot = -1;
+        for (uint32_t i = 0; i < current.quick_count && slot < 0; ++i) {
+            if (current.quick[i] == BBXR_ITEM_NONE) {
+                slot = int(i);
+            }
+        }
+        if (slot < 0 && current.quick_count > 0) {
+            // Every slot is full: the last one is replaced (the one you reach last with the d-pad,
+            // so the others keep their places) and the message says which. To choose, take one out
+            // first (Remove from wheel).
+            slot = int(current.quick_count) - 1;
+            menus.ShowMessage("Quick slots full",
+                              "Replaced slot " + std::to_string(slot + 1) +
+                                  "; use Remove from wheel first to choose which one goes",
+                              5.0);
+            log += Fmt("game UI: quick slots full: replacing slot %d\n", slot + 1);
+        }
+        if (slot < 0) {
+            Refuse("Cannot add " + a.item, "no quick slots read from the game", log);
+            return;
+        }
+        out = {BBXR_UI_ASSIGN_QUICK, slot, int32_t(id), a.action == "assign_use" ? 1 : 0};
+    } else if (a.action == "clear_quick") {
+        const int slot = a.source == "quick" ? a.index : -1;
+        if (slot < 0 || uint32_t(slot) >= current.quick_count ||
+            current.quick[slot] == BBXR_ITEM_NONE) {
+            Refuse("Cannot remove " + a.item, "it is in no quick slot", log);
+            return;
+        }
+        out = {BBXR_UI_CLEAR_QUICK, slot, int32_t(current.quick[slot]), 0};
+    } else if (a.action == "equip") {
+        int slot = a.source == "weapons" ? a.index : -1;
+        for (int i = 0; i < 4 && slot < 0; ++i) {
+            if (current.weapons[i] == id) {
+                slot = i;
+            }
+        }
+        if (slot < 0 || !(current.flags & BBXR_GAME_WEAPONS)) {
+            Refuse("Cannot equip " + a.item,
+                   "it is in no hand slot, and putting a weapon into a slot needs the game's "
+                   "equipment menu (Options)",
+                   log);
+            return;
+        }
+        out = {BBXR_UI_EQUIP, slot, int32_t(id), 0};
+    } else if (a.action == "use") {
+        int slot = a.source == "quick" ? a.index : -1;
+        for (uint32_t i = 0; i < current.quick_count && slot < 0; ++i) {
+            if (current.quick[i] == id) {
+                slot = int(i);
+            }
+        }
+        out = slot >= 0 ? BbXrUiAction{BBXR_UI_USE_QUICK, slot, int32_t(id), 0}
+                        : BbXrUiAction{BBXR_UI_USE_ITEM, int32_t(id), 0, 0};
+    } else {
+        log += "game UI: " + a.action + ": nothing to do\n";
+        return;
+    }
+    log += Fmt("game UI: %s %s -> action %u (%d, %d)\n", a.action.c_str(), a.item.c_str(),
+               out.kind, int(out.a), int(out.b));
+    if (out.kind == BBXR_UI_USE_ITEM) {
+        Refuse("Cannot use it from here",
+               "only items in a quick slot can be used from the dashboard (the game's "
+               "use-from-menu path is not hooked yet)",
+               log);
+        return;
+    }
+    if (!pending.empty() && now - pending_at < kPendingActionS) {
+        Refuse("Busy", "still doing: " + pending, log);
+        return;
+    }
+    pending = a.action + (a.item.empty() ? std::string() : " " + a.item);
+    pending_at = now;
+    std::scoped_lock lock{mutex};
+    if (actions.size() < 32) {
+        actions.push_back(out);
+    }
+}
+
+void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::string& log) {
+    now = in.time;
+    head_pose = in.head;
+    left_grip = in.grip[0];
+    left_aim = in.aim[0];
+    if (!hitbox_log.empty()) {
+        log += hitbox_log;
+        hitbox_log.clear();
+    }
+    BbXrGameState s;
+    uint64_t seq;
+    double at;
+    {
+        std::scoped_lock lock{mutex};
+        seq = state_seq;
+        at = state_at;
+        if (seq != applied_seq) {
+            current = state;
+        }
+    }
+    s = current;
+    if (seq != applied_seq) {
+        applied_seq = seq;
+        ApplyState(s, log);
+    }
+    const bool was_active = active;
+    active = (s.flags & BBXR_GAME_IN_WORLD) && now - at < kStaleS;
+    const sb::UiLayout& layout = menus.Layout();
+    InputFilter::Settings fs;
+    fs.enabled = active;
+    fs.r3_hold_s = layout.game.r3_hold_s;
+    fs.lock_on = layout.game.lock_on;
+    fs.r3_menu = HasMenuOn(layout, sb::UiInputId::R3);
+    fs.l3_menu = HasMenuOn(layout, sb::UiInputId::L3);
+    for (const std::string& name : layout.game.active) { // face buttons the menus open on
+        const sb::UiMenuSpec* m = layout.FindGameMenu(name);
+        if (m && m->open.modifiers.empty() &&
+            (m->open.key == sb::UiInputId::A || m->open.key == sb::UiInputId::B ||
+             m->open.key == sb::UiInputId::X || m->open.key == sb::UiInputId::Y)) {
+            fs.menu_face |= PadBit(m->open.key);
+        }
+    }
+    filter.Configure(fs);
+    const InputFilter::UiView view = filter.Step(now, in.pad);
+    {
+        double held_s;
+        bool hold;
+        if (active && filter.TakeR3Episode(held_s, hold)) { // what became of an R3 click (the wheel's hold)
+            char line[160];
+            std::snprintf(line, sizeof(line), "game UI: R3 released after %.2f s: %s (hold %.2f s, r3 menu %d, lock-on %d)\n", held_s,
+                          hold ? "the hold reached the menus" : "too short for the hold", fs.r3_hold_s, int(fs.r3_menu),
+                          int(fs.lock_on));
+            log += line;
+        }
+    }
+    if (!active) {
+        if (was_active) {
+            menus.CloseAll();
+            log += "game UI: off (no player in the world)\n";
+        }
+        filter.SetMenuState(false, false, false, false);
+        filter.SetClaim(0);
+        prev_buttons = in.pad.buttons;
+        readout.enabled = false;
+        return;
+    }
+    if (!was_active) {
+        log += "game UI: on (a player in the world)\n";
+    }
+
+    // The body's yaw: the head's, with a dead zone (the sandbox's rig does the same).
+    if (in.head.valid) {
+        const float head_yaw = YawOf(in.head.rotation);
+        if (!body_yaw_valid) {
+            body_yaw = head_yaw;
+            body_yaw_valid = true;
+        }
+        float d = head_yaw - float(body_yaw);
+        while (d > kPi) d -= 2.0f * kPi;
+        while (d < -kPi) d += 2.0f * kPi;
+        if (std::fabs(d) > kBodyDeadzone) {
+            body_yaw += d > 0.0f ? d - kBodyDeadzone : d + kBodyDeadzone;
+        }
+    }
+
+    sb::UiInput ui;
+    ui.time = in.time;
+    ui.stage = in.stage;
+    ui.floor_y = in.stage ? 0.0f : -world.eye_height_m; // LOCAL's origin is at the eyes
+    ui.head = in.head;
+    for (int h = 0; h < 2; ++h) {
+        ui.grip[h] = in.grip[h];
+        ui.aim[h] = in.aim[h];
+        ui.trigger[h] = in.trigger[h];
+        ui.squeeze[h] = in.squeeze[h];
+    }
+    ui.buttons = view.buttons;
+    // L3 with a menu other than an l3 one open closes the menus (and is used up).
+    if (view.buttons & BBXR_BTN_L3) {
+        if (!l3_consumed && menus.Engaged() && !menus.IsOpen("quick_ring")) {
+            bool l3_open = false;
+            for (const std::string& name : layout.game.active) {
+                const sb::UiMenuSpec* m = layout.FindGameMenu(name);
+                l3_open = l3_open || (m && m->open.key == sb::UiInputId::L3 && menus.IsOpen(name));
+            }
+            if (!l3_open) {
+                menus.CloseAll();
+                l3_consumed = true;
+                log += "game UI: L3: menus closed\n";
+            }
+        }
+        if (l3_consumed) {
+            ui.buttons &= ~BBXR_BTN_L3;
+        }
+    } else {
+        l3_consumed = false;
+    }
+    if (view.close_menus) {
+        menus.CloseAll();
+        log += "game UI: L3 while walking: menus closed (no jump)\n";
+    }
+    sb::UiSticks(in.pad.lx, in.pad.ly, in.pad.rx, in.pad.ry, ui.stick);
+    sb::UiBody body;
+    body.yaw = float(body_yaw);
+    for (int h = 0; h < 2; ++h) {
+        if (in.aim[h].valid) {
+            body.tip[h] = in.aim[h].position + Rotate(in.aim[h].rotation, {0, 0, -0.06f});
+            body.tip_valid[h] = true;
+        }
+    }
+    sb::UiEvents ev;
+    menus.Update(ui, body, world, ev);
+    for (const sb::UiHaptic& h : ev.haptics) {
+        haptics.push_back({h.hand, h.amplitude, h.seconds});
+    }
+    log += ev.log;
+    for (const sb::UiAction& a : ev.actions) {
+        Act(a, log);
+    }
+    bool r3_open = false;
+    for (const std::string& name : layout.game.active) {
+        const sb::UiMenuSpec* m = layout.FindGameMenu(name);
+        r3_open = r3_open || (m && m->open.key == sb::UiInputId::R3 && menus.IsOpen(name));
+    }
+    filter.SetMenuState(menus.Engaged(), r3_open, menus.UsesStick(0), menus.UsesStick(1));
+    // Combos whose modifiers are held now: their key is the menus', not the game's.
+    uint32_t claim = 0;
+    for (const std::string& name : layout.game.active) {
+        const sb::UiMenuSpec* m = layout.FindGameMenu(name);
+        if (!m || m->open.modifiers.empty()) {
+            continue;
+        }
+        bool held = true;
+        for (sb::UiInputId id : m->open.modifiers) {
+            held = held && ModifierHeld(id, in);
+        }
+        if (held) {
+            claim |= PadBit(m->open.key);
+        }
+    }
+    filter.SetClaim(claim);
+
+    // The debug gun ray: remember the pull, log the aim once per pull (rate limited).
+    ray_in_world = true;
+    if ((in.pad.buttons & BBXR_BTN_L2) && !(prev_buttons & BBXR_BTN_L2)) {
+        last_pull = now;
+        if (in.aim[0].valid && now - last_pull_log > 0.25) {
+            last_pull_log = now;
+            const Vec3 dir = Rotate(in.aim[0].rotation, {0, 0, -1});
+            float wy, wp, hy, hp;
+            AimAngles(dir, nullptr, &wy, &wp);
+            AimAngles(dir, in.head.valid ? &in.head.rotation : nullptr, &hy, &hp);
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "gun ray: L2 pull origin (%.3f %.3f %.3f) dir (%.3f %.3f %.3f) %s; "
+                          "world yaw %.1f pitch %.1f deg, head-relative yaw %.1f pitch %.1f deg\n",
+                          in.aim[0].position.x, in.aim[0].position.y, in.aim[0].position.z,
+                          dir.x, dir.y, dir.z, in.stage ? "STAGE" : "LOCAL", wy / kDeg,
+                          wp / kDeg, hy / kDeg, hp / kDeg);
+            log += buf;
+        }
+    }
+
+    // The swing HUD.
+    Swings(in, s, haptics);
+    Events(haptics, log);
+    prev_buttons = in.pad.buttons;
+    readout.now = now;
+    const bool stamina = (s.flags & BBXR_GAME_STAMINA) != 0;
+    readout.stamina = stamina ? float(s.stamina) : 0.0f;
+    readout.max = stamina ? float(std::max(s.stamina_max, 1)) : 1.0f;
+    readout.can_act = !stamina || s.stamina > 0;
+    const bool recent = now - last_activity < kActivityS ||
+                        readout.result == Result::Pending;
+    readout.enabled = layout.game.hud && stamina && (layout.game.bar != "action" || recent);
+}
+
+void GameUi::DrawGunRay(const sb::UiGameLayout& g) {
+    const GunRayLook look = GunRayFor(g, ray_in_world, left_aim.valid, now - last_pull);
+    if (!look.visible) {
+        return;
+    }
+    const Vec3 dir = Rotate(left_aim.rotation, {0, 0, -1});
+    const float length = g.debug_gun_ray_length_m;
+    const Vec3 from = left_aim.position, to = from + dir * length;
+    const Vec3 mid = from + dir * (length * 0.5f);
+    sb::UiPanel beam;
+    beam.origin = mid;
+    beam.x = dir;
+    beam.z = Normalize(Perp(head_pose.position - mid, dir), AnyPerp(dir));
+    beam.y = Cross(beam.z, beam.x);
+    hud_canvas.on_top = true;
+    hud_canvas.alpha = look.alpha;
+    hud_canvas.Box(beam, 0.0f, 0.0f, length, look.width_m, g.debug_gun_ray_color);
+    const sb::UiPanel dot = sb::UiPanel::Facing(to, head_pose.position, {0, 1, 0});
+    const float r = look.flash ? 0.12f : 0.06f; // grows with the distance it is seen from
+    hud_canvas.alpha = 1.0f;
+    hud_canvas.Disc(dot, 0, 0, r * 1.3f, {1, 1, 1, 0.9f});
+    hud_canvas.Disc(dot, 0, 0, r, g.debug_gun_ray_color);
+    hud_canvas.on_top = false;
+}
+
+bool GameUi::Build() {
+    if (!active) {
+        hud_canvas.Clear();
+        menus.Build(); // empties the menus' geometry too
+        ray_in_world = false;
+        hud_visible = false;
+        if (hud_gpu_ready) {
+            hud_gpu.SetGeometry(hud_canvas);
+        }
+        return false;
+    }
+    menus.Build();
+    hud_canvas.Clear();
+    const sb::UiGameLayout& g = menus.Layout().game;
+    sb::SwingHudConfig c;
+    c.head = g.hud_head;
+    c.wrist = g.hud_wrist;
+    c.distance = g.hud_distance;
+    c.down_deg = g.hud_down_deg;
+    c.scale = g.hud_scale;
+    c.wrist_scale = g.wrist_scale;
+    c.wrist_offset = g.wrist_offset;
+    c.label_s = g.label_s;
+    c.speed = false;  // the game's swings are xr_input's speed thresholds, no live classifier
+    c.popups = false; // no hit point from the game yet
+    hud_canvas.outline = 0.12f;
+    sb::DrawSwingHud(hud_canvas, readout, c, head_pose, left_grip);
+    DrawGunRay(g);
+    hud_canvas.on_top = false;
+    hud_canvas.alpha = 1.0f;
+    hitboxes.Draw(hud_canvas, g.debug_hitboxes, current, now, head_pose.position, hitbox_log);
+    hud_visible = !hud_canvas.world.empty() || !hud_canvas.top.empty();
+    if (hud_gpu_ready) {
+        hud_gpu.SetGeometry(hud_canvas);
+    }
+    return hud_visible || menus.Visible();
+}
+
+void GameUi::Draw(VkCommandBuffer cmd, const Mat4& view_proj, VkFormat color) {
+    if (sb::DrawHook* gpu = menus.Gpu()) {
+        gpu->Draw(cmd, view_proj, color, VK_FORMAT_UNDEFINED);
+    }
+    if (hud_gpu_ready) {
+        hud_gpu.Draw(cmd, view_proj, color, VK_FORMAT_UNDEFINED);
+    }
+}
+
+} // namespace vrui

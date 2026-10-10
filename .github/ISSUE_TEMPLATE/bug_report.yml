@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in the Bloodborne VR alpha does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. **Do not attach game files, dumps, extracted assets or save files.**
+        This alpha is single-player only; online / co-op issues are out of scope.
+  - type: input
+    id: version
+    attributes:
+      label: Release version
+      description: From the zip name (BloodborneVR-x.y.z) or `COMMIT.txt`.
+    validations:
+      required: true
+  - type: input
+    id: crash_id
+    attributes:
+      label: Crash id (if you opted in to crash reports)
+      description: The id the game printed after the crash. Leave empty if there was no crash or you did not opt in.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Steps to reproduce, where in the game, how often.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Paste or attach `logs/bbvr-latest.log` (the last 200 lines are enough for a crash).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: For example "RTX 4070, 560.94". Output of `bin\bb-gpu-capabilities.exe` helps.
+    validations:
+      required: true
+  - type: input
+    id: headset
+    attributes:
+      label: Headset and OpenXR runtime
+      description: For example "Quest 3 via Virtual Desktop, runtime VDXR" or "Pimax Crystal, Pimax Play".
+    validations:
+      required: true
+  - type: dropdown
+    id: version_game
+    attributes:
+      label: Game version (param.sfo APP_VER)
+      options: ["1.09", "other (unsupported)"]
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Checks
+      options:
+        - label: I own the game, and this report contains no game files or save data.
+          required: true

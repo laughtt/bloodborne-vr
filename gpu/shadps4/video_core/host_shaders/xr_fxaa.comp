@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport VR (BB_XR_AA=fxaa, docs/vr/findings/30-vr-image-quality.md): spatial anti-aliasing of the
+// game frame before it goes to an eye. One frame in, one frame out, no history: safe with
+// alternate-eye stereo, where every temporal pass would mix the two eyes' images.
+//
+// An edge-directed pass in the manner of FXAA 3.11 "Quality" as published by Timothy Lottes
+// (NVIDIA, 2011): local contrast test, horizontal/vertical edge choice, search along the edge for
+// its ends, a blend across the edge by the position along it, plus a sub-pixel term. This file is
+// an independent implementation of that published algorithm, not NVIDIA's source.
+//
+// Input: the display image through an sRGB view (linear values); luma is taken perceptually
+// (sqrt of linear luminance). Output: RGBA16F linear, consumed by the FSR1 and post passes.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D InputTexture;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D OutputTexture;
+layout(set = 0, binding = 2) uniform sampler InputSampler;
+
+layout(push_constant) uniform Params {
+    vec2 inv_size;
+    ivec2 size;
+    float subpix;         // amount of sub-pixel aliasing removal (0 off .. 1 soft)
+    float edge_threshold; // local contrast needed, relative to the local maximum
+    float edge_min;       // and at least this much (dark areas)
+    float pad;
+} p;
+
+vec3 Fetch(vec2 uv) {
+    return textureLod(sampler2D(InputTexture, InputSampler), uv, 0.0).rgb;
+}
+
+float Luma(vec3 c) {
+    return sqrt(max(dot(c, vec3(0.299, 0.587, 0.114)), 0.0));
+}
+
+float LumaAt(vec2 uv) {
+    return Luma(Fetch(uv));
+}
+
+const int STEPS = 10;
+const float STEP_SIZE[STEPS] = float[](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 12.0);
+
+void main() {
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= p.size.x || pix.y >= p.size.y) {
+        return;
+    }
+    const vec2 inv = p.inv_size;
+    vec2 uv = (vec2(pix) + 0.5) * inv;
+    const vec3 rgb_m = Fetch(uv);
+    const float l_m = Luma(rgb_m);
+    float l_n = LumaAt(uv + vec2(0.0, -inv.y));
+    float l_s = LumaAt(uv + vec2(0.0, inv.y));
+    const float l_w = LumaAt(uv + vec2(-inv.x, 0.0));
+    const float l_e = LumaAt(uv + vec2(inv.x, 0.0));
+    const float l_max = max(max(max(l_n, l_s), max(l_w, l_e)), l_m);
+    const float l_min = min(min(min(l_n, l_s), min(l_w, l_e)), l_m);
+    const float range = l_max - l_min;
+    if (range < max(p.edge_min, l_max * p.edge_threshold)) {
+        imageStore(OutputTexture, pix, vec4(rgb_m, 1.0));
+        return;
+    }
+    const float l_nw = LumaAt(uv + vec2(-inv.x, -inv.y));
+    const float l_ne = LumaAt(uv + vec2(inv.x, -inv.y));
+    const float l_sw = LumaAt(uv + vec2(-inv.x, inv.y));
+    const float l_se = LumaAt(uv + vec2(inv.x, inv.y));
+
+    // Second derivatives across rows (a horizontal edge) and across columns (a vertical one).
+    const float l_ns = l_n + l_s;
+    const float l_we = l_w + l_e;
+    const float edge_horz = abs(-2.0 * l_w + l_nw + l_sw) + 2.0 * abs(-2.0 * l_m + l_ns) +
+                            abs(-2.0 * l_e + l_ne + l_se);
+    const float edge_vert = abs(-2.0 * l_n + l_nw + l_ne) + 2.0 * abs(-2.0 * l_m + l_we) +
+                            abs(-2.0 * l_s + l_sw + l_se);
+    const bool horz = edge_horz >= edge_vert;
+
+    // Sub-pixel term: how far the center stands out of its 3x3 average.
+    const float average = (2.0 * (l_ns + l_we) + (l_nw + l_ne + l_sw + l_se)) / 12.0;
+    const float sub_c = clamp(abs(average - l_m) / range, 0.0, 1.0);
+    const float sub_f = (-2.0 * sub_c + 3.0) * sub_c * sub_c;
+    const float sub_h = sub_f * sub_f * p.subpix;
+
+    // The neighbour across the edge with the larger gradient.
+    if (!horz) {
+        l_n = l_w;
+        l_s = l_e;
+    }
+    float step_len = horz ? inv.y : inv.x;
+    const float grad_n = abs(l_n - l_m);
+    const float grad_s = abs(l_s - l_m);
+    const bool pair_n = grad_n >= grad_s;
+    const float gradient = max(grad_n, grad_s);
+    if (pair_n) {
+        step_len = -step_len;
+    }
+    const float l_pair = 0.5 * ((pair_n ? l_n : l_s) + l_m);
+
+    // Walk along the edge (on the boundary between the two rows) until the pair's average luma
+    // changes by a quarter of the gradient: the ends of the edge.
+    vec2 pos_b = uv;
+    if (horz) {
+        pos_b.y += step_len * 0.5;
+    } else {
+        pos_b.x += step_len * 0.5;
+    }
+    const vec2 along = horz ? vec2(inv.x, 0.0) : vec2(0.0, inv.y);
+    vec2 pos_n = pos_b - along;
+    vec2 pos_p = pos_b + along;
+    float end_n = LumaAt(pos_n) - l_pair;
+    float end_p = LumaAt(pos_p) - l_pair;
+    const float scaled = gradient * 0.25;
+    bool done_n = abs(end_n) >= scaled;
+    bool done_p = abs(end_p) >= scaled;
+    for (int i = 1; i < STEPS && !(done_n && done_p); ++i) {
+        if (!done_n) {
+            pos_n -= along * STEP_SIZE[i];
+            end_n = LumaAt(pos_n) - l_pair;
+            done_n = abs(end_n) >= scaled;
+        }
+        if (!done_p) {
+            pos_p += along * STEP_SIZE[i];
+            end_p = LumaAt(pos_p) - l_pair;
+            done_p = abs(end_p) >= scaled;
+        }
+    }
+    const float dist_n = horz ? uv.x - pos_n.x : uv.y - pos_n.y;
+    const float dist_p = horz ? pos_p.x - uv.x : pos_p.y - uv.y;
+    const bool center_below = l_m - l_pair < 0.0;
+    const bool good_n = (end_n < 0.0) != center_below;
+    const bool good_p = (end_p < 0.0) != center_below;
+    const bool toward_n = dist_n < dist_p;
+    const float dist = min(dist_n, dist_p);
+    const bool good = toward_n ? good_n : good_p;
+    const float span = max(dist_n + dist_p, 1e-6);
+    const float offset_edge = good ? 0.5 - dist / span : 0.0;
+    const float offset = max(offset_edge, sub_h);
+    if (horz) {
+        uv.y += offset * step_len;
+    } else {
+        uv.x += offset * step_len;
+    }
+    imageStore(OutputTexture, pix, vec4(Fetch(uv), 1.0));
+}

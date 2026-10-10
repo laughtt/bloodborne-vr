@@ -1,0 +1,348 @@
+/* Unit tests for src/vr_arm_math.h, the arm IK the game (src/runtime_vr_arms.c) and the 3D sandbox
+ * (gpu/xr_bridge/sandbox3d/rig.cpp) share (docs/vr/findings/24-arms-ik.md). Written in the common
+ * subset of C and C++: tests/test_vr_arms_cpp.cpp compiles this same file as C++. Build: ninja -C
+ * out/gpu vr-arms-test vr-arms-test-cpp (no GPU, no game). Prints PASS lines; exit 0. */
+#include "vr_arm_math.h"
+#include "vr_fp_math.h"
+#include <stdio.h>
+
+static int failures, checks;
+#define CHECK(cond, ...) do { ++checks; if (!(cond)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); ++failures; } } while (0)
+
+static int near_v(VrVec3 a, VrVec3 b, float eps) { return vam_len(vr_sub(a, b)) <= eps; }
+static int near_f(float a, float b, float eps) { return fabsf(a - b) <= eps; }
+static VrVec3 mirror_v(VrVec3 v) { return vr_v3(-v.x, v.y, v.z); }
+static VrQuat mirror_q(VrQuat q) { return vr_q(q.x, -q.y, -q.z, q.w); }
+/* Same rotation (q and -q). */
+static int near_q(VrQuat a, VrQuat b, float eps) {
+    const float d = fabsf(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+    return d >= 1.0f - eps;
+}
+
+/* The game's right arm in the bind pose (findings/13 2.2: A-pose, arms 45 deg down, R at -X), each
+ * bone's local +X along its segment, the face toward -Z. */
+static VamArmBind right_bind(void) {
+    VamArmBind b;
+    memset(&b, 0, sizeof(b));
+    b.upper = vr_v3(-0.171f, 1.440f, 0.033f);
+    b.fore = vr_v3(-0.371f, 1.240f, 0.033f);
+    b.hand = vr_v3(-0.564f, 1.047f, 0.033f);
+    const VrVec3 d1 = vam_norm(vr_sub(b.fore, b.upper), vr_v3(1, 0, 0));
+    const VrVec3 d2 = vam_norm(vr_sub(b.hand, b.fore), vr_v3(1, 0, 0));
+    b.upper_rot = vam_from_to(vr_v3(1, 0, 0), d1);
+    b.fore_rot = vam_from_to(vr_v3(1, 0, 0), d2);
+    b.hand_rot = b.fore_rot;
+    b.twist_rot = b.fore_rot;
+    b.twist1_rot = b.fore_rot;
+    b.has_twist = b.has_twist1 = 1;
+    b.twist1_t = 0.5f;
+    /* knuckles further along the forearm, the thumb toward the front (-Z) */
+    vam_bind_hand_frame(&b, vr_add(b.hand, vr_scale(d2, 0.09f)), vr_add(b.hand, vr_v3(0.0f, 0.0f, -0.04f)));
+    return b;
+}
+static VamArmParams right_params(void) {
+    VamArmParams p;
+    p.pole = vam_norm(vr_v3(-0.4f, -0.85f, 0.35f), vr_v3(0, -1, 0)); /* out (-X), down, back (+Z) */
+    p.arm_scale = 1.0f;
+    p.twist_share = 1.0f;
+    return p;
+}
+/* Forward kinematics with the bind locals: where the game's model pose puts the elbow and the wrist
+ * once the new rotations are written (child = parent . bind local). */
+static void fk(const VamArmBind *b, const VamArmPose *o, VrVec3 *elbow, VrVec3 *wrist) {
+    *elbow = vr_add(o->shoulder, vr_qrotate(vr_qmul(o->upper_rot, vr_qconj(b->upper_rot)), vr_sub(b->fore, b->upper)));
+    *wrist = vr_add(*elbow, vr_qrotate(vr_qmul(o->fore_rot, vr_qconj(b->fore_rot)), vr_sub(b->hand, b->fore)));
+}
+
+static void test_math(void) {
+    const VrQuat f = vam_from_to(vr_v3(1, 0, 0), vr_v3(0, 0, 1));
+    CHECK(near_v(vr_qrotate(f, vr_v3(1, 0, 0)), vr_v3(0, 0, 1), 1e-5f), "from_to");
+    const VrQuat g = vam_from_to(vr_v3(0, 1, 0), vr_v3(0, -1, 0));
+    CHECK(near_v(vr_qrotate(g, vr_v3(0, 1, 0)), vr_v3(0, -1, 0), 1e-5f), "from_to opposite");
+    const VrQuat qs[4] = {vr_xr_ypr(0.3f, -0.2f, 1.1f), vr_xr_ypr(3.0f, 0.1f, 0.0f), vr_xr_ypr(-1.5f, 1.4f, -2.9f),
+                          vr_q(0.0f, 0.0f, 1.0f, 0.0f)};
+    for (int i = 0; i < 4; ++i) {
+        float m[3][3];
+        vr_qmat3(qs[i], m);
+        const VrQuat back = vam_quat_from_columns(vr_v3(m[0][0], m[1][0], m[2][0]), vr_v3(m[0][1], m[1][1], m[2][1]),
+                                                  vr_v3(m[0][2], m[1][2], m[2][2]));
+        CHECK(near_q(back, qs[i], 1e-5f), "matrix -> quaternion round trip %d", i);
+    }
+    const VrQuat fr = vam_frame(vr_v3(0, 0, -1), vr_v3(0, 1, 0));
+    CHECK(near_v(vr_qrotate(fr, vr_v3(1, 0, 0)), vr_v3(0, 0, -1), 1e-5f) &&
+          near_v(vr_qrotate(fr, vr_v3(0, 1, 0)), vr_v3(0, 1, 0), 1e-5f), "frame");
+    CHECK(near_f(vam_signed_angle(vr_v3(1, 0, 0), vr_v3(0, 0, -1), vr_v3(0, 1, 0)), VR_PI / 2, 1e-5f), "signed angle");
+    printf("PASS math\n");
+}
+
+static void test_two_bone(void) {
+    const VrVec3 s = vr_v3(0, 0, 0);
+    VrVec3 w;
+    int clamped = 1;
+    const VrVec3 e = vam_two_bone(s, vr_v3(0.4f, 0, 0), 0.3f, 0.3f, vr_v3(0, -1, 0), &w, &clamped);
+    CHECK(!clamped && near_v(w, vr_v3(0.4f, 0, 0), 1e-5f), "reached");
+    CHECK(near_f(vam_len(e), 0.3f, 1e-4f) && near_f(vam_len(vr_sub(w, e)), 0.3f, 1e-4f), "lengths");
+    CHECK(e.y < 0.0f, "toward the pole");
+    vam_two_bone(s, vr_v3(2.0f, 0, 0), 0.3f, 0.3f, vr_v3(0, -1, 0), &w, &clamped);
+    CHECK(clamped && w.x > 0.59f && w.x < 0.6f, "out of reach: clamped along the ray (%f)", w.x);
+    vam_two_bone(s, vr_v3(0.0f, 0, 0), 0.3f, 0.25f, vr_v3(0, -1, 0), &w, &clamped);
+    CHECK(clamped && vam_len(w) >= 0.05f - 1e-3f, "at the shoulder: pushed out to |a-b|");
+    /* the pole along the reach direction: still a valid elbow */
+    const VrVec3 e2 = vam_two_bone(s, vr_v3(0.0f, -0.4f, 0), 0.3f, 0.3f, vr_v3(0, -1, 0), &w, &clamped);
+    CHECK(near_f(vam_len(e2), 0.3f, 1e-4f) && isfinite(e2.x), "pole along the reach");
+    const VrQuat r = vam_aim_with_twist(vr_v3(1, 0, 0), vr_v3(0, 0, -1), vr_v3(0, 1, 0), vr_v3(1, 0, 0));
+    CHECK(near_v(vr_qrotate(r, vr_v3(1, 0, 0)), vr_v3(0, 0, -1), 1e-4f), "aim: the segment");
+    CHECK(near_v(vr_qrotate(r, vr_v3(0, 1, 0)), vr_v3(1, 0, 0), 1e-4f), "aim: the roll");
+    printf("PASS two-bone\n");
+}
+
+static void test_arm(void) {
+    const VamArmBind b = right_bind();
+    const VamArmParams p = right_params();
+    const float a = vam_upper_len(&b), c = vam_fore_len(&b);
+    CHECK(near_f(a, 0.283f, 2e-3f) && near_f(c, 0.273f, 2e-3f), "the game's lengths: %f %f", a, c);
+    /* hand in front of the chest, below the shoulder */
+    const VrVec3 shoulder = b.upper;
+    const VrVec3 target = vr_add(shoulder, vr_v3(0.05f, -0.25f, -0.32f));
+    VamArmPose o;
+    vam_solve_arm(&b, shoulder, target, b.hand_rot, &p, &o);
+    CHECK(!o.clamped && near_v(o.wrist, target, 1e-4f), "reached");
+    VrVec3 fe, fw;
+    fk(&b, &o, &fe, &fw);
+    CHECK(near_v(fe, o.elbow, 1e-4f) && near_v(fw, target, 1e-3f), "the bind locals rebuild the solved chain (FK %f)", vam_len(vr_sub(fw, target)));
+    CHECK(vr_dot(vr_sub(o.elbow, vam_lerp(shoulder, target, 0.5f)), p.pole) > 0.0f, "elbow toward the pole");
+    CHECK(o.elbow.y < shoulder.y && o.elbow.x < shoulder.x, "elbow down and out (R side -X)");
+    /* continuity: 1 mm target steps move the elbow smoothly */
+    float worst = 0.0f;
+    VrVec3 prev = o.elbow;
+    for (int i = 0; i <= 600; ++i) {
+        const float t = (float)i / 600.0f;
+        const VrVec3 tt = vr_add(shoulder, vr_v3(0.25f * sinf(6.0f * t) - 0.1f, -0.45f + 0.6f * t, -0.2f - 0.15f * cosf(4.0f * t)));
+        vam_solve_arm(&b, shoulder, tt, b.hand_rot, &p, &o);
+        const float jump = vam_len(vr_sub(o.elbow, prev));
+        if (i > 0 && jump > worst) worst = jump;
+        prev = o.elbow;
+        fk(&b, &o, &fe, &fw);
+        if (!near_v(fw, o.wrist, 2e-3f)) { CHECK(0, "FK at step %d", i); break; }
+    }
+    CHECK(worst < 0.02f, "no elbow flips along a path (worst step %.4f m)", worst);
+    /* out of reach */
+    vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(0, 0, -2.0f)), b.hand_rot, &p, &o);
+    CHECK(o.clamped && vam_len(vr_sub(o.wrist, shoulder)) <= a + c + 1e-4f && o.reach > 3.0f, "clamped");
+    /* the twist bones: with the hand rolled 60 deg about the forearm, Twist takes it all, Twist1 half */
+    vam_solve_arm(&b, shoulder, target, b.hand_rot, &p, &o);
+    const VrVec3 fore_dir = vam_norm(vr_sub(o.wrist, o.elbow), vr_v3(1, 0, 0));
+    const VrQuat rolled = vr_qmul(vam_axis_angle(fore_dir, 1.0472f), o.fore_rot);
+    const VrQuat base_fore = o.fore_rot;
+    vam_solve_arm(&b, shoulder, target, rolled, &p, &o);
+    const VrVec3 t0 = vr_qrotate(vr_qmul(base_fore, vr_qconj(b.fore_rot)), b.thumb);
+    const VrVec3 t1 = vr_qrotate(vr_qmul(o.twist_rot, vr_qconj(b.twist_rot)), b.thumb);
+    const VrVec3 t2 = vr_qrotate(vr_qmul(o.twist1_rot, vr_qconj(b.twist1_rot)), b.thumb);
+    const float r1 = vam_signed_angle(vam_norm(vam_perp(t0, fore_dir), t0), vam_norm(vam_perp(t1, fore_dir), t1), fore_dir);
+    const float r2 = vam_signed_angle(vam_norm(vam_perp(t0, fore_dir), t0), vam_norm(vam_perp(t2, fore_dir), t2), fore_dir);
+    CHECK(near_f(r1, 1.0472f, 0.02f) && near_f(r2, 0.5236f, 0.02f), "twist shares: %f %f", r1, r2);
+    CHECK(near_v(o.twist1_pos, vam_lerp(o.elbow, o.wrist, 0.5f), 1e-5f), "twist1 mid forearm");
+    printf("PASS arm\n");
+}
+
+/* The same solve in the mirrored frame (the sandbox's: x -> -x) gives the mirrored answer: the
+ * game's left-handed model space and the sandbox's right-handed one share the code. */
+static void test_mirror(void) {
+    const VamArmBind b = right_bind();
+    const VamArmParams p = right_params();
+    VamArmBind m = b;
+    m.upper = mirror_v(b.upper); m.fore = mirror_v(b.fore); m.hand = mirror_v(b.hand);
+    m.upper_rot = mirror_q(b.upper_rot); m.fore_rot = mirror_q(b.fore_rot); m.hand_rot = mirror_q(b.hand_rot);
+    m.twist_rot = mirror_q(b.twist_rot); m.twist1_rot = mirror_q(b.twist1_rot);
+    m.fingers = mirror_v(b.fingers); m.thumb = mirror_v(b.thumb);
+    VamArmParams mp = p;
+    mp.pole = mirror_v(p.pole);
+    const VrVec3 target = vr_add(b.upper, vr_v3(0.1f, -0.2f, -0.35f));
+    const VrQuat hand = vr_qmul(vr_xr_ypr(0.4f, -0.3f, 0.7f), b.hand_rot);
+    VamArmPose o, om;
+    vam_solve_arm(&b, b.upper, target, hand, &p, &o);
+    vam_solve_arm(&m, m.upper, mirror_v(target), mirror_q(hand), &mp, &om);
+    CHECK(near_v(om.elbow, mirror_v(o.elbow), 1e-5f) && near_v(om.wrist, mirror_v(o.wrist), 1e-5f), "mirrored joints");
+    CHECK(near_q(om.upper_rot, mirror_q(o.upper_rot), 1e-5f) && near_q(om.fore_rot, mirror_q(o.fore_rot), 1e-5f) &&
+          near_q(om.twist_rot, mirror_q(o.twist_rot), 1e-4f), "mirrored rotations");
+    /* the hand basis too */
+    const VrQuat h = vam_hand_rotation(vr_qidentity(), vr_v3(0, 0, -1), vr_v3(0, 1, 0), b.fingers, b.thumb, b.hand_rot);
+    const VrQuat hm = vam_hand_rotation(vr_qidentity(), vr_v3(0, 0, -1), vr_v3(0, 1, 0), m.fingers, m.thumb, m.hand_rot);
+    CHECK(near_q(hm, mirror_q(h), 1e-5f), "mirrored hand rotation");
+    /* the grip offset mirrors as the sandbox's (x, euler y, euler z negated) */
+    VrVec3 op;
+    VrQuat oq;
+    const VrQuat off = vr_qmul(vr_qmul(vam_axis_angle(vr_v3(0, 0, 1), 0.2f), vam_axis_angle(vr_v3(0, 1, 0), 0.3f)),
+                               vam_axis_angle(vr_v3(1, 0, 0), -0.26f));
+    vam_side_offset(0, vr_v3(0.01f, -0.01f, 0.07f), off, &op, &oq);
+    const VrQuat expect = vr_qmul(vr_qmul(vam_axis_angle(vr_v3(0, 0, 1), -0.2f), vam_axis_angle(vr_v3(0, 1, 0), -0.3f)),
+                                  vam_axis_angle(vr_v3(1, 0, 0), -0.26f));
+    CHECK(near_v(op, vr_v3(-0.01f, -0.01f, 0.07f), 1e-6f) && near_q(oq, expect, 1e-5f), "left offset");
+    printf("PASS mirror\n");
+}
+
+static void test_hand(void) {
+    const VamArmBind b = right_bind();
+    /* a grip with no rotation (OpenXR/sandbox axes): fingers along -Z, thumb up */
+    const VrQuat h = vam_hand_rotation(vr_qidentity(), vr_v3(0, 0, -1), vr_v3(0, 1, 0), b.fingers, b.thumb, b.hand_rot);
+    const VrQuat delta = vr_qmul(h, vr_qconj(b.hand_rot));
+    CHECK(near_v(vr_qrotate(delta, b.fingers), vr_v3(0, 0, -1), 1e-4f), "fingers along the grip");
+    CHECK(near_v(vr_qrotate(delta, b.thumb), vr_v3(0, 1, 0), 1e-4f), "thumb up");
+    /* a grip turned 90 deg to the left: the fingers follow */
+    const VrQuat left = vam_axis_angle(vr_v3(0, 1, 0), VR_PI / 2);
+    const VrQuat h2 = vam_hand_rotation(left, vr_v3(0, 0, -1), vr_v3(0, 1, 0), b.fingers, b.thumb, b.hand_rot);
+    CHECK(near_v(vr_qrotate(vr_qmul(h2, vr_qconj(b.hand_rot)), b.fingers), vr_v3(-1, 0, 0), 1e-4f), "turned grip");
+    /* the wrist sits behind the grip by the offset */
+    VrVec3 w;
+    VrQuat r;
+    vam_grip_wrist(vr_v3(1, 1, 1), left, vr_v3(0, -0.01f, 0.07f), vr_qidentity(), &w, &r);
+    CHECK(near_v(w, vr_v3(1.07f, 0.99f, 1.0f), 1e-5f), "wrist offset in the grip frame");
+    /* the rest pose */
+    VrVec3 fingers, thumb;
+    const VrVec3 rest = vam_rest_target(b.upper, vr_v3(-1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, -1), 0.0f, -0.3f, 0.32f,
+                                        20.0f * VR_DEG, &fingers, &thumb);
+    CHECK(near_v(rest, vr_add(b.upper, vr_v3(0, -0.3f, -0.32f)), 1e-6f), "rest wrist");
+    CHECK(near_f(vr_dot(fingers, thumb), 0.0f, 1e-5f) && fingers.y < 0.0f && fingers.z < 0.0f && thumb.y > 0.9f, "rest axes");
+    printf("PASS hand\n");
+}
+
+/* First person in the game: a controller in front of / right of the headset ends in front of /
+ * right of the character's face (R bones are at model -X, the face looks along -Z). */
+static void test_game_mapping(void) {
+    const float yaw = 0.7f;                  /* physics yaw: model +Z heads this way */
+    const VrVec3 pos = vr_v3(10.0f, -3.0f, 5.0f);
+    const VrVec3 eye_model = vr_v3(0.0f, 1.6f, -0.1f);
+    const float heading = vr_facing_heading(yaw); /* the camera looks where the face does */
+    float cam[4][4];
+    vr_cam_from_heading(cam, heading, vr_model_to_world(pos, yaw, eye_model));
+    VrVec3 cp;
+    VrQuat cq;
+    vam_camera_in_model((const float (*)[4])cam, pos, yaw, &cp, &cq);
+    CHECK(near_v(cp, eye_model, 1e-4f), "camera position in model space");
+    CHECK(near_v(vr_qrotate(cq, vr_v3(0, 0, 1)), vr_v3(0, 0, -1), 1e-4f), "camera forward = model -Z (the face)");
+    CHECK(near_v(vr_qrotate(cq, vr_v3(1, 0, 0)), vr_v3(-1, 0, 0), 1e-4f), "camera right = model -X (the R side)");
+    /* head turned and moved; the grip 0.3 m forward, 0.2 right, 0.25 down of the head in the head's frame */
+    const VrQuat head = vr_xr_ypr(0.0f, 0.0f, 0.0f);
+    const VrVec3 head_p = vr_v3(0.5f, 1.7f, -0.2f);
+    const VrVec3 grip_p = vr_add(head_p, vr_v3(0.2f, -0.25f, -0.3f));
+    VrVec3 gp;
+    VrQuat gq;
+    vam_xr_in_head_game(head_p, head, grip_p, vr_qidentity(), &gp, &gq);
+    CHECK(near_v(gp, vr_v3(0.2f, -0.25f, 0.3f), 1e-5f), "grip in the camera frame (+Z forward)");
+    const VrVec3 hand_model = vr_add(cp, vr_qrotate(cq, gp));
+    CHECK(near_v(hand_model, vr_add(eye_model, vr_v3(-0.2f, -0.25f, -0.3f)), 1e-4f), "grip in model space: in front, R side");
+    /* the grip's fingers: OpenXR -Z mirrored to +Z in the camera frame, then the face direction */
+    CHECK(near_v(vr_qrotate(vr_qmul(cq, gq), vr_v3(0, 0, 1)), vr_v3(0, 0, -1), 1e-4f), "grip fingers forward");
+    /* a head turned 30 deg left: the same grip relative to the head turns with it */
+    const VrQuat head_l = vr_xr_ypr(30.0f * VR_DEG, 0.0f, 0.0f);
+    const VrVec3 grip_l = vr_add(head_p, vr_qrotate(head_l, vr_v3(0.0f, 0.0f, -0.4f)));
+    vam_xr_in_head_game(head_p, head_l, grip_l, head_l, &gp, &gq);
+    CHECK(near_v(gp, vr_v3(0, 0, 0.4f), 1e-5f) && near_q(gq, vr_qidentity(), 1e-5f), "head-relative");
+    /* the camera turned with the head (level H1 camera: R(heading) . head) keeps the grip where it is in the world */
+    float cam_l[4][4];
+    vr_cam_from_heading(cam_l, heading, vr_model_to_world(pos, yaw, eye_model));
+    vr_cam_compose(cam_l, vr_head_rel_game(head_l, vr_qidentity()), vr_v3(0, 0, 0), 1);
+    vam_camera_in_model((const float (*)[4])cam_l, pos, yaw, &cp, &cq);
+    const VrVec3 hm = vr_add(cp, vr_qrotate(cq, gp));
+    /* 30 deg to the user's left = toward the character's left = model +X, ahead = -Z */
+    CHECK(near_v(hm, vr_add(eye_model, vr_v3(0.4f * sinf(30.0f * VR_DEG), 0.0f, -0.4f * cosf(30.0f * VR_DEG))), 1e-4f),
+          "head turned left: the grip ahead-left (%f %f %f)", hm.x, hm.y, hm.z);
+    /* vam_grip_to_model: the same result as the head-relative fake path, for any head in the space */
+    {
+        const VrVec3 hp = vr_v3(1.5f, 1.1f, -4.0f);
+        const VrQuat hq = vr_xr_ypr(70.0f * VR_DEG, -10.0f * VR_DEG, 5.0f * VR_DEG);
+        const VrVec3 rel_p = vr_v3(0.18f, -0.38f, -0.32f);
+        const VrQuat rel_q = vr_xr_ypr(10.0f * VR_DEG, -20.0f * VR_DEG, 0.0f);
+        VrVec3 op, w_fake, w_xr;
+        VrQuat oq, r_fake, r_xr;
+        vam_side_offset(1, vr_v3(0.0f, -0.01f, 0.07f), vam_axis_angle(vr_v3(1, 0, 0), -15.0f * VR_DEG), &op, &oq);
+        vam_grip_to_model(vr_v3(0, 0, 0), vr_qidentity(), rel_p, rel_q, op, oq, cp, cq, &w_fake, &r_fake);
+        /* the same hand, the head anywhere: world grip = head * relative */
+        const VrVec3 world_p = vr_add(hp, vr_qrotate(hq, rel_p));
+        const VrQuat world_q = vr_qnormalize(vr_qmul(hq, rel_q));
+        vam_grip_to_model(hp, hq, world_p, world_q, op, oq, cp, cq, &w_xr, &r_xr);
+        CHECK(near_v(w_fake, w_xr, 1e-4f), "grip_to_model: wrist independent of the head's place in the space");
+        CHECK(near_q(r_fake, r_xr, 1e-4f), "grip_to_model: hand rotation independent too");
+        /* a hand straight ahead of the face (no offset) lands ahead of it in model space (-Z) */
+        VrVec3 w0;
+        VrQuat r0;
+        vam_grip_to_model(hp, hq, vr_add(hp, vr_qrotate(hq, vr_v3(0, 0, -0.5f))), hq, vr_v3(0, 0, 0), vr_qidentity(), cp,
+                          cq, &w0, &r0);
+        CHECK(near_v(w0, vr_add(cp, vr_qrotate(cq, vr_v3(0, 0, 0.5f))), 1e-4f), "grip_to_model: ahead of the camera");
+    }
+    printf("PASS game mapping\n");
+}
+
+static void test_weight(void) {
+    float w = 0.0f;
+    for (int i = 0; i < 9; ++i) w = vam_weight_step(w, 1.0f, 0.016f, 0.15f, 0.08f);
+    CHECK(near_f(w, 0.96f, 1e-3f), "fade in: %f", w);
+    w = vam_weight_step(w, 1.0f, 0.1f, 0.15f, 0.08f);
+    CHECK(w == 1.0f, "capped");
+    w = vam_weight_step(w, 0.0f, 0.04f, 0.15f, 0.08f);
+    CHECK(near_f(w, 0.5f, 1e-5f), "fade out faster: %f", w);
+    CHECK(vam_weight_step(0.3f, 1.0f, 0.0f, 0.1f, 0.1f) == 0.3f, "dt 0: unchanged");
+    CHECK(vam_weight_step(0.3f, 1.0f, 0.01f, 0.0f, 0.0f) == 1.0f, "no fade");
+    printf("PASS weight\n");
+}
+
+static void test_body_follow(void) {
+    /* the face looks along -Z (model); a view 40 deg toward -X is +40 deg about +Y? check by rotating */
+    const VrVec3 facing = vr_v3(0, 0, -1);
+    const VrVec3 view = vr_qrotate(vam_axis_angle(vr_v3(0, 1, 0), 0.7f), vr_v3(0, -0.5f, -1));
+    CHECK(near_f(vam_yaw_between(facing, view), 0.7f, 1e-5f), "yaw between: %f", vam_yaw_between(facing, view));
+    CHECK(vam_yaw_between(facing, vr_v3(0, -1, 0)) == 0.0f, "straight down: 0");
+    const float dz = 25.0f * VR_DEG;
+    CHECK(vam_body_follow(0.0f, 20.0f * VR_DEG, dz, 0.2f, 0.016f) == 0.0f, "inside the deadzone: no change");
+    CHECK(near_f(vam_body_follow(0.0f, 60.0f * VR_DEG, dz, 0.0f, 0.016f), 35.0f * VR_DEG, 1e-5f), "tau 0: at the edge");
+    float off = 0.0f;
+    for (int i = 0; i < 300; ++i) off = vam_body_follow(off, -90.0f * VR_DEG, dz, 0.2f, 1.0f / 72.0f);
+    CHECK(near_f(off, -65.0f * VR_DEG, 1e-3f), "converges to the edge: %f", off / VR_DEG);
+    off = vam_body_follow(170.0f * VR_DEG, -170.0f * VR_DEG, 25.0f * VR_DEG, 0.0f, 0.016f);
+    CHECK(near_f(off, 170.0f * VR_DEG, 1e-4f), "across the seam: 20 deg the short way, inside 25");
+    off = vam_body_follow(170.0f * VR_DEG, -150.0f * VR_DEG, 10.0f * VR_DEG, 0.0f, 0.016f);
+    CHECK(near_f(vam_wrap(off - (-160.0f * VR_DEG)), 0.0f, 1e-4f), "across the seam: %f", off / VR_DEG);
+    const VrVec3 r = vam_turn_about(vr_v3(-0.171f, 1.44f, 0.033f), vr_v3(0, 0, 0.033f), VR_PI / 2);
+    CHECK(near_v(r, vr_v3(0.0f, 1.44f, 0.033f + 0.171f), 1e-5f), "shoulder turned about the spine: %f %f %f", r.x, r.y, r.z);
+    /* the shoulders' heading in the world: the character's own turns never move it */
+    VamShoulderYaw sy;
+    memset(&sy, 0, sizeof(sy));
+    const float dt = 1.0f / 72.0f;
+    float b = vam_shoulder_yaw(&sy, 0.3f, 0.0f, dz, 0.2f, dt);
+    CHECK(near_f(b, 0.0f, 1e-6f), "start: shoulders under the head");
+    b = vam_shoulder_yaw(&sy, 0.3f + VR_PI / 2, -VR_PI / 2, dz, 0.2f, dt); /* the body turned 90 right, head still */
+    CHECK(near_f(b, -VR_PI / 2, 1e-5f), "body turned 90: the shoulders turn back -90 at once (%f)", b / VR_DEG);
+    b = vam_shoulder_yaw(&sy, 0.3f + VR_PI, -VR_PI, dz, 0.2f, dt); /* walking backwards: the body faces back */
+    CHECK(near_f(fabsf(b), VR_PI, 1e-4f), "body turned 180: the shoulders turn 180 at once (%f)", b / VR_DEG);
+    /* the turned shoulders, the same in the world as at the start: the facing stays in front of the view */
+    const VrVec3 fwd0 = vr_qrotate(vam_axis_angle(vr_v3(0, 1, 0), 0.3f), vr_v3(0, 0, -1));
+    const VrVec3 fwd1 = vr_qrotate(vam_axis_angle(vr_v3(0, 1, 0), 0.3f + VR_PI + b), vr_v3(0, 0, -1));
+    CHECK(near_v(fwd0, fwd1, 1e-4f), "180: the arms' front is unchanged in the world");
+    /* wrap: the character's yaw crosses +-pi while the head stays */
+    memset(&sy, 0, sizeof(sy));
+    vam_shoulder_yaw(&sy, 3.1f, 0.0f, dz, 0.2f, dt);
+    b = vam_shoulder_yaw(&sy, -3.1f, 6.2f - 2.0f * VR_PI, dz, 0.2f, dt);
+    CHECK(near_f(vam_wrap(b - (6.2f - 2.0f * VR_PI)), 0.0f, 1e-4f), "wrap at +-pi: %f", b);
+    /* the head itself: inside the deadzone nothing, beyond it the follow */
+    memset(&sy, 0, sizeof(sy));
+    vam_shoulder_yaw(&sy, 0.0f, 0.0f, dz, 0.2f, dt);
+    b = vam_shoulder_yaw(&sy, 0.0f, 20.0f * VR_DEG, dz, 0.2f, dt);
+    CHECK(b == 0.0f, "head 20 deg: inside the deadzone");
+    for (int i = 0; i < 300; ++i) b = vam_shoulder_yaw(&sy, 0.0f, 60.0f * VR_DEG, dz, 0.2f, dt);
+    CHECK(near_f(b, 35.0f * VR_DEG, 1e-3f), "head 60 deg: the shoulders follow to the edge (%f)", b / VR_DEG);
+    printf("PASS body follow\n");
+}
+
+int main(void) {
+    test_math();
+    test_two_bone();
+    test_arm();
+    test_mirror();
+    test_hand();
+    test_game_mapping();
+    test_weight();
+    test_body_follow();
+    if (failures) { printf("%d of %d checks failed\n", failures, checks); return 1; }
+    printf("All VR arm tests passed (%d checks)\n", checks);
+    return 0;
+}
