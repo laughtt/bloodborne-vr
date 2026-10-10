@@ -106,6 +106,7 @@ static struct {
     float rest[4];          /* out, up, forward (m), pitch down (deg) */
     float pole[3];          /* out, down, back (unit-ish; right side mirrored by the side) */
     float twist_share;
+    float soft, give, fore_roll; /* arm_soft (reach fraction easing starts), arm_give (m the shoulder may slide), arm_fore_roll */
     float offset[4];        /* grip -> wrist, right hand, OpenXR grip frame: x, y, z (m), pitch (deg) */
     float fake[2][6];       /* left, right: grip relative to the head (OpenXR): x y z, yaw pitch roll */
     float rot[2][2];        /* left, right: aim trim, yaw right / pitch up (deg), not mirrored */
@@ -146,6 +147,10 @@ static struct {
     int anim, attack;
     float reach[2];
     int clamped[2];
+    float roll_prev[2];  /* last wrist roll per side (unwrapped continuity) */
+    int has_roll[2];
+    VamArmPose dbg[2];   /* last solve per side, for the per-second line */
+    float dbg_upper[2], dbg_fore[2];
 } arms;
 
 static _Atomic int arms_busy;
@@ -326,6 +331,9 @@ static void arms_init(void) {
     const float pole[3] = {0.4f, 0.85f, 0.35f};
     memcpy(arms.pole, pole, sizeof(pole));
     arms.twist_share = 1.0f;
+    arms.soft = 0.92f;
+    arms.give = 0.04f;
+    arms.fore_roll = 0.35f;
     const float offset[4] = {0.0f, -0.01f, 0.07f, -15.0f}; /* the sandbox's hand_offset */
     memcpy(arms.offset, offset, sizeof(offset));
     const float fake[2][6] = {{-0.18f, -0.38f, -0.32f, 0.0f, -20.0f, 0.0f}, {0.18f, -0.38f, -0.32f, 0.0f, -20.0f, 0.0f}};
@@ -368,6 +376,9 @@ static void arms_apply_key(const char *k, const char *v) {
     else if (!strcmp(k, "arm_rest")) set_floats(v, arms.rest, 3, 4);
     else if (!strcmp(k, "arm_pole")) set_floats(v, arms.pole, 3, 3);
     else if (!strcmp(k, "arm_twist") && ok) arms.twist_share = vr_clampf(x, 0.0f, 1.0f);
+    else if (!strcmp(k, "arm_soft") && ok) arms.soft = x <= 0.0f ? 0.0f : vr_clampf(x, 0.5f, 0.99f);
+    else if (!strcmp(k, "arm_give") && ok) arms.give = vr_clampf(x, 0.0f, 0.15f);
+    else if (!strcmp(k, "arm_fore_roll") && ok) arms.fore_roll = vr_clampf(x, 0.0f, 1.0f);
     else if (!strcmp(k, "arm_offset")) set_floats(v, arms.offset, 3, 4);
     else if (!strcmp(k, "arm_fake_r")) set_floats(v, arms.fake[1], 3, 6);
     else if (!strcmp(k, "arm_fake_l")) set_floats(v, arms.fake[0], 3, 6);
@@ -397,9 +408,9 @@ static void arms_poll_control(uint64_t now) {
         arms_apply_key(tok, eq + 1);
     }
     fprintf(stderr, "VR arms: control: arm %d src %s weight %.2f attack %.2f in %.2f out %.2f tp %d rest (%.2f %.2f %.2f, %.0f deg) "
-                    "pole (%.2f %.2f %.2f) twist %.2f offset (%.3f %.3f %.3f, %.0f deg) fake_r (%.2f %.2f %.2f) fake_l (%.2f %.2f %.2f)\n",
+                    "pole (%.2f %.2f %.2f) twist %.2f soft %.2f give %.3f fore_roll %.2f offset (%.3f %.3f %.3f, %.0f deg) fake_r (%.2f %.2f %.2f) fake_l (%.2f %.2f %.2f)\n",
             arms.on, src_names[arms.src], arms.weight_max, arms.attack_weight, arms.in_s, arms.out_s, arms.tp, arms.rest[0],
-            arms.rest[1], arms.rest[2], arms.rest[3], arms.pole[0], arms.pole[1], arms.pole[2], arms.twist_share,
+            arms.rest[1], arms.rest[2], arms.rest[3], arms.pole[0], arms.pole[1], arms.pole[2], arms.twist_share, arms.soft, arms.give, arms.fore_roll,
             arms.offset[0], arms.offset[1], arms.offset[2], arms.offset[3], arms.fake[1][0], arms.fake[1][1],
             arms.fake[1][2], arms.fake[0][0], arms.fake[0][1], arms.fake[0][2]);
 }
@@ -741,13 +752,24 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
         VrQuat hand_rot;
         if (!arms_target(side, &a->bind, shoulder, body_yaw, &view, have_view, &wrist, &hand_rot)) continue;
         VamArmParams params;
+        memset(&params, 0, sizeof(params));
         params.pole = vr_v3(side ? -arms.pole[0] : arms.pole[0], -arms.pole[1], arms.pole[2]); /* out, down, back (+Z) */
         params.pole = vr_qrotate(vam_axis_angle(vr_v3(0, 1, 0), body_yaw), vam_norm(params.pole, vr_v3(0, -1, 0)));
         params.arm_scale = 1.0f;
         params.twist_share = arms.twist_share;
+        params.soft = arms.soft;
+        params.give = arms.give;
+        params.fore_roll = arms.fore_roll;
+        params.roll_prev = arms.roll_prev[side];
+        params.has_roll_prev = arms.has_roll[side];
         VamArmPose ik;
         vam_solve_arm(&a->bind, shoulder, wrist, hand_rot, &params, &ik);
         arms.reach[side] = ik.reach;
+        arms.roll_prev[side] = ik.roll;
+        arms.has_roll[side] = 1;
+        arms.dbg[side] = ik;
+        arms.dbg_upper[side] = vam_upper_len(&a->bind);
+        arms.dbg_fore[side] = vam_fore_len(&a->bind);
         arms.clamped[side] = ik.clamped;
         /* the chain's new rotations (blended with the animation), positions rebuilt from the
          * animated locals down the hierarchy (parents first) */
@@ -864,6 +886,14 @@ static void arms_hook(BbHookContext *ctx, int which, uint32_t site, uintptr_t mo
                 arms.attack ? " (attack)" : "", arms.reach[0], arms.clamped[0] ? " clamped" : "", arms.reach[1],
                 arms.clamped[1] ? " clamped" : "", arms.writes, arms.skipped_busy,
                 atomic_exchange_explicit(&arms_spins, 0, memory_order_relaxed), arms.stale_view);
+        for (int side = 0; side < 2; ++side) {
+            const VamArmPose *d = &arms.dbg[side];
+            fprintf(stderr, "VR arms: ik %s: upper %.3f fore %.3f m | target %.3f m (reach %.2f) -> ik %.3f (eased %.0f%%, shoulder give %.3f m%s) | "
+                            "elbow %.0f deg | roll %.0f deg (fore %.0f%% twist %.0f%%, twist1 half)\n",
+                    side ? "R" : "L", arms.dbg_upper[side], arms.dbg_fore[side], d->dist, d->reach, d->dist * d->eased, d->eased * 100.0f,
+                    d->give, d->clamped ? ", clamped" : "", d->elbow_deg, d->roll * (180.0f / VR_PI), arms.fore_roll * 100.0f,
+                    (1.0f - arms.fore_roll) * arms.twist_share * 100.0f);
+        }
         if (arms.n_callers) {
             fprintf(stderr, "VR arms:   player syncs per caller:");
             for (int k = 0; k < arms.n_callers; ++k)

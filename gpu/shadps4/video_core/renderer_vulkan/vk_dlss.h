@@ -55,12 +55,15 @@ public:
     static constexpr u32 FlatSlot = 0, EyeSlot0 = 1, Slots = 4;
     /// The bridge supports feature slots other than 0 (bridge ABI 2).
     [[nodiscard]] bool HasSlots() const;
+    /// The bridge takes a bias mask (bridge ABI 3); older bridges ignore it.
+    [[nodiscard]] bool HasBiasMask() const;
     struct Frame {
         Resource color, depth, motion, output;
         float jitter_x, jitter_y;
         bool reset;
         float frame_ms;
         float sharpness;
+        Resource bias_mask{}; ///< optional (null view = none), R8, bridge ABI 3: 1 = trust current colour
     };
 
     /// DLSS quality mode for an output/render size ratio (0 DLAA .. 4 Ultra Performance).

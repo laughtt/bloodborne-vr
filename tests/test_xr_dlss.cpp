@@ -299,15 +299,53 @@ void TestMotionVectors() {
     }
 }
 
+// The arm/weapon bias mask: depth -> view distance -> near flag (host_shaders/xr_dlss_mask.comp).
+void TestMask() {
+    const Camera c = MakeCamera(0, 0, 0);
+    const float W = 1920.0f, H = 1080.0f;
+    // Linearisation round trip on the game's projection (near 0.2, far 3000).
+    for (float z : {0.2f, 0.5f, 0.9f, 1.0f, 5.0f, 100.0f}) {
+        assert(Near(LinearDepth(DepthAt(c, z), c.proj), z, z * 2e-3f));
+    }
+    // Screen centre: distance == z, the threshold is a strict "<".
+    const float u = 0.5f, v = 0.5f;
+    assert(NearMask(DepthAt(c, 0.5f), u, v, c.proj, 0.9f));
+    assert(NearMask(DepthAt(c, 0.85f), u, v, c.proj, 0.9f));
+    assert(!NearMask(DepthAt(c, 0.95f), u, v, c.proj, 0.9f));
+    assert(!NearMask(DepthAt(c, 5.0f), u, v, c.proj, 0.9f));
+    // The distance is radial: at the screen corner the same z is farther away.
+    const float centre = ViewDistance(DepthAt(c, 0.8f), u, v, c.proj);
+    const float corner = ViewDistance(DepthAt(c, 0.8f), 0.0f, 0.0f, c.proj);
+    assert(Near(centre, 0.8f, 2e-3f) && corner > 0.8f * 1.2f);
+    assert(NearMask(DepthAt(c, 0.8f), u, v, c.proj, 0.9f));
+    assert(!NearMask(DepthAt(c, 0.8f), 0.0f, 0.0f, c.proj, 0.9f));
+    // A pixel's own uv: the left-edge pixel at z 0.7 and the matching centre pixel.
+    assert(NearMask(DepthAt(c, 0.7f), 0.5f / W, 0.5f / H, c.proj, 1.5f));
+    // Off (0) and sky / cleared depth never mask; a bad threshold leaves the default.
+    assert(!NearMask(DepthAt(c, 0.5f), u, v, c.proj, 0.0f));
+    assert(!NearMask(1.0f, u, v, c.proj, 100.0f));
+    assert(Near(ParseMaskMeters("0.6", 0.9f), 0.6f) && Near(ParseMaskMeters("0", 0.9f), 0.0f));
+    assert(Near(ParseMaskMeters("abc", 0.9f), 0.9f) && Near(ParseMaskMeters("-1", 0.9f), 0.9f));
+    assert(Near(ParseMaskMeters("", 0.9f), 0.9f) && Near(ParseMaskMeters("99", 0.9f), 5.0f));
+}
+
+void TestColorOrder() {
+    // BGRA stays BGRA, RGBA stays RGBA (no red/blue swap), sRGB becomes UNORM.
+    assert(DlssColorFormat(50) == 44 && DlssColorFormat(44) == 44);
+    assert(DlssColorFormat(43) == 37 && DlssColorFormat(37) == 37);
+}
+
 } // namespace
 
 int main() {
+    TestColorOrder();
     TestOptions();
     TestOutputSize();
     TestSelect();
     TestJitter();
     TestHistory();
     TestMotionVectors();
+    TestMask();
     std::printf("xr-dlss-test: all passed\n");
     return 0;
 }

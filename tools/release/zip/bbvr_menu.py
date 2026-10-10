@@ -21,6 +21,18 @@ from urllib.parse import parse_qs, urlparse
 import bbvr_settings as S
 
 
+def crash_module(port):
+    """scripts/crash_report.py of the port (None when it is missing)."""
+    scripts = Path(port) / 'scripts'
+    if str(scripts) not in sys.path:
+        sys.path.append(str(scripts))
+    try:
+        import crash_report
+        return crash_report
+    except ImportError:
+        return None
+
+
 class Menu:
     def __init__(self, settings_path, paths, caps, settings=None):
         self.settings_path = Path(settings_path)
@@ -35,6 +47,19 @@ class Menu:
         self.httpd = None
         self.thread = None
         self.status = ''
+        self.user_dir = self.settings_path.parent  # where crash_config.json lives (same as run.py's user dir)
+        self.crash = crash_module(paths['port'])
+
+    # -- crash-report consent (first launch asks in the page; run.py then never needs the console)
+    def crash_state(self):
+        if not self.crash:
+            return {'available': False, 'asked': True, 'mode': 'off'}
+        mode = self.crash.load_config(self.user_dir)['crash_reports']
+        return {'available': True, 'asked': self.crash.consent_stored(self.user_dir), 'mode': mode}
+
+    def set_crash_mode(self, mode):
+        if self.crash and mode in ('on', 'off'):
+            self.crash.save_mode(self.user_dir, mode)
 
     # -- state shared with the page
     def state(self):
@@ -49,6 +74,7 @@ class Menu:
                 st['warnings'].append(w)
             st['game_running'] = self.game_running
             st['status'] = self.status
+            st['crash'] = self.crash_state()
             st['dlss_native'] = bool(self.caps['dlss'].get('native'))
             return st
 
@@ -138,6 +164,9 @@ class Menu:
                 path = urlparse(self.path).path
                 if path == '/api/save':
                     menu.update(body)
+                    self._json(menu.state())
+                elif path == '/api/crash':
+                    menu.set_crash_mode(body.get('mode'))
                     self._json(menu.state())
                 elif path == '/api/launch':
                     menu.update(body)
@@ -241,6 +270,8 @@ main{padding:0 16px 40px;max-width:980px}.card{background:var(--panel);border:1p
 .banner.info{border-color:var(--live);background:color-mix(in srgb,var(--live) 12%,transparent)}.banner.bad{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
 input[type=number],input[type=text]{width:12em}textarea{width:100%;min-height:70px}input[type=range]{width:min(260px,60%);vertical-align:middle;padding:0}
 .status{color:var(--dim);font-size:13px;margin-left:auto}.small{font-size:13px;color:var(--dim)}label.chk{display:inline-flex;gap:6px;align-items:center}
+[hidden]{display:none!important}.consent{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:16px}
+.consentbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 20px 14px;max-width:560px}
 @media (max-width:640px){.row{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>Bloodborne VR</h1>
@@ -248,7 +279,11 @@ input[type=number],input[type=text]{width:12em}textarea{width:100%;min-height:70
 <span class="status" id="status"></span>
 <label class="chk"><input type="checkbox" id="adv"> advanced</label>
 <label class="chk"><input type="checkbox" id="showmenu" checked> show this menu next time</label>
+<label class="chk" id="crashwrap" hidden><input type="checkbox" id="crashbox"> send crash reports</label>
 <button class="primary" id="start">Start game</button><button id="quit">Quit</button></header>
+<div id="consent" class="consent" hidden><div class="consentbox"><b>Help fix crashes?</b>
+<p>If the game crashes, it can send an anonymous crash report to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at the report on your PC first, and change this later with the "send crash reports" box at the top of this page.</p>
+<p><button class="primary" id="crashyes">Yes, send crash reports</button> <button id="crashno">No, keep them on my PC</button></p></div></div>
 <nav id="tabs"></nav><main><div id="banners"></div><div class="card" id="card"></div></main>
 <script>
 const TOKEN="__TOKEN__";let S=null,tab=localStorage.getItem('bbvr_tab')||'display',saveTimer=null,values={};
@@ -256,6 +291,8 @@ const $=id=>document.getElementById(id);
 const el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!==undefined)e.textContent=txt;return e};
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-BB-Token':TOKEN,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw new Error(r.status);return r.json()}
 function applyState(s){S=s;values=Object.assign({},s.values);render()}
+function renderCrash(){const c=S.crash||{available:false,asked:true};$('consent').hidden=!(c.available&&!c.asked);$('crashwrap').hidden=!(c.available&&c.asked);$('crashbox').checked=c.mode==='on'}
+async function crashMode(m){try{applyState(await api('/api/crash',{mode:m}))}catch(e){$('status').textContent='save failed'}}
 function dlssOK(){return S.caps.dlss.ok}
 function schedule(){clearTimeout(saveTimer);saveTimer=setTimeout(async()=>{try{applyState(await api('/api/save',{values:values}))}catch(e){$('status').textContent='save failed'}},400)}
 function mk(o){
@@ -278,7 +315,7 @@ function mk(o){
 function dependsOff(o){if(o.only_if){for(const k in o.only_if){const cur=values[k];if(cur!==o.only_if[k])return 'only with '+k+' = '+o.only_if[k]}}return ''}
 function render(){
  $('profile').innerHTML='';S.profiles.forEach(p=>{const op=el('option',null,p);op.value=p;$('profile').appendChild(op)});$('profile').value=S.profile;
- $('pnote').textContent=S.profile_notes[S.profile]||'';$('showmenu').checked=S.show_menu;$('status').textContent=S.status||'';
+ renderCrash();$('pnote').textContent=S.profile_notes[S.profile]||'';$('showmenu').checked=S.show_menu;$('status').textContent=S.status||'';
  const tabs=$('tabs');tabs.innerHTML='';S.tabs.forEach(t=>{const b=el('button',t.id===tab?'on':'',t.label);b.onclick=()=>{tab=t.id;try{localStorage.setItem('bbvr_tab',tab)}catch(e){};render()};tabs.appendChild(b)});
  const bn=$('banners');bn.innerHTML='';(S.warnings||[]).forEach(w=>bn.appendChild(el('div','banner',w)));
  if(S.game_running)bn.appendChild(el('div','banner info','The game is running. Live options (blue badge) apply within a second; the others need a restart.'));
@@ -299,6 +336,8 @@ function render(){
  if(!card.querySelector('.row'))card.appendChild(el('div','hint','Nothing here (tick "advanced" for more).'));
 }
 $('adv').onchange=render;
+$('crashyes').onclick=()=>crashMode('on');$('crashno').onclick=()=>crashMode('off');
+$('crashbox').onchange=()=>crashMode($('crashbox').checked?'on':'off');
 $('profile').onchange=async()=>{applyState(await api('/api/save',{profile:$('profile').value}))};
 $('showmenu').onchange=async()=>{applyState(await api('/api/save',{show_menu:$('showmenu').checked}))};
 $('start').onclick=async()=>{$('start').disabled=true;try{applyState(await api('/api/launch',{values:values}));$('status').textContent='Starting the game - put the headset on. You can keep changing live options here.'}catch(e){$('start').disabled=false}};

@@ -18,7 +18,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace XrDlssLogic {
@@ -298,6 +300,43 @@ inline std::array<float, 2> MotionVector(float px, float py, float depth, float 
     return {(pu - u) * width, (pv - v) * height};
 }
 
+/// Bias-current-colour mask (the player's arms and weapon, host_shaders/xr_dlss_mask.comp):
+/// view-space z of a hardware depth value (D3D projection: depth = zs + zo / z).
+inline float LinearDepth(float depth, const std::array<float, 4>& proj) {
+    return proj[3] / std::min(depth - proj[2], -1e-8f);
+}
+
+/// Distance from the camera of the surface at a pixel of the (unjittered) scene uv.
+inline float ViewDistance(float depth, float scene_u, float scene_v,
+                          const std::array<float, 4>& proj) {
+    const float z = LinearDepth(depth, proj);
+    const float x = (scene_u * 2.0f - 1.0f) * z / proj[0];
+    const float y = (1.0f - scene_v * 2.0f) * z / proj[1];
+    return std::sqrt(x * x + y * y + z * z);
+}
+
+/// 1 = trust the current colour: a surface closer than `threshold_m` (0 = mask off). Sky and
+/// cleared depth (>= 1) never.
+inline bool NearMask(float depth, float scene_u, float scene_v, const std::array<float, 4>& proj,
+                     float threshold_m) {
+    if (threshold_m <= 0.0f || depth >= 1.0f) {
+        return false;
+    }
+    return LinearDepth(depth, proj) > 0.0f &&
+           ViewDistance(depth, scene_u, scene_v, proj) < threshold_m;
+}
+
+/// dlss_mask_m: metres, 0 = off; a bad value keeps the default; capped at 5 m.
+inline float ParseMaskMeters(std::string_view text, float fallback) {
+    std::string copy{text};
+    char* end = nullptr;
+    const float v = std::strtof(copy.c_str(), &end);
+    if (copy.empty() || end == copy.c_str() || !std::isfinite(v) || v < 0.0f) {
+        return fallback;
+    }
+    return std::min(v, 5.0f);
+}
+
 /// Camera position (world) of a view [R | t]: -R^T t.
 inline std::array<float, 3> Position(const std::array<float, 12>& view) {
     std::array<float, 3> p{};
@@ -446,5 +485,22 @@ private:
     std::array<uint64_t, 2> eye_frames_{};
     std::array<uint64_t, 2> resets_{};
 };
+
+// ---------------------------------------------------------------------------------------------
+// Colour channel order
+
+/// The VkFormat (UNORM, no sRGB decode: DLSS works on the encoded values) DLSS reads the display
+/// buffer through. It must be the format the presenter samples the buffer in (the video-out pixel
+/// format decides it), not the image's own format: the two can differ in channel order, and then
+/// reading the image natively swaps red and blue (blue skin and leather). Numbers are VkFormat.
+inline uint32_t DlssColorFormat(uint32_t presenter_sample_format) {
+    constexpr uint32_t kR8G8B8A8Unorm = 37, kR8G8B8A8Srgb = 43, kB8G8R8A8Unorm = 44,
+                       kB8G8R8A8Srgb = 50;
+    if (presenter_sample_format == kR8G8B8A8Srgb)
+        return kR8G8B8A8Unorm;
+    if (presenter_sample_format == kB8G8R8A8Srgb)
+        return kB8G8R8A8Unorm;
+    return presenter_sample_format;
+}
 
 } // namespace XrDlssLogic

@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Bloodborne VR (alpha) first-run helper and launcher. Standard library only.
 
-    BloodborneVR.bat                 check everything, then start the game in VR
-    BloodborneVR.bat --check         only run the checks
-    BloodborneVR.bat --mono          VR with a flat screen in the headset (no stereo)
-    BloodborneVR.bat --game-dir DIR  use (and remember) another game folder
-    BloodborneVR.bat --reset         forget the saved game folder and the extracted VR data
-    BloodborneVR.bat --menu          show the settings menu (default until you tick "don't show next time")
-    BloodborneVR.bat --no-menu       start with the saved settings, no menu
-    BloodborneVR.bat --profile NAME  start with a profile (Default, Comfort, Performance, "Quality (DLSS)", Custom)
-    BloodborneVR.bat --reset-settings  forget the saved profile and options (and the UI overrides)
+    BloodborneVR.exe                 check everything, then start the game in VR
+    BloodborneVR.exe --check         only run the checks
+    BloodborneVR.exe --mono          VR with a flat screen in the headset (no stereo)
+    BloodborneVR.exe --game-dir DIR  use (and remember) another game folder
+    BloodborneVR.exe --reset         forget the saved game folder and the extracted VR data
+    BloodborneVR.exe --menu          show the settings menu (default until you tick "don't show next time")
+    BloodborneVR.exe --no-menu       start with the saved settings, no menu
+    BloodborneVR.exe --profile NAME  start with a profile (Default, Comfort, Performance, "Quality (DLSS)", Custom)
+    BloodborneVR.exe --reset-settings  forget the saved profile and options (and the UI overrides)
 
 What it does, in order:
   1. finds your own legally dumped game folder (CUSA03173) and remembers it in bbvr_config.json;
@@ -315,7 +315,9 @@ def launch(env_extra, menu=None):
             text = chunk.decode('utf-8', 'replace')
             handle.write(text)
             handle.flush()
-            sys.stdout.write(text)
+            # The console may not be UTF-8 (cp1252): never let a character it can't show stop the game.
+            enc = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+            sys.stdout.write(text.encode(enc, 'replace').decode(enc, 'replace'))
             sys.stdout.flush()
         code = child.wait()
     if menu:
@@ -470,8 +472,20 @@ def main():
     return run_with_settings(game, args)
 
 
+def finish(code):
+    """BloodborneVR.exe gives the launcher its own console window, which closes with the process: when
+    something went wrong, or only checks ran, keep it open until Enter so the text can be read."""
+    if os.environ.get('BBVR_EXE') == '1' and (code or '--check' in sys.argv or '--dry-run' in sys.argv):
+        try:
+            input('
+Press Enter to close this window.')
+        except (EOFError, OSError, KeyboardInterrupt):
+            pass
+    sys.exit(code)
+
+
 if __name__ == '__main__':
     try:
-        sys.exit(main())
+        finish(main())
     except KeyboardInterrupt:
         sys.exit(130)

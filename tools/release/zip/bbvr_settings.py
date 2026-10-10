@@ -96,6 +96,14 @@ def _build_schema():
          help='default = the driver\'s choice; K is the transformer model.'))
     a(_o('dlss_sharpen', 'dlss', 'DLSS sharpen', 'float', ('iq', 'dlss_sharpen', 'BB_XR_DLSS_SHARPEN'), 0.0,
          min=0.0, max=1.0, step=0.05, only_if={'upscale': 'dlss'}, help='RCAS sharpening after DLSS, 0..1.'))
+    a(_o('dlss_mask', 'dlss', 'DLSS arm/weapon mask', 'bool', ('iq', 'dlss_mask', 'BB_XR_DLSS_MASK'), True,
+         only_if={'upscale': 'dlss'},
+         help='The arms and weapon move with your hands but DLSS only knows camera motion, so they smear. On: surfaces '
+              'nearer than the distance below are drawn from the current frame only (needs the matching bbport_dlss.dll).'))
+    a(_o('dlss_mask_m', 'dlss', 'Arm mask distance (m)', 'float', ('iq', 'dlss_mask_m', 'BB_XR_DLSS_MASK_M'), 0.9,
+         min=0.0, max=3.0, step=0.05, only_if={'upscale': 'dlss'},
+         help='View distance of the masked surfaces from the camera. 0 turns the mask off. Raise it if the weapon tip still '
+              'smears; lower it if nearby walls look noisy.'))
     a(_o('eye_res', 'dlss', 'Eye resolution', 'text', ('iq', 'res', 'BB_XR_EYE_RES'), None,
          suggestions=['1.5', '2', '3', '2880x1620', '3840x2160'],
          help='Size of each eye image: a factor of the 1080p frame (1.5, 2 = 3840x2160) or WxH. Blank = default.'))
@@ -628,6 +636,8 @@ def build_launch(values, paths, caps=None, public=None):
         e('BB_XR_DLSS_QUALITY', v['dlss_quality'] or 'auto')
         e('BB_XR_DLSS_PRESET', v['dlss_preset'] or 'default')
         e('BB_XR_DLSS_SHARPEN', fmt_num(v['dlss_sharpen'] or 0))
+        e('BB_XR_DLSS_MASK', '0' if v.get('dlss_mask') is False else '1')
+        e('BB_XR_DLSS_MASK_M', fmt_num(0.9 if v.get('dlss_mask_m') is None else v['dlss_mask_m']))
         if v.get('jitter_sign') == '-1':
             e('BB_XR_DLSS_JITTER_SIGN', '-1')
     if v.get('online') and not public:
@@ -654,7 +664,7 @@ def build_launch(values, paths, caps=None, public=None):
             if val is not None:
                 ui[o['target'][1]] = val
     if upscale != 'dlss':  # the DLSS keys mean nothing then; keep them out of the file
-        for k in ('dlss_quality', 'dlss_preset', 'dlss_sharpen'):
+        for k in ('dlss_quality', 'dlss_preset', 'dlss_sharpen', 'dlss_mask', 'dlss_mask_m'):
             files['iq'].pop(k, None)
     return {'env': env, 'exe': exe, 'hooks': hooks, 'patches': patches, 'files': files, 'ui': ui,
             'warnings': warnings, 'upscale': upscale}

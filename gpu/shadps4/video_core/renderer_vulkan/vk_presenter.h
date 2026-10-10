@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 
 #include <condition_variable>
@@ -17,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/renderer_vulkan/vk_xr_stereo.h"
+#include "video_core/renderer_vulkan/xr_resize_logic.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Frontend {
@@ -126,12 +128,25 @@ private:
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
-    void SetExpectedGameSize(s32 width, s32 height);
+    XrResize::Size FitGameSize(s32 width, s32 height) const;
 
 private:
-    float expected_ratio{1920.0 / 1080.0f};
-    u32 expected_frame_width{1920};
-    u32 expected_frame_height{1080};
+    // bbport: written by the GPU thread (PrepareFrame) and the present thread (Present), read
+    // by the other: each one atomic and the frame size published whole (XrResize::Pack), so the
+    // GPU thread never sees half of an update (docs/vr/findings/37, device-lost crashes).
+    std::atomic<float> expected_ratio{1920.0f / 1080.0f};
+    std::atomic<u64> expected_frame_size{(u64(1920) << 32) | 1080};
+    /// bbport VR: present thread only. The frame size target is applied once it held for a few
+    /// presents; the inputs it was made of last (for the resize log line).
+    XrResize::SizeDebounce frame_size_debounce{3};
+    XrResize::Inputs frame_size_inputs{};
+    /// bbport VR: the sizes of the bridge swapchains this side wrote (eye L, eye R, flat, HUD):
+    /// before one is recreated the GPU must be done with the old images.
+    std::array<XrResize::ChainSize, 4> xr_chain_sizes{};
+    void XrChainResize(int chain, u32 width, u32 height);
+    /// bbport VR: the last frame size PrepareFrame drew at (GPU thread): host pass images and
+    /// DLSS outputs are recreated after a change, once the GPU is done with them.
+    XrResize::Size prepared_size{};
 
     Frontend::WindowSDL& window;
     Instance instance;

@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport VR DLSS (docs/vr/findings/37-dlss-vr.md, section 12): the "bias current colour" mask.
+// The player's arms and weapon move with the hands while the motion vectors are camera-only, so
+// DLSS would blend them with a wrong history (blur, smear). Everything closer to the camera than
+// `threshold` metres gets 1.0 ("trust the current frame"), the rest 0.0. Sky and far depth stay 0.
+// The math is XrDlssLogic::NearMask (xr_dlss_logic.h, unit tested), kept in step with this file.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex; // D32, depth 0..1 (D3D projection)
+layout(binding = 1, r8) uniform writeonly image2D mask_img;
+
+layout(push_constant) uniform Constants {
+    vec4 proj;      // x scale, y scale, z scale, z offset
+    vec2 size;      // pixels
+    vec2 jitter;    // viewport shift of the depth in render pixels (x right, y down)
+    float threshold; // metres
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    const vec2 scene_uv = (vec2(pixel) + 0.5) / size - jitter / size;
+    const vec2 ndc = vec2(scene_uv.x * 2.0 - 1.0, 1.0 - scene_uv.y * 2.0);
+    // Clip z = zs * z + zo, w = z; depth = zs + zo / z.
+    const float denom = min(depth - proj.z, -1e-8);
+    const float z = proj.w / denom;
+    const vec3 view = vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+    const bool near_pixel = depth < 1.0 && z > 0.0 && length(view) < threshold;
+    imageStore(mask_img, pixel, vec4(near_pixel ? 1.0 : 0.0));
+}

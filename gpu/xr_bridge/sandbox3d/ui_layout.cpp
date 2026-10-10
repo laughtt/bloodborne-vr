@@ -156,7 +156,7 @@ const char* const kDefaultLayout = R"JSON({
     "r3_hold_s": 0.5,
     "press_s": 0.06,
     "debug_gun_ray": true, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
-    "debug_hitboxes": {"weapon": true, "attack": true, "enemies": true, "self": false, "hits": true,
+    "debug_hitboxes": {"weapon": false, "attack": false, "enemies": false, "self": false, "hits": false,
                        "line_mrad": 1.5, "idle_alpha": 0.6},
     "hud": {"on": true, "head": false, "wrist": true, "bar": "always", "distance": 0.9,
             "down_deg": 24, "scale": 1.0, "wrist_scale": 0.7, "wrist_offset": [0.0, 0.08, 0.0],

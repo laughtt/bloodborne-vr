@@ -17,7 +17,10 @@ extern "C" {
 // ABI 2 (bbport VR DLSS, docs/vr/findings/37-dlss-vr.md): independent features in slots (0 is the
 // flat game's, the one the ABI 1 functions use; 1 and 2 the VR eyes), each with its own history.
 // The ABI 1 members keep their place, so an ABI 1 caller works with an ABI 2 bridge.
-#define BBPORT_DLSS_BRIDGE_ABI 2
+// ABI 3: BbDlssEvaluate gets a bias_mask image at the end (NGX "bias current colour mask": 1 = trust the
+// current frame, e.g. first-person arms that move with the hands while the motion vectors are
+// camera-only). A null view leaves it out, as in ABI 2 and for the flat game.
+#define BBPORT_DLSS_BRIDGE_ABI 3
 #define BBPORT_DLSS_BRIDGE_SLOTS 4
 
 typedef void (*BbDlssLogFn)(int warning, const char* message);
@@ -52,6 +55,8 @@ typedef struct BbDlssEvaluate {
     int32_t reset;
     float frame_ms;
     float sharpness; // 0..1; 0 leaves the output unsharpened
+    // ABI 3, optional (view == VK_NULL_HANDLE: none): R8_UNORM sampled, render resolution.
+    BbDlssImage bias_mask;
 } BbDlssEvaluate;
 
 typedef struct BbDlssApi {

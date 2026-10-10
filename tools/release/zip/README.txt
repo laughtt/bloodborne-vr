@@ -30,7 +30,7 @@ INSTALL IN 5 STEPS
    (not Program Files, not inside OneDrive).
 2. Start your headset software and make it the active OpenXR runtime
    (SteamVR: Settings > OpenXR; Oculus app: Settings > General; Pimax Play / WMR: same switch).
-3. Double-click BloodborneVR.bat. On the first run it asks you to accept the legal note and to
+3. Double-click BloodborneVR.exe. On the first run it asks you to accept the legal note and to
    pick the folder of YOUR game dump. It checks the version and the executable (it will say
    if your dump is not compatible), checks Vulkan and OpenXR, and builds the VR menu and
    hit-shape data from your dump (a few minutes, once; stays on your PC in out\vr_assets).
@@ -38,7 +38,15 @@ INSTALL IN 5 STEPS
    while; later starts are faster.
 5. Play. Closing the console window or leaving the game ends it. Logs are in logs\ .
 
-Other options:  BloodborneVR.bat --check (checks only)   --mono (flat screen in the headset)
+WINDOWS WARNING ON FIRST START: BloodborneVR.exe is a tiny unsigned program (the alpha has no code-signing
+certificate yet), so Windows SmartScreen may say "Windows protected your PC". Click "More info", then
+"Run anyway". If Windows 11 "Smart App Control" blocks it outright, turn that off or use
+BloodborneVR-console.bat, which does the same thing. The SHA-256 sums of the download are in
+SHA256SUMS.txt next to the zip. A black console window opens next to the settings page: that is
+the launcher's log; leave it open while you play. Crash reports: the settings page asks once whether
+you want to send them (see REPORTING BUGS below).
+
+Other options:  BloodborneVR.exe --check (checks only)   --mono (flat screen in the headset)
                 --game-dir "D:\dump\CUSA03173"           --reset (forget game folder and data)
 
 CONTROLS (alpha; may change)
@@ -64,7 +72,7 @@ a text menu if neither works). Tabs: Display / VR, DLSS / Upscaling, Comfort, Co
 UI, Patches, Advanced. Profiles: Default (the old behaviour), Comfort, Performance, Quality (DLSS)
 and Custom (your own values). A blue "live" badge means the option applies while the game runs (the
 menu stays open: change it there); "restart" needs a new start. Tick "show this menu next time" off
-to skip it; BloodborneVR.bat --menu brings it back, --no-menu skips it, --profile "Comfort" starts a
+to skip it; BloodborneVR.exe --menu brings it back, --no-menu skips it, --profile "Comfort" starts a
 profile, --reset-settings forgets the saved choices. The page is served only on your own PC
 (127.0.0.1) and protected by a one-time token. Changed control files keep a .bak of the original.
 DLSS (optional, off by default; falls back to FSR 1) is NOT available in this download: it needs an NVIDIA RTX GPU,

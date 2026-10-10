@@ -80,6 +80,21 @@ static inline VrQuat vam_frame(VrVec3 x, VrVec3 y) { return vam_quat_from_column
 
 /* ---- two-bone IK ---- */
 
+/* The part of the pole perpendicular to the reach axis n (the elbow's bend direction). Where the pole
+ * lines up with the reach (hand at the hip, behind, in the pole's direction) the plain perpendicular
+ * shrinks to nothing and flips sign (the elbow and forearm roll spin); below 0.4 the "back" (+Z)
+ * direction's perpendicular takes over smoothly, so the bend direction never passes through zero. */
+static inline VrVec3 vam_pole_perp(VrVec3 pole, VrVec3 n) {
+    const VrVec3 pn = vam_norm(pole, vr_v3(0, -1, 0));
+    VrVec3 v = vam_perp(pn, n);
+    const float l = vam_len(v);
+    if (l < 0.4f) {
+        const VrVec3 sec = vam_perp(vr_v3(0, 0, 1), n);
+        v = vr_add(v, vr_scale(vam_len(sec) > 1e-4f ? sec : vam_any_perp(n), 0.4f - l));
+    }
+    return vam_norm(v, vam_any_perp(n));
+}
+
 /* The elbow for a chain of lengths a (upper) and b (lower) from the shoulder s toward the target
  * t, bending toward `pole`. *wrist gets the wrist actually reached (t pulled in or pushed out to
  * the reachable range |a-b|..0.9995 (a+b)), *clamped 1 when it moved. Either may be NULL. */
@@ -90,7 +105,7 @@ static inline VrVec3 vam_two_bone(VrVec3 s, VrVec3 t, float a, float b, VrVec3 p
     const float lo = fabsf(a - b) + 1e-4f, hi = (a + b) * 0.9995f;
     const float dc = vr_clampf(len, lo, hi);
     if (clamped) *clamped = fabsf(dc - len) > 1e-4f;
-    const VrVec3 pp = vam_norm(vam_perp(pole, n), vam_any_perp(n));
+    const VrVec3 pp = vam_pole_perp(pole, n);
     const float x = (a * a - b * b + dc * dc) / (2.0f * dc);
     const float h = sqrtf(a * a - x * x > 0.0f ? a * a - x * x : 0.0f);
     if (wrist) *wrist = vr_add(s, vr_scale(n, dc));
@@ -151,11 +166,22 @@ typedef struct {
     VrVec3 pole;       /* elbow direction for this side (model space; mirror x for the other side) */
     float arm_scale;   /* chain length scale (1: the skeleton's) */
     float twist_share; /* share of the wrist roll the forearm twist bone takes (Twist1: half of it) */
+    /* Spaghetti guards (all 0 = off, the old behaviour; zero-initialise the struct): */
+    float soft;        /* reach fraction (0.5..0.99) where the target is eased toward the straight arm, not cut at it */
+    float give;        /* metres the shoulder may slide toward a target beyond the soft limit (arms too short) */
+    float fore_roll;   /* share of the wrist roll taken by the Forearm bone itself, before the twist bones */
+    float roll_prev;   /* last frame's wrist roll (VamArmPose.roll), unwrapped against while has_roll_prev */
+    int has_roll_prev;
 } VamArmParams;
 
 typedef struct {
     int clamped;
     float reach;                              /* shoulder-target distance over the chain length */
+    float dist;                               /* shoulder-target distance (m, before any give / easing) */
+    float eased;                              /* distance the IK was asked for over dist (1: not eased) */
+    float give;                               /* metres the shoulder slid toward the target */
+    float elbow_deg;                          /* the angle at the elbow (180: straight) */
+    float roll;                               /* wrist roll about the forearm (radians, continuous) */
     VrVec3 shoulder, elbow, wrist, twist_pos, twist1_pos;
     VrQuat upper_rot, fore_rot, hand_rot, twist_rot, twist1_rot; /* model rotations */
 } VamArmPose;
@@ -176,38 +202,75 @@ static inline void vam_solve_arm(const VamArmBind *b, VrVec3 shoulder, VrVec3 ta
                                  const VamArmParams *p, VamArmPose *out) {
     const float scale = p->arm_scale > 0.0f ? p->arm_scale : 1.0f;
     const float a = vam_upper_len(b) * scale, c = vam_fore_len(b) * scale;
+    const float chain = a + c, hi = chain * 0.9995f;
+    const float dist0 = vam_len(vr_sub(target, shoulder));
+    out->dist = dist0;
+    out->give = 0.0f;
+    out->eased = 1.0f;
+    /* Arms shorter than the player's: the shoulder slides toward a target past the soft limit (up to
+     * `give`), then the rest is eased in (exponential approach to the straight arm) so the elbow never
+     * snaps straight or hyperextends; bone lengths are never touched. */
+    const float s0 = p->soft >= 0.5f ? chain * (p->soft < 0.99f ? p->soft : 0.99f) : hi;
+    if (p->give > 0.0f && dist0 > s0) {
+        const float g = fminf(p->give, dist0 - s0);
+        shoulder = vr_add(shoulder, vr_scale(vr_sub(target, shoulder), g / dist0));
+        out->give = g;
+    }
+    VrVec3 aim_target = target;
+    {
+        const float len = vam_len(vr_sub(target, shoulder));
+        if (p->soft >= 0.5f && len > s0 && len > 1e-6f) {
+            const float span = hi - s0 > 1e-5f ? hi - s0 : 1e-5f;
+            const float eased = s0 + span * (1.0f - expf(-(len - s0) / span));
+            aim_target = vr_add(shoulder, vr_scale(vr_sub(target, shoulder), eased / len));
+            out->eased = eased / len;
+        }
+    }
     VrVec3 wrist;
     int clamped = 0;
-    const VrVec3 elbow = vam_two_bone(shoulder, target, a, c, p->pole, &wrist, &clamped);
+    const VrVec3 elbow = vam_two_bone(shoulder, aim_target, a, c, p->pole, &wrist, &clamped);
+    if (out->eased < 0.999f || out->give > 0.0f) clamped = 1;
     const VrVec3 reach_dir = vam_norm(vr_sub(wrist, shoulder), vr_v3(0, -1, 0));
-    const VrVec3 pole_dir = vam_norm(vam_perp(p->pole, reach_dir), vam_any_perp(reach_dir));
+    const VrVec3 pole_dir = vam_pole_perp(p->pole, reach_dir);
 
     const VrVec3 bind_upper = vam_norm(vr_sub(b->fore, b->upper), vr_v3(1, 0, 0));
     const VrVec3 new_upper = vam_norm(vr_sub(elbow, shoulder), bind_upper);
-    const VrQuat upper = vam_aim_with_twist(bind_upper, new_upper, vam_perp(p->pole, bind_upper), pole_dir);
+    const VrQuat upper = vam_aim_with_twist(bind_upper, new_upper, vam_pole_perp(p->pole, bind_upper), pole_dir);
     const VrVec3 bind_fore = vam_norm(vr_sub(b->hand, b->fore), vr_v3(1, 0, 0));
     const VrVec3 new_fore = vam_norm(vr_sub(wrist, elbow), bind_fore);
-    const VrQuat fore = vam_aim_with_twist(bind_fore, new_fore, vam_perp(p->pole, bind_fore), pole_dir);
+    const VrQuat fore_aim = vam_aim_with_twist(bind_fore, new_fore, vam_pole_perp(p->pole, bind_fore), pole_dir);
 
     out->clamped = clamped;
-    out->reach = vam_len(vr_sub(target, shoulder)) / (a + c > 1e-4f ? a + c : 1e-4f);
+    out->reach = dist0 / (chain > 1e-4f ? chain : 1e-4f);
+    out->elbow_deg = acosf(vr_clampf(vr_dot(vam_norm(vr_sub(shoulder, elbow), vr_v3(0, 1, 0)), vam_norm(vr_sub(wrist, elbow), vr_v3(0, -1, 0))), -1.0f, 1.0f)) * (180.0f / VR_PI);
     out->shoulder = shoulder;
     out->elbow = elbow;
     out->wrist = wrist;
     out->upper_rot = vr_qnormalize(vr_qmul(upper, b->upper_rot));
-    out->fore_rot = vr_qnormalize(vr_qmul(fore, b->fore_rot));
     out->hand_rot = vr_qnormalize(hand_rot);
 
-    /* The forearm twist bones take part of the wrist roll (less candy-wrapping at the wrist). */
-    const float share = vr_clampf(p->twist_share, 0.0f, 1.0f);
-    float roll = 0.0f;
-    const VrVec3 thumb_hand = vam_norm(vam_perp(vr_qrotate(vr_qmul(out->hand_rot, vr_qconj(b->hand_rot)), b->thumb), new_fore), vr_v3(0, 0, 0));
-    const VrVec3 thumb_fore = vam_norm(vam_perp(vr_qrotate(fore, b->thumb), new_fore), vr_v3(0, 0, 0));
-    if (vam_len(thumb_hand) > 0.5f && vam_len(thumb_fore) > 0.5f) roll = vam_signed_angle(thumb_fore, thumb_hand, new_fore);
+    /* The wrist roll about the forearm: swing-twist of the hand's rotation relative to the forearm's
+     * (stable at any wrist bend, unlike projecting the thumb), unwrapped against last frame's so it
+     * never snaps by a turn. The Forearm bone takes `fore_roll` of it, the twist bones the rest
+     * (less candy-wrapping than all of it at the wrist). */
+    const VrQuat hand_delta = vr_qmul(out->hand_rot, vr_qconj(b->hand_rot));
+    VrQuat rel = vr_qnormalize(vr_qmul(hand_delta, vr_qconj(fore_aim)));
+    if (rel.w < 0.0f) rel = vr_q(-rel.x, -rel.y, -rel.z, -rel.w);
+    float roll = 2.0f * atan2f(rel.x * new_fore.x + rel.y * new_fore.y + rel.z * new_fore.z, rel.w);
+    if (p->has_roll_prev && isfinite(p->roll_prev)) {
+        float d = roll - p->roll_prev;
+        d -= 2.0f * VR_PI * floorf((d + VR_PI) / (2.0f * VR_PI));
+        roll = vr_clampf(p->roll_prev + d, -2.0f * VR_PI, 2.0f * VR_PI);
+    }
+    out->roll = roll;
+    const float fs = vr_clampf(p->fore_roll, 0.0f, 1.0f), share = vr_clampf(p->twist_share, 0.0f, 1.0f);
+    const VrQuat fore = vr_qnormalize(vr_qmul(vam_axis_angle(new_fore, roll * fs), fore_aim));
+    const float rem = roll * (1.0f - fs);
+    out->fore_rot = vr_qnormalize(vr_qmul(fore, b->fore_rot));
     out->twist_pos = wrist;
     out->twist1_pos = vam_lerp(elbow, wrist, b->twist1_t);
-    out->twist_rot = vr_qnormalize(vr_qmul(vr_qmul(vam_axis_angle(new_fore, roll * share), fore), b->twist_rot));
-    out->twist1_rot = vr_qnormalize(vr_qmul(vr_qmul(vam_axis_angle(new_fore, roll * share * 0.5f), fore), b->twist1_rot));
+    out->twist_rot = vr_qnormalize(vr_qmul(vr_qmul(vam_axis_angle(new_fore, rem * share), fore), b->twist_rot));
+    out->twist1_rot = vr_qnormalize(vr_qmul(vr_qmul(vam_axis_angle(new_fore, rem * share * 0.5f), fore), b->twist1_rot));
 }
 
 /* ---- targets ---- */

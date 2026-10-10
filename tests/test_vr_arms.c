@@ -5,6 +5,7 @@
 #include "vr_arm_math.h"
 #include "vr_fp_math.h"
 #include <stdio.h>
+#include <string.h>
 
 static int failures, checks;
 #define CHECK(cond, ...) do { ++checks; if (!(cond)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); ++failures; } } while (0)
@@ -42,6 +43,7 @@ static VamArmBind right_bind(void) {
 }
 static VamArmParams right_params(void) {
     VamArmParams p;
+    memset(&p, 0, sizeof(p));
     p.pole = vam_norm(vr_v3(-0.4f, -0.85f, 0.35f), vr_v3(0, -1, 0)); /* out (-X), down, back (+Z) */
     p.arm_scale = 1.0f;
     p.twist_share = 1.0f;
@@ -333,10 +335,84 @@ static void test_body_follow(void) {
     printf("PASS body follow\n");
 }
 
+/* Spaghetti guards: bone lengths stay, a far target is eased not cut, the roll is continuous. */
+static void test_spaghetti(void) {
+    const VamArmBind b = right_bind();
+    VamArmParams p = right_params();
+    p.soft = 0.92f;
+    p.give = 0.04f;
+    p.fore_roll = 0.35f;
+    const float a = vam_upper_len(&b), c = vam_fore_len(&b);
+    const VrVec3 shoulder = b.upper;
+    VamArmPose o;
+    /* sweep a target out through and past the reach: the elbow angle and the wrist move continuously,
+     * the FK (bind locals = fixed bone lengths) always rebuilds the solved chain */
+    float worst = 0.0f, prev_elbow = -1.0f;
+    for (int i = 0; i <= 400; ++i) {
+        const float d = 0.30f + 0.5f * (float)i / 400.0f; /* 0.30 .. 0.80 m, chain is 0.556 */
+        vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(-0.2f * d, -0.3f * d, -0.93f * d)), b.hand_rot, &p, &o);
+        VrVec3 fe, fw;
+        fk(&b, &o, &fe, &fw);
+        CHECK(near_v(fw, o.wrist, 2e-3f) && near_v(fe, o.elbow, 2e-3f), "FK matches at d=%.3f", d);
+        CHECK(near_f(vam_len(vr_sub(o.elbow, o.shoulder)), a, 1e-4f) && near_f(vam_len(vr_sub(o.wrist, o.elbow)), c, 1e-4f),
+              "bone lengths kept at d=%.3f", d);
+        if (prev_elbow >= 0.0f && fabsf(o.elbow_deg - prev_elbow) > worst) worst = fabsf(o.elbow_deg - prev_elbow);
+        prev_elbow = o.elbow_deg;
+    }
+    CHECK(worst < 3.0f, "elbow angle changes smoothly through the reach limit (worst step %.2f deg)", worst);
+    CHECK(o.clamped && o.give > 0.0f && o.give <= 0.04f + 1e-6f && o.elbow_deg < 179.9f && o.eased < 1.0f,
+          "far target: shoulder gives %.3f, eased %.3f, elbow %.1f deg", o.give, o.eased, o.elbow_deg);
+    CHECK(vam_len(vr_sub(o.wrist, o.shoulder)) <= a + c, "never beyond the chain");
+    /* the roll is continuous across +-180 deg, and the Forearm bone takes its share */
+    vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(0.05f, -0.25f, -0.32f)), b.hand_rot, &p, &o);
+    const VrVec3 fd = vam_norm(vr_sub(o.wrist, o.elbow), vr_v3(1, 0, 0));
+    const VrQuat base = o.fore_rot;
+    p.has_roll_prev = 0;
+    float prev = 0.0f;
+    float step_worst = 0.0f, roll0 = 0.0f;
+    for (int i = 0; i <= 120; ++i) {
+        const float ang = (float)i * 3.0f * VR_DEG; /* 0 .. 360 deg in 3 deg steps */
+        vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(0.05f, -0.25f, -0.32f)),
+                      vr_qmul(vam_axis_angle(fd, ang), base), &p, &o);
+        if (i > 0 && fabsf(o.roll - prev) > step_worst) step_worst = fabsf(o.roll - prev);
+        if (i == 0) roll0 = o.roll;
+        prev = o.roll;
+        p.roll_prev = o.roll;
+        p.has_roll_prev = 1;
+        if (i == 20) CHECK(near_f(o.roll - roll0, 60.0f * VR_DEG, 0.02f), "roll measured %f", (o.roll - roll0) / VR_DEG);
+    }
+    CHECK(step_worst < 4.0f * VR_DEG, "roll unwrapped through 180 deg (worst step %.2f deg)", step_worst / VR_DEG);
+    /* fore_roll 0.5: the forearm bone itself rolls half of 60 deg */
+    p.has_roll_prev = 0;
+    p.fore_roll = 0.5f;
+    vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(0.05f, -0.25f, -0.32f)), vr_qmul(vam_axis_angle(fd, 1.0472f), base), &p, &o);
+    const VrQuat dq = vr_qmul(o.fore_rot, vr_qconj(base));
+    CHECK(near_f(2.0f * atan2f(vr_dot(vr_v3(dq.x, dq.y, dq.z), fd), dq.w < 0 ? -dq.w : dq.w), 0.5236f, 0.02f) || near_f(fabsf(dq.w), cosf(0.2618f), 0.02f),
+          "forearm takes half the roll (w %f)", dq.w);
+    /* the wrist bent across the forearm (thumb projection would vanish): the roll is still defined */
+    p.fore_roll = 0.0f;
+    vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_v3(0.05f, -0.25f, -0.32f)),
+                  vr_qmul(vam_axis_angle(vam_any_perp(fd), 1.5708f), base), &p, &o);
+    CHECK(isfinite(o.roll) && vr_qvalid(o.twist_rot), "roll finite with a 90 deg wrist bend");
+    /* a pole lined up with the reach never flips the elbow */
+    float worst2 = 0.0f;
+    VrVec3 pe = vr_v3(0, 0, 0);
+    p.has_roll_prev = 0;
+    for (int i = 0; i <= 200; ++i) {
+        const VrVec3 n = vam_norm(vr_add(vr_scale(p.pole, 1.0f), vr_v3(0.004f * (float)(i - 100), 0.0f, 0.0f)), vr_v3(0, -1, 0));
+        vam_solve_arm(&b, shoulder, vr_add(shoulder, vr_scale(n, 0.4f)), b.hand_rot, &p, &o);
+        if (i > 0 && vam_len(vr_sub(o.elbow, pe)) > worst2) worst2 = vam_len(vr_sub(o.elbow, pe));
+        pe = o.elbow;
+    }
+    CHECK(worst2 < 0.03f, "no elbow flip with the hand along the pole (worst step %.4f m)", worst2);
+    printf("PASS spaghetti guards\n");
+}
+
 int main(void) {
     test_math();
     test_two_bone();
     test_arm();
+    test_spaghetti();
     test_mirror();
     test_hand();
     test_game_mapping();

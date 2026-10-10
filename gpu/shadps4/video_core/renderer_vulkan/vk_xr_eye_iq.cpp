@@ -52,6 +52,10 @@ void Apply(Settings& s, const std::string& key, const std::string& value) {
         }
     } else if (key == "dlss_sharpen") {
         s.dlss_sharpen = std::clamp(float(std::atof(value.c_str())), 0.0f, 1.0f);
+    } else if (key == "dlss_mask") {
+        s.dlss_mask = !(value == "0" || value == "off" || value == "false");
+    } else if (key == "dlss_mask_m") {
+        s.dlss_mask_m = XrDlssLogic::ParseMaskMeters(value, s.dlss_mask_m);
     } else if (key == "sharpen") {
         s.sharpen = std::clamp(float(std::atof(value.c_str())), 0.0f, 1.0f);
     } else if (key == "res") {
@@ -81,6 +85,8 @@ Settings FromEnv() {
     env("BB_XR_DLSS_QUALITY", "dlss_quality");
     env("BB_XR_DLSS_PRESET", "dlss_preset");
     env("BB_XR_DLSS_SHARPEN", "dlss_sharpen");
+    env("BB_XR_DLSS_MASK", "dlss_mask");
+    env("BB_XR_DLSS_MASK_M", "dlss_mask_m");
     return s;
 }
 
@@ -99,8 +105,14 @@ void Describe(const Settings& s, const char* where) {
         } else {
             std::snprintf(quality, sizeof(quality), "from the size, frame %s", res);
         }
-        std::printf("VR IQ (%s): upscale dlss (quality %s, preset %c, sharpen %.2f)\n", where,
-                    quality, XrDlssLogic::PresetLetter(s.dlss_preset), s.dlss_sharpen);
+        char mask[48];
+        if (s.dlss_mask && s.dlss_mask_m > 0.0f) {
+            std::snprintf(mask, sizeof(mask), "arm mask %.2f m", s.dlss_mask_m);
+        } else {
+            std::snprintf(mask, sizeof(mask), "arm mask off");
+        }
+        std::printf("VR IQ (%s): upscale dlss (quality %s, preset %c, sharpen %.2f, %s)\n", where,
+                    quality, XrDlssLogic::PresetLetter(s.dlss_preset), s.dlss_sharpen, mask);
     } else {
         std::printf("VR IQ (%s): aa %s, upscale %s (frame %s, sharpen %.2f)\n", where,
                     s.fxaa ? "fxaa" : "off", s.fsr1 ? "fsr1" : "off", res, s.sharpen);

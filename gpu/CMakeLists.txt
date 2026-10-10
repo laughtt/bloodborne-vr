@@ -121,6 +121,7 @@ add_host_shader(post_process.frag post_process_frag)
 add_host_shader(xr_opaque.frag xr_opaque_frag)
 add_host_shader(xr_fxaa.comp xr_fxaa_comp)
 add_host_shader(camera_motion.comp camera_motion_comp)
+add_host_shader(xr_dlss_mask.comp xr_dlss_mask_comp)
 add_host_shader(upscale_merge.comp upscale_merge_comp)
 add_host_shader(upscale_reactive.comp upscale_reactive_comp)
 add_host_shader(taa.comp taa_comp)
@@ -368,6 +369,12 @@ target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan:
 add_executable(xr-dlss-test EXCLUDE_FROM_ALL ../tests/test_xr_dlss.cpp)
 target_compile_options(xr-dlss-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(xr-dlss-test PRIVATE ..)
+
+# bbport VR resize bookkeeping (renderer_vulkan/xr_resize_logic.h): frame size debounce, resize
+# reason, swapchain size tracking (device-lost crashes on a one-frame eye size flip).
+add_executable(xr-resize-test EXCLUDE_FROM_ALL ../tests/test_xr_resize.cpp)
+target_compile_options(xr-resize-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(xr-resize-test PRIVATE ..)
 
 # bbport: the DLSS bridge (gpu/dlss_bridge, bbport_dlss.dll, MIT) links NVIDIA's DLSS SDK, which
 # ships MSVC libraries only, so it is its own MSVC project. BB_DLSS_SDK_ROOT (a checkout or copy

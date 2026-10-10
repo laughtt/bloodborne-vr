@@ -141,6 +141,9 @@ A1/A2 (animation; any thread; a busy flag)   rax == player pose + 0x18 ?
 | `arm_rest=<out,up,forward[,pitch_deg]>` | rest pose relative to the shoulder (0.02, -0.30, 0.32, 25) |
 | `arm_pole=<out,down,back>` | elbow pole (0.4, 0.85, 0.35; the sandbox's `elbow_pole`) |
 | `arm_twist=<0..1>` | forearm twist share (1) |
+| `arm_soft=<0.5..0.99>` | reach fraction where a far target is eased toward the straight arm instead of cut (0.92; 0 = hard clamp) |
+| `arm_give=<m>` | metres the shoulder may slide toward a target past the soft limit (0.04; the chain is only 0.556 m) |
+| `arm_fore_roll=<0..1>` | share of the wrist roll the Forearm bone takes before the twist bones (0.35) |
 | `arm_fake_r= / arm_fake_l=<x,y,z[,yaw,pitch,roll]>` | fake grips relative to the head (m, deg; right default 0.18, -0.38, -0.32, pitch -20) |
 | `arm_offset=<x,y,z[,pitch]>` | grip -> wrist offset, right hand |
 

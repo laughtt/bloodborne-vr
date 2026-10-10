@@ -115,9 +115,20 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
         impl->module ? reinterpret_cast<BbDlssGetApiFn>(GetProcAddress(impl->module, "BbDlssGetApi"))
                      : nullptr;
     impl->api = get_api ? get_api() : nullptr;
-    // ABI 1 bridges keep working for the flat game (slot 0); the VR eyes need ABI 2.
+    // ABI 1 bridges keep working for the flat game (slot 0); the VR eyes need ABI 2, the bias
+    // mask ABI 3. A bridge newer than this build (e.g. the ABI 3 dll with an older exe) is not
+    // loaded: it would read a bigger evaluation struct than the exe fills in.
     if (!impl->api || impl->api->abi < 1 || impl->api->abi > BBPORT_DLSS_BRIDGE_ABI) {
-        impl->Disable("bbport_dlss.dll is missing or from another version");
+        if (impl->api) {
+            char message[160];
+            std::snprintf(message, sizeof(message),
+                          "bbport_dlss.dll is ABI %u but this build needs ABI 1-%d (use the "
+                          "bbport_dlss.dll that matches this exe)",
+                          impl->api->abi, BBPORT_DLSS_BRIDGE_ABI);
+            impl->Disable(message);
+        } else {
+            impl->Disable("bbport_dlss.dll is missing or not a DLSS bridge");
+        }
         return;
     }
     // NGX writes its logs and model updates here: beside the saves and shader caches.
@@ -201,6 +212,10 @@ bool Dlss::HasSlots() const {
     return impl->api && impl->api->abi >= 2;
 }
 
+bool Dlss::HasBiasMask() const {
+    return impl->api && impl->api->abi >= 3;
+}
+
 bool Dlss::HasFeature(const FeatureDesc& desc, u32 slot) const {
     return slot < Slots && impl->features[slot] && *impl->features[slot] == desc;
 }
@@ -237,7 +252,8 @@ bool Dlss::Evaluate(vk::CommandBuffer command, const Frame& frame, u32 slot) {
     };
     const BbDlssEvaluate parameters{image(frame.color),  image(frame.depth), image(frame.motion),
                                     image(frame.output), frame.jitter_x,     frame.jitter_y,
-                                    frame.reset ? 1 : 0, frame.frame_ms,     frame.sharpness};
+                                    frame.reset ? 1 : 0, frame.frame_ms,     frame.sharpness,
+                                    HasBiasMask() ? image(frame.bias_mask) : BbDlssImage{}};
     return (slot == FlatSlot ? impl->api->Evaluate(command, &parameters)
                              : impl->api->EvaluateSlot(slot, command, &parameters)) != 0;
 }
@@ -287,6 +303,9 @@ std::string Dlss::Problem() const {
     return {};
 }
 bool Dlss::HasSlots() const {
+    return false;
+}
+bool Dlss::HasBiasMask() const {
     return false;
 }
 bool Dlss::HasFeature(const FeatureDesc&, u32) const {

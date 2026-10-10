@@ -12,7 +12,7 @@ walking the PE import tables; no ldd needed). Scripts, patches and run.py come f
 (run tools/release/export_public.py first), so only cleared files are packaged.
 
 Layout of BloodborneVR-<version>/ in the zip:
-    BloodborneVR.bat, README.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
+    BloodborneVR.exe (tiny launcher stub, built here), BloodborneVR-console.bat (fallback), README.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
     launcher/{bbvr_launcher,bbvr_menu,bbvr_settings}.py (start-up settings menu), defaults/{fp,stereo}.txt,
     python/ (embeddable Python, optional)
     run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/
@@ -28,6 +28,9 @@ import struct
 import sys
 import urllib.request
 import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_stub  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 ZIPSRC = REPO / 'tools' / 'release' / 'zip'
@@ -167,6 +170,7 @@ def main():
     ap.add_argument('--allow-online', action='store_true', help='skip the online-strings check of the host exe (never for a public build)')
     ap.add_argument('--version', default='0.1.0-alpha1')
     ap.add_argument('--out', type=Path, default=REPO / 'out' / 'release')
+    ap.add_argument('--stub', type=Path, help='prebuilt BloodborneVR.exe (default: build tools/release/zip/exe with clang)')
     ap.add_argument('--strip', default=None, help='llvm-strip to drop debug info (default: clang64/bin/llvm-strip.exe if present)')
     args = ap.parse_args()
 
@@ -226,7 +230,15 @@ def main():
     shutil.copytree(ex / 'patches', stage / 'patches')
     shutil.copytree(ex / 'scripts', stage / 'scripts',
                     ignore=shutil.ignore_patterns('*.sh', '__pycache__', 'test_*.py', 'vr_frames.py'))
-    for item in ('BloodborneVR.bat', 'README.txt'):
+    stub = args.stub
+    if not stub:
+        try:
+            stub = build_stub.build(REPO / 'out' / 'release_cache' / 'BloodborneVR.exe', args.version, args.msys2)
+        except RuntimeError as error:
+            shutil.rmtree(stage)
+            sys.exit(f'cannot build BloodborneVR.exe: {error}')
+    shutil.copyfile(stub, stage / 'BloodborneVR.exe')
+    for item in ('BloodborneVR-console.bat', 'README.txt'):
         text = (ZIPSRC / item).read_text(encoding='utf-8')
         (stage / item).write_bytes(text.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
     (stage / 'launcher').mkdir()
@@ -254,6 +266,10 @@ def main():
         for path in sorted(stage.rglob('*')):
             if path.is_file():
                 z.write(path, f'{name}/{path.relative_to(stage).as_posix()}')
+    sums = [(hashlib.sha256(path.read_bytes()).hexdigest(), n) for path, n in
+            ((archive, archive.name), (stage / 'BloodborneVR.exe', 'BloodborneVR.exe'), (bin_dir / 'bb-probe.exe', 'bin/bb-probe.exe'))]
+    (args.out / 'SHA256SUMS.txt').write_text(''.join(f'{h} *{n}\n' for h, n in sums), encoding='ascii')
+    print(f'BloodborneVR.exe: {(stage / "BloodborneVR.exe").stat().st_size / 1024:.0f} KB; sums: {args.out / "SHA256SUMS.txt"}')
     total = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file())
     dlls = sorted(p.name for p in bin_dir.iterdir())
     print(f'release folder: {stage}')

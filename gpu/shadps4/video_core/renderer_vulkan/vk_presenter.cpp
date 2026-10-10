@@ -404,6 +404,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    // bbport VR: a new frame size recreates the FSR / FXAA pass images and the DLSS eye outputs
+    // in this frame's passes; earlier frames may still read them on the GPU (BB_FRAMES_AHEAD).
+    if (const XrResize::Size size{frame->width, frame->height}; size != prepared_size) {
+        if (prepared_size.Valid()) {
+            draw_scheduler.WaitSubmitted();
+            if (Xr::Get()) {
+                std::printf("VR: frames now %ux%u (were %ux%u): GPU idle before the passes "
+                            "resize\n",
+                            size.width, size.height, prepared_size.width, prepared_size.height);
+                std::fflush(stdout);
+            }
+        }
+        prepared_size = size;
+    }
     // bbport VR: this frame's scene camera (prepared on the GPU thread right after its draws).
     frame->has_camera_view = rasterizer->GetCameraMotion().CurrentView(frame->camera_view);
     // bbport VR (BB_XR_MODE=alt): the eye the frame's camera was set up for, matched here, in
@@ -530,7 +544,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
     }
-    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+    expected_ratio.store(static_cast<float>(image_size.width) / static_cast<float>(image_size.height),
+                         std::memory_order_relaxed);
 
     // bbport VR image quality (vk_xr_eye_iq.h): spatial AA of 3D frames, FSR 1 to the eye size.
     // Both without history: alternate-eye stereo stays clean.
@@ -1040,16 +1055,54 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     {
         const vk::Extent2D extent = swapchain.GetExtent();
-        SetExpectedGameSize(s32(extent.width), s32(extent.height));
-        // bbport VR image quality (BB_XR_UPSCALE=fsr1): the frame, which an eye swapchain copies
-        // 1:1, at its own size instead of the window's; the window gets it scaled down.
+        // bbport VR image quality (BB_XR_UPSCALE=fsr1|dlss): the frame, which an eye swapchain
+        // copies 1:1, at its own size instead of the window's; the window gets it scaled down.
+        // The size is computed here in full and published once (the GPU thread reads it in
+        // GetRenderFrame): writing the window size first and the eye size after it let the GPU
+        // thread catch the window size for one frame, which recreated an eye swapchain and its
+        // DLSS feature twice under in-flight work (device lost, 2026-10-10 crashes). A new size
+        // also has to hold for a few presents (XrResize::SizeDebounce): a one-frame target (a
+        // frame with another display buffer size, say) never reaches the frames and swapchains.
         {
-            const u64 source = xr_iq_source.load(std::memory_order_relaxed);
-            u32 iq_w = 0, iq_h = 0;
-            XrEyeIq::TargetSize(XrEyeIq::Current(), u32(source >> 32), u32(source), iq_w, iq_h);
-            if (iq_w && iq_h) {
-                expected_frame_width = iq_w;
-                expected_frame_height = iq_h;
+            XrResize::Inputs in{};
+            in.window = FitGameSize(s32(extent.width), s32(extent.height));
+            in.source = XrResize::Unpack(xr_iq_source.load(std::memory_order_relaxed));
+            XrEyeIq::TargetSize(XrEyeIq::Current(), in.source.width, in.source.height,
+                                in.iq.width, in.iq.height);
+            const XrResize::Size before = frame_size_debounce.Applied();
+            const XrResize::Size target = XrResize::Target(in);
+            if (frame_size_debounce.Update(target)) {
+                const XrResize::Size after = frame_size_debounce.Applied();
+                expected_frame_size.store(XrResize::Pack(after), std::memory_order_release);
+                if (before.Valid() && Xr::Get()) {
+                    std::printf("VR: frame size %ux%u -> %ux%u (%s; window %ux%u, display buffer "
+                                "%ux%u, eye IQ %ux%u)\n",
+                                before.width, before.height, after.width, after.height,
+                                XrResize::ChangeReason(frame_size_inputs, in), in.window.width,
+                                in.window.height, in.source.width, in.source.height,
+                                in.iq.width, in.iq.height);
+                    std::fflush(stdout);
+                }
+                frame_size_inputs = in;
+            } else if (target.Valid() && target != before && frame_size_debounce.Pending() == 1 &&
+                       Xr::Get()) {
+                // A different size for the first time: held back. Logged (at most once a second)
+                // with what it was made of, so a one-frame flip shows its cause.
+                static auto next_log = std::chrono::steady_clock::time_point{};
+                static u32 held_back = 0;
+                ++held_back;
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_log) {
+                    next_log = now + std::chrono::seconds(1);
+                    std::printf("VR: frame size: holding back %ux%u (stays %ux%u until it holds "
+                                "3 presents; %s; window %ux%u, display buffer %ux%u, eye IQ "
+                                "%ux%u; %u so far)\n",
+                                target.width, target.height, before.width, before.height,
+                                XrResize::ChangeReason(frame_size_inputs, in), in.window.width,
+                                in.window.height, in.source.width, in.source.height,
+                                in.iq.width, in.iq.height, held_back);
+                    std::fflush(stdout);
+                }
             }
         }
         const vk::ImageSubresourceRange color_range{
@@ -1164,9 +1217,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const bool hud_cinema = hud && frame->hud_fullscreen;
             if (hud_cinema) {
                 if (!is_reusing_frame) {
+                    XrChainResize(2, frame->hud_width, frame->hud_height);
                     xr_flat = xr->AcquireFlat(frame->hud_width, frame->hud_height,
                                               frame->hud_format);
                     if (xr_flat) {
+                        xr_chain_sizes[2].Acquired({frame->hud_width, frame->hud_height});
                         CopyToFlat(instance.GetDevice(), cmdbuf, frame->hud_image,
                                    frame->hud_format, {frame->hud_width, frame->hud_height},
                                    *xr_flat, vk::ImageLayout::eGeneral);
@@ -1174,9 +1229,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 }
             } else if (alt && frame->stereo.kind == xrstereo::Kind::Eye) {
                 if (!is_reusing_frame) {
+                    const int eye_chain = frame->stereo.eye & 1;
+                    XrChainResize(eye_chain, frame->width, frame->height);
                     xr_eye = xr->AcquireEye(frame->stereo.eye, frame->width, frame->height,
                                             swapchain.GetSurfaceFormat().format);
                     if (xr_eye) {
+                        xr_chain_sizes[eye_chain].Acquired({frame->width, frame->height});
                         CopyToFlat(instance.GetDevice(), cmdbuf, frame->image,
                                    swapchain.GetSurfaceFormat().format,
                                    {frame->width, frame->height}, *xr_eye,
@@ -1184,9 +1242,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     }
                 }
             } else if (!alt || frame->stereo.kind == xrstereo::Kind::Mono) {
+                XrChainResize(2, extent.width, extent.height);
                 xr_flat = xr->AcquireFlat(extent.width, extent.height,
                                           swapchain.GetSurfaceFormat().format);
                 if (xr_flat) {
+                    xr_chain_sizes[2].Acquired({extent.width, extent.height});
                     CopyToFlat(instance.GetDevice(), cmdbuf, swapchain_image,
                                swapchain.GetSurfaceFormat().format, extent, *xr_flat);
                 }
@@ -1195,9 +1255,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             // carries its UI itself or went to the cinema screen.
             if (!is_reusing_frame && XrHud::Separating()) {
                 if (hud && !hud_cinema) {
+                    XrChainResize(3, frame->hud_width, frame->hud_height);
                     xr_hud = xr->AcquireHud(frame->hud_width, frame->hud_height,
                                             frame->hud_format);
                     if (xr_hud) {
+                        xr_chain_sizes[3].Acquired({frame->hud_width, frame->hud_height});
                         CopyToFlat(instance.GetDevice(), cmdbuf, frame->hud_image,
                                    frame->hud_format, {frame->hud_width, frame->hud_height},
                                    *xr_hud, vk::ImageLayout::eGeneral, false);
@@ -1282,27 +1344,55 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
-    if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
+    const XrResize::Size expected =
+        XrResize::Unpack(expected_frame_size.load(std::memory_order_acquire));
+    if (frame->width != expected.width || frame->height != expected.height ||
         frame->is_hdr != swapchain.GetHDR()) {
-        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+        RecreateFrame(frame, expected.width, expected.height);
     }
 
     return frame;
 }
 
-void Presenter::SetExpectedGameSize(s32 width, s32 height) {
+XrResize::Size Presenter::FitGameSize(s32 width, s32 height) const {
     if (width <= 0 || height <= 0) {
-        return; // no surface (minimized window): keep the last frame size
+        return {}; // no surface (minimized window): the debounce keeps the last frame size
     }
     const float ratio = (float)width / (float)height;
-
-    expected_frame_height = height;
-    expected_frame_width = width;
-    if (ratio > expected_ratio) {
-        expected_frame_width = static_cast<s32>(height * expected_ratio);
+    const float game_ratio = expected_ratio.load(std::memory_order_relaxed);
+    XrResize::Size size{u32(width), u32(height)};
+    if (ratio > game_ratio) {
+        size.width = static_cast<u32>(height * game_ratio);
     } else {
-        expected_frame_height = static_cast<s32>(width / expected_ratio);
+        size.height = static_cast<u32>(width / game_ratio);
     }
+    return size;
+}
+
+void Presenter::XrChainResize(int chain, u32 width, u32 height) {
+    // The bridge destroys and recreates a swapchain whose size changes inside its Acquire
+    // (xrDestroySwapchain). Copies into the old images from earlier presents, and the runtime's
+    // own submissions on the shared queue, may still run: wait for the queue first (resizes are
+    // rare: debounced frame size, cinema <-> mono switches).
+    const XrResize::Size size{width, height};
+    if (!xr_chain_sizes[chain].NeedsWait(size)) {
+        return;
+    }
+    static constexpr const char* names[] = {"eye L", "eye R", "flat", "HUD"};
+    const XrResize::Size last = xr_chain_sizes[chain].Last();
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::scoped_lock lock{Scheduler::submit_mutex};
+        (void)instance.GetGraphicsQueue().waitIdle();
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::printf("VR: %s swapchain %ux%u -> %ux%u: waited %.1f ms for the GPU before the bridge "
+                "recreates it\n",
+                names[chain], last.width, last.height, width, height, ms);
+    std::fflush(stdout);
+    // Recreated now (or on the next acquire that gets an image): no second wait for this size.
+    xr_chain_sizes[chain].Acquired(size);
 }
 
 } // namespace Vulkan

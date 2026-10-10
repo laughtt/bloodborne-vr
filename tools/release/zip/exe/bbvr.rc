@@ -1,0 +1,35 @@
+#include <winuser.h>
+#include <winver.h>
+#ifndef BBVR_FILEVER
+#define BBVR_FILEVER 0,1,0,0
+#define BBVR_FILEVER_STR "0.1.0.0"
+#endif
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "bbvr.manifest"
+// The first icon is the one Explorer shows (original art, made by packaging/windows/make_icon.py).
+1 ICON "../../../../launcher/bloodborne.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION BBVR_FILEVER
+PRODUCTVERSION BBVR_FILEVER
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Bloodborne VR launcher (alpha)"
+      VALUE "ProductName", "Bloodborne VR"
+      VALUE "CompanyName", "Bloodborne VR contributors"
+      VALUE "FileVersion", BBVR_FILEVER_STR
+      VALUE "ProductVersion", BBVR_FILEVER_STR
+      VALUE "InternalName", "BloodborneVR"
+      VALUE "OriginalFilename", "BloodborneVR.exe"
+      VALUE "LegalCopyright", "GPL-2.0-or-later. Unofficial fan project; no affiliation with Sony or FromSoftware."
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

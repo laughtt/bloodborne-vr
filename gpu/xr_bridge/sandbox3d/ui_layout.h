@@ -133,11 +133,11 @@ struct UiInventoryEntry {
 /// stamina HUD and the haptics of the game's swings.
 /// The game's hitbox debug overlay ("game" object, "debug_hitboxes"; vr_game_hitbox.h).
 struct UiDebugHitboxes {
-    bool weapon = true;  // the held weapons' hit capsules (every attack's, each shape once)
-    bool attack = true;  // the current attack's shapes highlighted, white flash on a hit
-    bool enemies = true; // enemy hurtboxes (not drawn yet: findings/29 section 5)
+    bool weapon = false; // the held weapons' hit capsules (every attack's, each shape once)
+    bool attack = false; // the current attack's shapes highlighted, white flash on a hit
+    bool enemies = false; // enemy hurtboxes (not drawn yet: findings/29 section 5)
     bool self = false;   // the player's own hurtboxes (chr_c0000)
-    bool hits = true;    // markers where the player's hits landed (3 s)
+    bool hits = false;   // markers where the player's hits landed (3 s)
     float line_mrad = 1.5f;  // line width as an angle (milliradians: ~1.5 px at 1 mrad/px)
     float idle_alpha = 0.6f; // the weapon's shapes outside an attack
 };

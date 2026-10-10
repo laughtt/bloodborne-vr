@@ -132,6 +132,18 @@ def save_mode(user_dir, mode):
         pass
 
 
+def consent_stored(user_dir, env=None):
+    """True when the player already answered (crash_config.json says on / off, or BB_CRASH_REPORTS is set)."""
+    env = os.environ if env is None else env
+    if env.get('BB_CRASH_REPORTS') in ('on', 'off'):
+        return True
+    try:
+        data = json.loads(config_path(user_dir).read_text(encoding='utf-8'))
+        return isinstance(data, dict) and data.get('crash_reports') in ('on', 'off')
+    except (OSError, ValueError):
+        return False
+
+
 def ask_consent(user_dir, input_fn=input, interactive=None):
     """First time only: asks on the console, saves on/off. Returns the mode ('ask' when unanswered)."""
     if interactive is None:

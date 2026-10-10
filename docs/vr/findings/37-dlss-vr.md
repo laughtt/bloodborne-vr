@@ -228,3 +228,76 @@ Running in the game or the headset (not launched while the headset was in use). 
   `out/dlss-vr/` test folder, with `NVIDIA-DLSS-LICENSE.txt`. Before any public release that ships
   it, someone must decide whether the GPL/§4e interaction, the attribution and the notification are
   handled.
+
+## 11. Device lost on a one-frame eye size flip (fixed 2026-10-10)
+
+Three crashes (`user/crashes/20261010-122419-exit-1193` FSR 1 on SteamVR,
+`20261010-144052-exit-f634` and `20261010-145315-exit-d1f9` DLSS; the last one while healing)
+end the same way: `VR: <eye> eye images 1920x1080` and, one frame of that eye later,
+`... eye images 2880x1620` (3840x2160 with FSR 1), then `Device lost during submit`. With DLSS the
+eye's feature is recreated twice as well (`DLSS slot 1: 1920x1080 -> 1920x1080`, then
+`-> 2880x1620`). 1920x1080 is the window size, not an eye size.
+
+Cause: the frame size the GPU thread uses in `GetRenderFrame` was written by the present thread in
+two steps per present, first the window size (`SetExpectedGameSize`), then the eye IQ size
+over it. The GPU thread could read it in between and make one frame at the window size; the eye
+swapchain followed it (the bridge's `AcquireEye` destroys and recreates a swapchain whose size
+changes, `xrDestroySwapchain`, while earlier copies into it and the runtime's submissions may still
+run), and so did the DLSS feature and output image. A one-frame change of the IQ source (the
+display buffer size) would have done the same.
+
+Fix (`renderer_vulkan/xr_resize_logic.h`, `tests/test_xr_resize.cpp`, `ninja xr-resize-test`):
+- the present thread computes the size once and publishes it whole (one atomic);
+- a new size is used only after it held 3 presents (`SizeDebounce`); the first one applies at once;
+- before an eye / flat / HUD swapchain this side wrote is recreated, the presenter waits for the
+  graphics queue (under the submit mutex, so the runtime's submissions are covered);
+- a new frame size waits for the draw scheduler's submitted work before the FSR / FXAA pass images
+  and DLSS outputs are recreated; DLSS motion and output images wait the same way (features already
+  did).
+
+Log lines: `VR: frame size A -> B (<reason>; window, display buffer, eye IQ)` when the size really
+changes; `VR: frame size: holding back B (...)` (at most once a second) for a target that did not
+hold, with what it was made of; `VR: eye L swapchain A -> B: waited N ms for the GPU ...`;
+`VR: frames now B (were A): GPU idle before the passes resize`; `VR DLSS: eye output A -> B`.
+In normal play none of them should appear after start-up; a live `res` / `dlss_quality` change
+shows one `frame size` line, then one swapchain line per eye.
+
+## 12. Arms and weapon smear: the bias-current-colour mask (2026-10-10)
+
+The player's arms and weapon move with the hands, but the motion vectors are camera-only
+(section 4), so DLSS reprojects those pixels with a wrong vector and blends in the wrong history:
+blurry, smeared arms. NGX has an input for exactly this, `NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask`
+(`pInBiasCurrentColorMask` in `NVSDK_NGX_VK_DLSS_Eval_Params`): 1 = trust the current frame's colour.
+
+- **Bridge ABI 3** (`BBPORT_DLSS_BRIDGE_ABI`): `BbDlssEvaluate` gets `bias_mask` (a `BbDlssImage`) at
+  the end; a null view means none (the flat game, ABI 2 callers). `EvaluateSlot` maps it to
+  `pInBiasCurrentColorMask`.
+- **Mask pass** (`host_shaders/xr_dlss_mask.comp`, run in `XrDlss::Run` right after the motion pass,
+  same depth view): R8_UNORM at render size; linearises the eye depth with the current projection
+  (`z = zo / (depth - zs)`), takes the radial view distance, writes 1 where it is below
+  `dlss_mask_m`, else 0. Sky/cleared depth is never masked. Binary (no soft edge). The same math is
+  `XrDlssLogic::LinearDepth/ViewDistance/NearMask` (unit tested in `xr-dlss-test`).
+- **Cost**: one 8x8 compute dispatch per game frame at render size, one R8 image.
+- **Side effect**: any geometry nearer than the distance (a wall you press against) is also
+  "trust current", i.e. slightly less temporal stability there.
+
+| Variable (control-file key) | Values | Default |
+|---|---|---|
+| `BB_XR_DLSS_MASK` (`dlss_mask`) | `0` \| `1` | 1 |
+| `BB_XR_DLSS_MASK_M` (`dlss_mask_m`) | metres from the camera, 0 = off, capped at 5 | 0.9 |
+
+Live through `BB_XR_IQ_CONTROL` (the start menu: DLSS tab, "DLSS arm/weapon mask" and "Arm mask
+distance (m)"). The log shows `VR DLSS: arm/weapon bias mask on (surfaces nearer than 0.90 m use the
+current colour)` when DLSS starts and on every change, and the `VR IQ (...)` line ends with
+`arm mask 0.90 m` / `arm mask off`.
+
+**DLL / exe pairing.** An exe built with ABI 3 loads an ABI 1 or 2 bridge (the mask is then off, one
+`VR DLSS: arm mask requested but the bridge has no bias mask` line). An older exe (ABI 2) does not
+load an ABI 3 bridge, because the bridge would read a larger struct than the exe fills in: it logs
+`DLSS: unavailable (bbport_dlss.dll is ABI 3 but this build needs ABI 1-2 ...)` and falls back to
+FSR 1. So bb-probe-all34 needs the ABI 2 dll (`out/bbport_dlss.abi2.dll`), bb-probe-all35 and later
+the ABI 3 one.
+
+Not tested in the headset yet: the 0.9 m default is a guess for the arm and weapon reach in
+first person. `dlss-bridge-smoke` checks that the bridge accepts the mask (right eye) and that the
+output still matches its input.

@@ -12,11 +12,13 @@
 #include <mutex>
 #include <string>
 
+#include "video_core/host_shaders/xr_dlss_mask_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_xr.h"
 #include "video_core/renderer_vulkan/vk_xr_eye_iq.h"
 #include "video_core/renderer_vulkan/xr_dlss_logic.h"
@@ -30,6 +32,14 @@ using XrDlssLogic::Quality;
 
 /// Shared by the rasterizer (scene jitter) and the presenter (flip): both on the GPU thread, the
 /// lock only guards against a future second caller.
+/// Push constants of host_shaders/xr_dlss_mask.comp.
+struct MaskConstants {
+    std::array<float, 4> proj;
+    std::array<float, 2> size;
+    std::array<float, 2> jitter;
+    float threshold;
+};
+
 struct JitterState {
     std::mutex mutex;
     std::atomic<bool> armed{false}; ///< the presenter runs DLSS: jitter the scene
@@ -45,17 +55,6 @@ struct JitterState {
 JitterState& State() {
     static JitterState state;
     return state;
-}
-
-vk::Format UnormOf(vk::Format format) {
-    switch (format) {
-    case vk::Format::eR8G8B8A8Srgb:
-        return vk::Format::eR8G8B8A8Unorm;
-    case vk::Format::eB8G8R8A8Srgb:
-        return vk::Format::eB8G8R8A8Unorm;
-    default:
-        return format;
-    }
 }
 
 bool LdrColor(vk::Format format) {
@@ -112,6 +111,16 @@ struct XrDlss::Impl {
     VideoCore::UniqueImage motion_image;
     vk::UniqueImageView motion_view;
     u32 motion_width = 0, motion_height = 0;
+    // The arm/weapon bias-current-colour mask (findings/37 section 12), R8 at render size.
+    VideoCore::UniqueImage mask_image;
+    vk::UniqueImageView mask_view;
+    u32 mask_width = 0, mask_height = 0;
+    vk::UniqueDescriptorSetLayout mask_desc_layout;
+    vk::UniquePipelineLayout mask_pipeline_layout;
+    vk::UniquePipeline mask_pipeline;
+    int mask_logged = -1; ///< last logged state: -1 none, 0 off, 1 on
+    float mask_logged_m = -1.0f;
+    bool warned_mask_abi = false;
     struct Eye {
         VideoCore::UniqueImage image; ///< RGBA8 UNORM, mutable format (sRGB sampling view)
         vk::UniqueImageView storage_view, sample_view;
@@ -186,6 +195,13 @@ struct XrDlss::Impl {
             return;
         }
         const auto device = instance.GetDevice();
+        if (motion_image) {
+            // The last frame's DLSS may still read it on the GPU.
+            scheduler.WaitSubmitted();
+            std::printf("VR DLSS: motion vectors %ux%u -> %ux%u\n", motion_width, motion_height,
+                        w, h);
+            std::fflush(stdout);
+        }
         motion_view.reset();
         motion_image = VideoCore::UniqueImage(device, instance.GetAllocator());
         motion_image.Create(vk::ImageCreateInfo{
@@ -209,11 +225,117 @@ struct XrDlss::Impl {
         motion_height = h;
     }
 
+    /// The compute pass of the mask, created on first use.
+    void EnsureMaskPipeline() {
+        if (mask_pipeline) {
+            return;
+        }
+        const auto device = instance.GetDevice();
+        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+            {.binding = 0,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        mask_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                          .offset = 0,
+                                          .size = sizeof(MaskConstants)};
+        mask_pipeline_layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*mask_desc_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        }));
+        const auto module = CompileSPV(XR_DLSS_MASK_COMP, device);
+        mask_pipeline = Check(device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                              .module = module,
+                              .pName = "main"},
+                    .layout = *mask_pipeline_layout,
+                }));
+        device.destroyShaderModule(module);
+    }
+
+    void EnsureMask(u32 w, u32 h) {
+        if (mask_image && mask_width == w && mask_height == h) {
+            return;
+        }
+        const auto device = instance.GetDevice();
+        if (mask_image) {
+            // The last frame's DLSS may still read it on the GPU.
+            scheduler.WaitSubmitted();
+        }
+        mask_view.reset();
+        mask_image = VideoCore::UniqueImage(device, instance.GetAllocator());
+        mask_image.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8Unorm,
+            .extent = {w, h, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        mask_view = Check(device.createImageViewUnique({
+            .image = vk::Image(mask_image),
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        mask_width = w;
+        mask_height = h;
+    }
+
+    /// Logs the mask state once and whenever it changes (on/off, distance).
+    void LogMask(bool on, float metres, const Dlss* dlss) {
+        if (on && !dlss->HasBiasMask()) {
+            if (!warned_mask_abi) {
+                warned_mask_abi = true;
+                std::printf("VR DLSS: arm mask requested but the bridge has no bias mask (needs "
+                            "bbport_dlss.dll ABI 3): off\n");
+                std::fflush(stdout);
+            }
+            return;
+        }
+        const int state = on ? 1 : 0;
+        if (state == mask_logged && (!on || metres == mask_logged_m)) {
+            return;
+        }
+        mask_logged = state;
+        mask_logged_m = metres;
+        if (on) {
+            std::printf("VR DLSS: arm/weapon bias mask on (surfaces nearer than %.2f m use the "
+                        "current colour)\n",
+                        metres);
+        } else {
+            std::printf("VR DLSS: arm/weapon bias mask off\n");
+        }
+        std::fflush(stdout);
+    }
+
     void EnsureOutput(Eye& eye, u32 w, u32 h, vk::Format sample_format) {
         if (eye.image && eye.width == w && eye.height == h && eye.sample_format == sample_format) {
             return;
         }
         const auto device = instance.GetDevice();
+        if (eye.image) {
+            // Earlier frames' DLSS writes and presenter passes may still use it on the GPU.
+            scheduler.WaitSubmitted();
+            std::printf("VR DLSS: eye output %ux%u -> %ux%u\n", eye.width, eye.height, w, h);
+            std::fflush(stdout);
+        }
         eye.storage_view.reset();
         eye.sample_view.reset();
         eye.image = VideoCore::UniqueImage(device, instance.GetAllocator());
@@ -385,7 +507,7 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     }
     auto& depth = impl->texture_cache.GetImage(depth_id);
     const auto depth_format = depth.info.pixel_format;
-    if (!LdrColor(color.info.pixel_format) ||
+    if (!LdrColor(color.info.pixel_format) || !LdrColor(in.sample_format) ||
         (depth_format != vk::Format::eD32Sfloat && depth_format != vk::Format::eD32SfloatS8Uint) ||
         depth.info.size.width < w || depth.info.size.height < h ||
         !(color.usage_flags & vk::ImageUsageFlagBits::eSampled)) {
@@ -411,6 +533,13 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     const u32 slot = Dlss::EyeSlot0 + u32(eye_frame.slot);
     auto& eye = impl->eyes[eye_frame.slot];
     impl->EnsureMotion(w, h);
+    const bool mask_on = s.dlss_mask && s.dlss_mask_m > 0.0f;
+    impl->LogMask(mask_on, s.dlss_mask_m, dlss);
+    const bool use_mask = mask_on && dlss->HasBiasMask();
+    if (use_mask) {
+        impl->EnsureMaskPipeline();
+        impl->EnsureMask(w, h);
+    }
     impl->EnsureOutput(eye, ow, oh, in.sample_format);
 
     const Quality quality = XrDlssLogic::FeatureQuality(
@@ -439,10 +568,14 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
 
     // Per-frame views of the game's images (the texture cache owns them; destroyed after use).
     const auto device = impl->instance.GetDevice();
+    // The presenter reads the display buffer in the video-out format (in.sample_format), whose
+    // channel order can differ from the image's own: read it the same way (swapped red/blue
+    // otherwise). Same 8888 class, so the image's mutable format covers it.
+    const vk::Format color_format = vk::Format(XrDlssLogic::DlssColorFormat(u32(in.sample_format)));
     const vk::ImageView color_view = Check(device.createImageView({
         .image = color.GetImage(),
         .viewType = vk::ImageViewType::e2D,
-        .format = UnormOf(color.info.pixel_format),
+        .format = color_format,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     }));
     const vk::ImageView depth_view = Check(device.createImageView({
@@ -488,6 +621,11 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
     barrier(vk::Image(eye.image), vk::ImageLayout::eUndefined, all,
             vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral, all, rw);
+    if (use_mask) {
+        barrier(vk::Image(impl->mask_image), vk::ImageLayout::eUndefined, all,
+                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+    }
 
     // Camera motion from this eye's previous frame (two game frames back with alternate eyes).
     const auto reproject = XrDlssLogic::Reproject(camera, eye_frame.previous);
@@ -497,6 +635,40 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
 
+    // Near surfaces (the arms and weapon follow the hands, the motion vectors only the camera):
+    // DLSS is told to trust the current colour there.
+    if (use_mask) {
+        const MaskConstants push{
+            .proj = camera.proj,
+            .size = {float(w), float(h)},
+            .jitter = jitter,
+            .threshold = s.dlss_mask_m,
+        };
+        const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
+                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo mask_info{.imageView = *impl->mask_view,
+                                                .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 2> writes = {{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .pImageInfo = &depth_info},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .pImageInfo = &mask_info},
+        }};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *impl->mask_pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *impl->mask_pipeline_layout,
+                                    0, writes);
+        cmdbuf.pushConstants(*impl->mask_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             sizeof(push), &push);
+        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        barrier(vk::Image(impl->mask_image), vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+    }
+
     float frame_ms = eye_frame.frame_ms;
     if (frame_ms <= 0.0f || frame_ms > 200.0f) {
         frame_ms = 27.8f; // two frames at 72 Hz
@@ -504,7 +676,7 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     const bool ok = dlss->Evaluate(
         cmdbuf,
         {
-            .color = {color.GetImage(), color_view, UnormOf(color.info.pixel_format),
+            .color = {color.GetImage(), color_view, color_format,
                       vk::ImageAspectFlagBits::eColor, w, h},
             .depth = {depth.GetImage(), depth_view, depth_format, vk::ImageAspectFlagBits::eDepth,
                       depth.info.size.width, depth.info.size.height},
@@ -517,6 +689,11 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
             .reset = eye_frame.reset,
             .frame_ms = frame_ms,
             .sharpness = s.dlss_sharpen, // NGX sharpening: ignored by the DLSS 4 models
+            .bias_mask = use_mask
+                             ? Dlss::Resource{vk::Image(impl->mask_image), *impl->mask_view,
+                                              vk::Format::eR8Unorm,
+                                              vk::ImageAspectFlagBits::eColor, w, h}
+                             : Dlss::Resource{},
         },
         slot);
 

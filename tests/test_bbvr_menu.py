@@ -237,6 +237,25 @@ class DlssTests(unittest.TestCase):
             iq = plan['files']['iq']
             self.assertEqual((iq['upscale'], iq['dlss_quality'], iq['dlss_preset'], iq['dlss_sharpen'], iq['res']),
                              ('dlss', 'performance', 'L', '0.3', '3840x2160'))
+            # The arm/weapon bias mask: on at 0.9 m unless changed, live through the control file.
+            self.assertEqual((env['BB_XR_DLSS_MASK'], env['BB_XR_DLSS_MASK_M']), ('1', '0.9'))
+            self.assertEqual((iq['dlss_mask'], iq['dlss_mask_m']), ('1', '0.9'))
+            opts = {o['id']: o for o in S.SCHEMA}
+            for key in ('dlss_mask', 'dlss_mask_m'):
+                self.assertEqual(opts[key]['tab'], 'dlss')
+                self.assertTrue(S.is_live(opts[key]))
+            vals = S.effective_values({'profile': 'Custom', 'custom': {'upscale': 'dlss', 'dlss_mask': False,
+                                                                        'dlss_mask_m': 1.2}})
+            plan = S.build_launch(vals, paths_in(tmp), caps, public=False)
+            self.assertEqual((plan['env']['BB_XR_DLSS_MASK'], plan['env']['BB_XR_DLSS_MASK_M']), ('0', '1.2'))
+            self.assertEqual((plan['files']['iq']['dlss_mask'], plan['files']['iq']['dlss_mask_m']), ('0', '1.2'))
+
+    def test_dlss_mask_keys_stay_out_without_dlss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = S.build_launch(S.effective_values({'profile': 'Custom', 'custom': {'upscale': 'fsr1'}}),
+                                  paths_in(tmp), NO_GPU, public=False)
+            self.assertNotIn('dlss_mask', plan['files']['iq'])
+            self.assertNotIn('BB_XR_DLSS_MASK', plan['env'])
 
 
 class RuntimeTests(unittest.TestCase):

@@ -792,6 +792,7 @@ void TestHitboxes(const fs::path& assets) {
     const float identity[12] = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
     std::memcpy(s.debug.weapon[1], identity, sizeof(identity));
     sb::UiDebugHitboxes cfg;
+    cfg.weapon = cfg.attack = cfg.enemies = cfg.hits = true; // drawing is off by default
     std::vector<vrui::HitboxLine> lines;
     hb.Lines(cfg, s, 1.0, lines, log);
     CHECK(!lines.empty());
