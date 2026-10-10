@@ -12,8 +12,9 @@ walking the PE import tables; no ldd needed). Scripts, patches and run.py come f
 (run tools/release/export_public.py first), so only cleared files are packaged.
 
 Layout of BloodborneVR-<version>/ in the zip:
-    BloodborneVR.exe (tiny launcher stub, built here), BloodborneVR-console.bat (fallback), README.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
-    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings}.py (start-up settings menu), defaults/{fp,stereo}.txt,
+    BloodborneVR.exe (the native dashboard, built here: ImGui + SDL3 linked in, one file; `--web` = the web menu),
+    BloodborneVR-console.bat (fallback), README.txt, VERSION.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
+    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli}.py (settings, web menu, the dashboard's helper), defaults/{fp,stereo}.txt,
     python/ (embeddable Python, optional)
     run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/
 No game file, extracted asset or DLSS / FSR 4 runtime is included.
@@ -30,6 +31,7 @@ import urllib.request
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_dashboard  # noqa: E402
 import build_stub  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -170,7 +172,8 @@ def main():
     ap.add_argument('--allow-online', action='store_true', help='skip the online-strings check of the host exe (never for a public build)')
     ap.add_argument('--version', default='0.1.0-alpha1')
     ap.add_argument('--out', type=Path, default=REPO / 'out' / 'release')
-    ap.add_argument('--stub', type=Path, help='prebuilt BloodborneVR.exe (default: build tools/release/zip/exe with clang)')
+    ap.add_argument('--stub', type=Path, help='prebuilt BloodborneVR.exe (default: build the native dashboard, tools/release/dashboard, with clang; '
+                    'falls back to the tiny console stub, tools/release/zip/exe)')
     ap.add_argument('--strip', default=None, help='llvm-strip to drop debug info (default: clang64/bin/llvm-strip.exe if present)')
     args = ap.parse_args()
 
@@ -232,17 +235,27 @@ def main():
                     ignore=shutil.ignore_patterns('*.sh', '__pycache__', 'test_*.py', 'vr_frames.py'))
     stub = args.stub
     if not stub:
+        cache = REPO / 'out' / 'release_cache'
         try:
-            stub = build_stub.build(REPO / 'out' / 'release_cache' / 'BloodborneVR.exe', args.version, args.msys2)
+            if not build_dashboard.available(args.msys2):
+                raise RuntimeError('clang++ / llvm-rc / SDL3 headers not found')
+            stub = build_dashboard.build(cache / 'BloodborneVR.exe', args.version, args.msys2)
         except RuntimeError as error:
-            shutil.rmtree(stage)
-            sys.exit(f'cannot build BloodborneVR.exe: {error}')
+            print(f'NOTE: native dashboard not built ({error}); using the console stub (web menu only)')
+            try:
+                stub = build_stub.build(cache / 'BloodborneVR.exe', args.version, args.msys2)
+            except RuntimeError as error2:
+                shutil.rmtree(stage)
+                sys.exit(f'cannot build BloodborneVR.exe: {error2}')
     shutil.copyfile(stub, stage / 'BloodborneVR.exe')
     for item in ('BloodborneVR-console.bat', 'README.txt'):
         text = (ZIPSRC / item).read_text(encoding='utf-8')
         (stage / item).write_bytes(text.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
+    controls = REPO / 'docs' / 'images' / 'controls.png'
+    if controls.is_file():  # the labelled controller map README.txt points to
+        shutil.copyfile(controls, stage / 'controls.png')
     (stage / 'launcher').mkdir()
-    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py'):  # the start-up menu is standard library only
+    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py', 'bbvr_cli.py'):  # the start-up menu is standard library only
         shutil.copyfile(ZIPSRC / module, stage / 'launcher' / module)
     shutil.copytree(ZIPSRC / 'defaults', stage / 'defaults')
     for lic in (ex / 'gpu' / 'xr_bridge' / 'LICENSE.txt',):
@@ -255,6 +268,7 @@ def main():
         f'from, tag v{args.version}; the commit is in COMMIT.txt. Build instructions: README.md, build.sh.\n'
         'Sources of the bundled third-party DLLs: see THIRD_PARTY_NOTICES.md.\n', encoding='utf-8')
     (stage / 'COMMIT.txt').write_text(commit_id() + '\n', encoding='utf-8')
+    (stage / 'VERSION.txt').write_text(args.version + '\n', encoding='utf-8')
 
     if not args.no_python:
         add_python(stage, fetch_python(args.python_embed, REPO / 'out' / 'release_cache'))

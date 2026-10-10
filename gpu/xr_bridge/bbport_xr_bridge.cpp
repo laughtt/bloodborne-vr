@@ -2597,7 +2597,9 @@ void Shutdown() {
 int GetInput(BbXrInput* out) {
     const int active = XrInput::Get(out);
     if (g && g->game_ui) {
-        g->game_ui->Filter().Apply(SteadyNow(), *out);
+        float trigger[2]{}, grip[2]{};
+        XrInput::Analog(trigger, grip);
+        g->game_ui->Filter().Apply(SteadyNow(), *out, trigger[0] > 0.6f || trigger[1] > 0.6f);
     }
     return active;
 }

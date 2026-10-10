@@ -235,6 +235,35 @@ struct HeavyCharge {
     }
 };
 
+/// The right grip tapped: squeezed (above kOn) and released (below kOff) within kMaxMs, with no
+/// swing fired during the press, is ONE tap (swap the right weapon). A grip held longer, or used
+/// as the heavy modifier of a swing, is never a tap. Update returns true once, on the release.
+struct GripTap {
+    static constexpr float kOn = 0.6f, kOff = 0.4f;
+    static constexpr double kDefaultMaxMs = 350.0;
+    double max_ms = kDefaultMaxMs;
+    bool down = false, swung = false;
+    double pressed_ms = 0.0;
+    bool Update(double now_ms, float grip, bool swing_fired) {
+        if (!down) {
+            if (grip > kOn) {
+                down = true;
+                swung = swing_fired;
+                pressed_ms = now_ms;
+            }
+            return false;
+        }
+        if (swing_fired) {
+            swung = true;
+        }
+        if (grip < kOff) {
+            down = false;
+            return !swung && now_ms - pressed_ms <= max_ms;
+        }
+        return false;
+    }
+};
+
 /// The left hand held at the mouth with the left grip closed for kDwellMs fires once; it rearms
 /// when the hand is more than twice the radius away.
 struct MouthDwell {

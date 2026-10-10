@@ -78,15 +78,18 @@ open.
 | Left stick | move |
 | Left stick click | moving: **L3, the jump**. Standing: **opens/closes the DASHBOARD** (`BB_VR_UI=1`; sent on release). Held 1 s alone: recenter |
 | Right stick | camera / turn |
-| Right stick click | **R3, lock-on** (a plain press; there is no hold-for-inventory any more) |
-| A | circle: dodge, sprint |
+| Right stick click | tap opens the **item wheel** (`quick_wheel`; pick with the right hand touch/point or the stick). Lock-on is off in the `game` layout (`lock_on: false`), so R3 never reaches the game |
+| A | circle: dodge, sprint (the dodge is this button, not a stick gesture) |
 | B | cross: interact |
 | X | square: use the current quick item (weak tick) |
 | Y | triangle: blood vial |
-| Left trigger | **swap the left weapon** (one d-pad-left pulse per pull, a tick). While the dashboard is open: the left ray's click |
-| Right trigger | **swap the right weapon** (one d-pad-right pulse per pull, a tick). While the dashboard is open: the right ray's click |
+| Left trigger | **hold the gun (L2)**; a left-hand thrust shoots (`BB_XR_TRIGGERS=switch`: swap the left weapon, one d-pad-left pulse, and no shooting). While the dashboard is open: the left ray's click |
+| Right trigger | **nothing in the world** (BB_XR_TRIGGERS=attack: R1). While the dashboard is open: the right ray's click; in the game's own menu: cross |
+| Right grip tap | **swap the right weapon** (squeeze and release within 0.35 s, BB_XR_GRIP_TAP_MS, no swing during the press: one d-pad-right pulse, a tick). Held grip + swing is the heavy attack (R2) and never swaps |
 | Left grip | L1, transform |
-| Right grip | heavy/charge modifier for swings |
+| Right grip | heavy/charge modifier for swings (see the tap row above) |
+| In the game's own menu (Options, pause) | either stick = d-pad (hold to repeat), A or either trigger = cross, B = circle, menu button closes (`vr_ui_filter.h`, host reports `BBXR_GAME_MENU_OPEN`) |
+| Swing at a staggered enemy | visceral attack (stagger: gun parry, or a charged heavy from behind) |
 | Left ☰ (menu) | Options (pause), sent on release; held 1 s = recenter. Pimax keeps this button for itself, so the dashboard has Options and Recenter buttons |
 | Swing right hand | R1 light / R2 heavy (gestures) |
 | Thrust left hand | L2, shoot |
@@ -94,7 +97,12 @@ open.
 
 **What the game sees.**
 - While the dashboard is open the game gets **no buttons**: the triggers are the pointers' clicks there.
-  The left stick still walks and the right stick still turns.
+  Both sticks are zeroed too (no walking, no turning, no swing or weapon swap): `block_move`, default true,
+  in the dashboard menu of the "game" block of `ui_layouts.json`.
+- **Stick navigation** (`stick_nav`, default true): either stick moves a focus highlight (the hover style) to
+  the nearest entry in the pushed direction (0.35 s, then every 0.14 s while held); A or either trigger pulls the
+  focused entry (same action as pointing and pulling); B closes it. Pointing moves the focus to what the ray
+  hits; a stick move takes it back, and a trigger then pulls the focus.
 - A button held when the dashboard closes stays hidden until it is released, so the trigger that
   clicked "Close" does not then swap weapons.
 - `L3` while walking with the dashboard open closes it and does not jump.

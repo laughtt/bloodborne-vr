@@ -160,6 +160,12 @@ void TestLayout() {
     CHECK(layout.presets.size() == 1 && layout.menus.size() == 1);
     CHECK(layout.menus[0].open.key == sb::UiInputId::Y && layout.menus[0].on_top);
     CHECK(layout.style.open_seconds > 0.0f); // the built-in style stays
+    // The dashboard's stick keys default on and can be turned off.
+    CHECK(sb::ParseLayout(R"({"menus": [{"name": "d", "type": "dashboard"},
+        {"name": "e", "type": "dashboard", "stick_nav": false, "block_move": false}]})",
+                          layout, error, &warnings));
+    CHECK(layout.menus.size() == 2 && layout.menus[0].stick_nav && layout.menus[0].block_move);
+    CHECK(!layout.menus[1].stick_nav && !layout.menus[1].block_move);
     CHECK(sb::ParseLayout(R"({"presets": [{"name": "p", "menus": ["missing"]}]})", layout, error,
                           &warnings));
     CHECK(warnings.find("missing") != std::string::npos);

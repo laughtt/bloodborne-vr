@@ -150,12 +150,12 @@ const char* const kDefaultLayout = R"JSON({
      ]}
   ],
   "game": {
-    "_doc": "The game's VR UI (BB_VR_UI=1, bbport_xr.dll; docs/vr/findings/26-game-ui.md): its own menus, drawn over the game in the headset by the same code as the sandbox. The dashboard (the standing left stick click) is one panel: what each hand holds, the weapon slots, the quick slots, the inventory and buttons for what has no button of its own (options, gestures, the d-pad, recenter); point at it with either controller and pull that trigger. Items: @quick = the game's quick slots, @inventory = every item the player carries, @weapons = the equipped weapon slots (right 1, right 2, left 1, left 2; @weapons/N one of them), goods:<id> / weapon:<id> / a name = one item with its live count. What you pick is done with the game's own buttons (d-pad to the slot, square to use). An older game object (version < 2) is replaced with these defaults.",
+    "_doc": "The game's VR UI (BB_VR_UI=1, bbport_xr.dll; docs/vr/findings/26-game-ui.md): its own menus, drawn over the game in the headset by the same code as the sandbox. The dashboard (the standing left stick click) is one panel: what each hand holds, the weapon slots, the quick slots, the inventory and buttons for what has no button of its own (options, gestures, the d-pad, recenter); point at it with either controller and pull that trigger, or use the sticks: either stick moves a highlight between the entries (nearest entry in the pushed direction, repeating while held), A or a trigger pulls the highlighted entry, B closes it (menu keys stick_nav and block_move, both default true; block_move keeps the character from walking, turning or swinging while the dashboard is open). Items: @quick = the game's quick slots, @inventory = every item the player carries, @weapons = the equipped weapon slots (right 1, right 2, left 1, left 2; @weapons/N one of them), goods:<id> / weapon:<id> / a name = one item with its live count. What you pick is done with the game's own buttons (d-pad to the slot, square to use). An older game object (version < 2) is replaced with these defaults.",
     "version": 2,
     "active": ["dashboard", "wrist_counters"],
     "r3_hold_s": 0.5,
     "press_s": 0.06,
-    "debug_gun_ray": true, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
+    "debug_gun_ray": false, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
     "debug_hitboxes": {"weapon": false, "attack": false, "enemies": false, "self": false, "hits": false,
                        "line_mrad": 1.5, "idle_alpha": 0.6},
     "hud": {"on": true, "head": false, "wrist": true, "bar": "always", "distance": 0.9,
@@ -166,7 +166,7 @@ const char* const kDefaultLayout = R"JSON({
     "menus": [
       {"name": "dashboard", "type": "dashboard", "label": "Dashboard", "open": "l3",
        "mode": "toggle", "columns": 10, "rows": 2, "cell": 0.055, "distance": 0.75,
-       "below": 0.12, "tilt": 12, "anchor": "world",
+       "below": 0.12, "tilt": 12, "anchor": "world", "stick_nav": true, "block_move": true,
        "tabs": ["all", "heal", "throw", "buff", "tool", "ammo", "weapons"],
        "buttons": [{"label": "Options", "action": "press:options"},
                    {"label": "Gestures", "action": "press:touchpad"},
@@ -377,6 +377,8 @@ void ReadMenu(const json::Value& d, UiMenuSpec& m, std::string& warnings) {
     if (d.Has("page_stick")) {
         m.page_stick = Hand(d["page_stick"], m.page_stick);
     }
+    Read(d["stick_nav"], m.stick_nav);
+    Read(d["block_move"], m.block_move);
     Read(d["show"], m.show);
     ReadBinding(d["hold"], m.open, where + " hold", warnings);
     Read(d["glance_deg"], m.glance_deg);

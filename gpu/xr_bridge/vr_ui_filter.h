@@ -79,6 +79,16 @@ public:
         stick_used[1] = right_stick;
     }
 
+    /// The game's own menu is open (the host's menu page): Apply turns the sticks into d-pad
+    /// navigation and maps the face buttons for menus (any thread).
+    void SetGameMenu(bool open) {
+        std::scoped_lock lock{mutex};
+        game_menu = open;
+        if (!open) {
+            nav_dir = 0;
+        }
+    }
+
     /// Keys whose binding's modifiers are held now (e.g. B while the right grip is squeezed, for
     /// "right_grip+b"): the game never sees them press, even before the menu opens (UI thread).
     void SetClaim(uint32_t mask) {
@@ -116,7 +126,7 @@ public:
     }
 
     /// What the game gets (the bridge's GetInput, any thread): `in` is changed in place.
-    void Apply(double now, BbXrInput& in) {
+    void Apply(double now, BbXrInput& in, bool trigger_confirm = false) {
         std::scoped_lock lock{mutex};
         Observe(now, in);
         if (!settings.enabled) {
@@ -137,7 +147,9 @@ public:
         if ((b & BBXR_BTN_L3) && l3_class != L3Class::Game) {
             b &= ~BBXR_BTN_L3;
         }
-        if (menus_engaged) {
+        if (game_menu && !menus_engaged) {
+            b = MenuNav(now, in, b, trigger_confirm);
+        } else if (menus_engaged) {
             b = 0; // swings, weapon swaps, dodges, items: the menus have the hands
             if (stick_used[0]) {
                 in.lx = in.ly = 128;
@@ -177,6 +189,49 @@ public:
         held_s = episode_s;
         hold = episode_hold;
         return true;
+    }
+
+    /// The game's own menu: the stick (either) is the d-pad with repeat, A (lower) = cross, B =
+    /// circle, a trigger pull = cross. Swings, gun, swap pulses and gesture buttons are dropped.
+    /// Kept: Options, L1/L2-less shoulder tabs (L1), X, the Y button, the touchpad.
+    static constexpr double kNavFirstS = 0.35, kNavRepeatS = 0.14, kNavPulseS = 0.07;
+    static constexpr float kNavDeflect = 0.55f;
+
+    uint32_t MenuNav(double now, BbXrInput& in, uint32_t b, bool trigger_confirm) {
+        uint32_t out = b & (BBXR_BTN_OPTIONS | BBXR_BTN_L1 | BBXR_BTN_SQUARE | BBXR_BTN_TOUCHPAD);
+        if (in.reserved[0] & BBXR_RAW_Y) {
+            out |= BBXR_BTN_TRIANGLE;
+        }
+        // xr_input maps A to circle and B to cross for the world; the menus want the reverse.
+        if (b & BBXR_BTN_CIRCLE) out |= BBXR_BTN_CROSS;
+        if (b & BBXR_BTN_CROSS) out |= BBXR_BTN_CIRCLE;
+        if (trigger_confirm) out |= BBXR_BTN_CROSS;
+        // The stick with the larger deflection chooses the direction.
+        const float lx = (float(in.lx) - 128.0f) / 127.0f, ly = (float(in.ly) - 128.0f) / 127.0f;
+        const float rx = (float(in.rx) - 128.0f) / 127.0f, ry = (float(in.ry) - 128.0f) / 127.0f;
+        const bool use_l = lx * lx + ly * ly >= rx * rx + ry * ry;
+        const float x = use_l ? lx : rx, y = use_l ? ly : ry; // pad y grows downwards
+        int dir = 0;
+        if (std::sqrt(x * x + y * y) >= kNavDeflect) {
+            dir = std::fabs(x) > std::fabs(y) ? (x > 0 ? 2 : 4) : (y > 0 ? 3 : 1); // up right down left
+        }
+        if (dir != nav_dir) {
+            nav_dir = dir;
+            if (dir) {
+                nav_until = now + kNavPulseS;
+                nav_next = now + kNavFirstS;
+            }
+        } else if (dir && now >= nav_next) {
+            nav_until = now + kNavPulseS;
+            nav_next = now + kNavRepeatS;
+        }
+        if (nav_dir && now < nav_until) {
+            static constexpr uint32_t pad[5] = {0, BBXR_BTN_UP, BBXR_BTN_RIGHT, BBXR_BTN_DOWN, BBXR_BTN_LEFT};
+            out |= pad[nav_dir];
+        }
+        in.lx = in.ly = in.rx = in.ry = 128; // neither the character nor the camera moves under the menu
+        in.l2 = in.r2 = 0;
+        return out;
     }
 
 private:
@@ -247,7 +302,9 @@ private:
 
     mutable std::mutex mutex;
     Settings settings;
-    bool menus_engaged = false, r3_open = false;
+    bool menus_engaged = false, r3_open = false, game_menu = false;
+    int nav_dir = 0;
+    double nav_until = -1.0, nav_next = 0.0;
     bool stick_used[2] = {};
     uint32_t last_raw = 0, sticky = 0, claim = 0, last_applied = 0;
     bool r3_down = false, r3_held_fired = false;

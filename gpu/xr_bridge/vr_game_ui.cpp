@@ -702,6 +702,7 @@ void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::str
         }
     }
     filter.Configure(fs);
+    filter.SetGameMenu(active && (s.flags & BBXR_GAME_MENU_OPEN) != 0);
     const InputFilter::UiView view = filter.Step(now, in.pad);
     {
         double held_s;

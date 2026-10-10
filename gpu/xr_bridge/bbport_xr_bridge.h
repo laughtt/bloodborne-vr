@@ -220,6 +220,7 @@ typedef struct BbXrEyeView {
 #define BBXR_GAME_WEAPONS 0x10u   /* weapons[] and the active indexes are valid */
 #define BBXR_GAME_BUSY 0x20u      /* the host is pressing buttons for an action (TakeUiActions) */
 #define BBXR_GAME_CAN_EQUIP 0x40u /* the equip hook runs: EQUIP_ITEM and ASSIGN_QUICK are possible */
+#define BBXR_GAME_MENU_OPEN 0x80u /* the game's own menu (pause / Options, inventory...) is open: the filter turns the sticks into d-pad navigation */
 #define BBXR_GAME_MAX_QUICK 8u
 #define BBXR_GAME_MAX_ITEMS 320u
 #define BBXR_ITEM_GOODS 0x40000000u

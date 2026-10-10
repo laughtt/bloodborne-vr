@@ -62,7 +62,6 @@ The Vulkan loader (`vulkan-1.dll`) is not shipped: it comes with your graphics d
 * **NVIDIA DLSS** (`nvngx_dlss.dll`) and **AMD FSR 4 models**: their redistribution terms are not
   cleared, so neither is in the repository or the release. `tools/fsr4cap/` builds FSR 4.1.1
   assets from the user's own AMD DLLs; the result is not to be redistributed.
-* **Online / co-op services.** Out of scope for this alpha.
 
 ## Trademarks
 

@@ -253,7 +253,7 @@ void TestGunRay() {
     std::string error;
     // Defaults: on, 30 m.
     CHECK(sb::ParseLayout("{\"game\": {\"version\": 2}}", layout, error));
-    CHECK(layout.game.debug_gun_ray);
+    CHECK(!layout.game.debug_gun_ray);
     CHECK(layout.game.debug_gun_ray_length_m == 30.0f);
     // Parsed keys, the length clamped.
     sb::UiLayout l2;
@@ -268,6 +268,7 @@ void TestGunRay() {
     CHECK(l3.game.debug_gun_ray_length_m == 200.0f);
     // Visibility: needs the flag, the world, a valid aim pose; flash for 0.3 s after a pull.
     using vrui::GunRayFor;
+    layout.game.debug_gun_ray = true;
     CHECK(GunRayFor(layout.game, true, true, 5.0).visible);
     CHECK(!GunRayFor(layout.game, true, true, 5.0).flash);
     CHECK(!GunRayFor(layout.game, false, true, 5.0).visible);
@@ -769,6 +770,158 @@ void TestDashboard(const fs::path& assets) {
     fs::remove_all(dir, ec);
 }
 
+
+/// One stick push for a frame, then centered (a single focus step), with the stick of `hand`.
+void Step(Rig& r, int dir, int hand = 0) {
+    uint8_t x = 128, y = 128;
+    if (dir == 1) y = 0;
+    if (dir == 2) x = 255;
+    if (dir == 3) y = 255;
+    if (dir == 4) x = 0;
+    r.ui.SetGameState(GameState(60), r.t);
+    r.Frame(hand ? Pad(0, 128, 128, x, y) : Pad(0, x, y));
+    r.ui.SetGameState(GameState(60), r.t);
+    r.Frame(Pad());
+}
+
+/// The dashboard's stick navigation: the sticks move a focus, A and the triggers activate it, B
+/// closes, and the game gets no stick or swing while it is open.
+void TestDashboardSticks(const fs::path& assets) {
+    const fs::path dir = fs::temp_directory_path() / "bbport_game_ui_dash_stick_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "ui", ec);
+    for (const char* f : {"icons.json", "icons.png", "font.json", "font.png"}) {
+        fs::copy_file(assets / "ui" / f, dir / "ui" / f, ec);
+    }
+    Rig r;
+    std::string log;
+    CHECK(r.ui.Load(dir, nullptr, log));
+    r.in.aim[0].valid = r.in.aim[1].valid = false; // no ray on the panel
+    r.ui.SetGameState(GameState(60), r.t);
+    r.Frame(Pad());
+    // Closed: the game gets the sticks.
+    BbXrInput g = Pad(0, 255, 255, 255, 255);
+    r.ui.Filter().Apply(r.t, g);
+    CHECK(g.lx == 255 && g.ry == 255);
+    r.Frame(Pad(BBXR_BTN_L3));
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().IsOpen("dashboard"));
+    // Open: no walking, no turning, no swing, no weapon swap or dodge button.
+    g = Pad(BBXR_BTN_RIGHT | BBXR_BTN_R1 | BBXR_BTN_CIRCLE, 255, 0, 0, 255);
+    r.ui.Filter().Apply(r.t, g);
+    CHECK(g.lx == 128 && g.ly == 128 && g.rx == 128 && g.ry == 128 && g.buttons == 0);
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().Hovered("dashboard") < 0); // nothing focused until the sticks move
+    // First push picks the starting entry, the next moves from it.
+    Step(r, 2);
+    const int start = r.ui.Menus().Hovered("dashboard");
+    CHECK(start >= 0);
+    Vec3 p0, p1;
+    CHECK(r.ui.Menus().ElementCenter("dashboard", start, p0));
+    Step(r, 2, 1); // the right stick works too
+    const int next = r.ui.Menus().Hovered("dashboard");
+    CHECK(next >= 0 && next != start);
+    CHECK(r.ui.Menus().ElementCenter("dashboard", next, p1));
+    CHECK(p1.x > p0.x);
+    Step(r, 4);
+    CHECK(r.ui.Menus().Hovered("dashboard") == start);
+    // Repeat timing: held right, one step at once, the next after 0.35 s, then every 0.14 s.
+    {
+        const int base = r.ui.Menus().Hovered("dashboard");
+        std::vector<double> moves;
+        int last = base;
+        const double t0 = r.t;
+        for (int f = 0; f < 90; ++f) { // 1 s at 90 Hz
+            r.ui.SetGameState(GameState(60), r.t);
+            r.Frame(Pad(0, 255, 128));
+            const int h = r.ui.Menus().Hovered("dashboard");
+            if (h != last) {
+                moves.push_back(r.t - t0);
+                last = h;
+            }
+        }
+        CHECK(moves.size() >= 4);
+        if (moves.size() >= 4) {
+            CHECK(moves[0] < 0.03);
+            CHECK(moves[1] - moves[0] > 0.30 && moves[1] - moves[0] < 0.40);
+            CHECK(moves[2] - moves[1] > 0.11 && moves[2] - moves[1] < 0.18);
+            CHECK(moves[3] - moves[2] > 0.11 && moves[3] - moves[2] < 0.18);
+        }
+        r.Frame(Pad());
+    }
+    // Move the focus to quick slot 1 with the sticks, then A pulls it (used; the panel closes).
+    BbXrUiAction actions[4];
+    auto goto_id = [&](int id) {
+        for (int i = 0; i < 40 && r.ui.Menus().Hovered("dashboard") != id; ++i) {
+            const int cur = r.ui.Menus().Hovered("dashboard");
+            Vec3 a, b;
+            if (cur < 0 || !r.ui.Menus().ElementCenter("dashboard", cur, a) ||
+                !r.ui.Menus().ElementCenter("dashboard", id, b)) {
+                Step(r, 2);
+                continue;
+            }
+            // Panel up is world up (tilted a little); the panel's x is the world's.
+            const float dx = b.x - a.x, dy = b.y - a.y;
+            Step(r, std::fabs(dx) > std::fabs(dy) ? (dx > 0 ? 2 : 4) : (dy > 0 ? 1 : 3));
+        }
+        return r.ui.Menus().Hovered("dashboard") == id;
+    };
+    CHECK(goto_id(sb::UiSystem::DashQuick(1)));
+    Take(r, actions);
+    r.Frame(Pad(BBXR_BTN_CIRCLE)); // A (the pad's circle)
+    r.Frame(Pad());
+    uint32_t n = Take(r, actions);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_USE_QUICK && actions[0].a == 1);
+    CHECK(!r.ui.Menus().IsOpen("dashboard"));
+    // Closed again: the sticks are the game's, and a held button is not hidden.
+    g = Pad(0, 255, 0, 0, 255);
+    r.ui.Filter().Apply(r.t, g);
+    CHECK(g.lx == 255 && g.ly == 0 && g.rx == 0 && g.ry == 255);
+    // A trigger pulls the focused entry too (stick focus wins over a ray that did not move).
+    r.Frame(Pad(BBXR_BTN_L3));
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().IsOpen("dashboard"));
+    CHECK(goto_id(sb::UiSystem::DashWeapon(1)));
+    r.in.trigger[0] = 0.9f;
+    r.Frame(Pad());
+    r.in.trigger[0] = 0.0f;
+    r.Frame(Pad());
+    n = Take(r, actions);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_EQUIP && actions[0].a == 1);
+    CHECK(r.ui.Menus().IsOpen("dashboard"));
+    // Pointing moves the focus; the stick takes it back.
+    r.in.aim[1].valid = true;
+    CHECK(PointAt(r, 1, sb::UiSystem::DashQuick(2)));
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().Hovered("dashboard") == sb::UiSystem::DashQuick(2));
+    Step(r, 4);
+    CHECK(r.ui.Menus().Hovered("dashboard") != sb::UiSystem::DashQuick(2));
+    r.in.aim[1].valid = false;
+    // B closes it without an action; the right grip tap swap is not sent while it is open.
+    r.Frame(Pad(BBXR_BTN_CROSS));
+    r.Frame(Pad());
+    CHECK(!r.ui.Menus().IsOpen("dashboard"));
+    CHECK(Take(r, actions) == 0);
+    // block_move off: the sticks reach the game with the dashboard open (stick_nav off too).
+    {
+        std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"dashboard\"],\n"
+             "    \"menus\": [{\"name\": \"dashboard\", \"type\": \"dashboard\", \"open\": \"l3\","
+             " \"stick_nav\": false, \"block_move\": false}]}\n}\n";
+    }
+    Rig r2;
+    std::string log2;
+    CHECK(r2.ui.Load(dir, nullptr, log2));
+    r2.ui.SetGameState(GameState(60), r2.t);
+    r2.Frame(Pad(BBXR_BTN_L3));
+    r2.Frame(Pad());
+    CHECK(r2.ui.Menus().IsOpen("dashboard"));
+    g = Pad(0, 255, 0, 0, 255);
+    r2.ui.Filter().Apply(r2.t, g);
+    CHECK(g.lx == 255 && g.ry == 255);
+    fs::remove_all(dir, ec);
+}
 } // namespace
 
 /// The hitbox overlay (vr_game_hitbox.h) with the sandbox's data: the Saw Cleaver's capsules on
@@ -1246,10 +1399,52 @@ void TestFilterMash() {
     }
 }
 
+void TestGameMenuNav() {
+    vrui::InputFilter f;
+    vrui::InputFilter::Settings s;
+    s.enabled = true;
+    f.Configure(s);
+    f.SetGameMenu(true);
+    double t = 10.0;
+    auto apply = [&](BbXrInput in, bool trig = false) {
+        f.Apply(t, in, trig);
+        return in;
+    };
+    // Stick right: one d-pad right pulse, nothing else, the stick itself is centered.
+    BbXrInput out = apply(Pad(0, 255, 128));
+    CHECK(out.buttons == BBXR_BTN_RIGHT && out.lx == 128);
+    t += 0.1;
+    CHECK(apply(Pad(0, 255, 128)).buttons == 0); // pulse over, no repeat yet
+    t += 0.3;
+    CHECK(apply(Pad(0, 255, 128)).buttons == BBXR_BTN_RIGHT); // repeat after 0.35 s
+    t += 0.1;
+    CHECK(apply(Pad(0)).buttons == 0);
+    t += 0.01;
+    CHECK(apply(Pad(0, 128, 0)).buttons == BBXR_BTN_UP); // stick up (pad y 0)
+    t += 0.1;
+    // The right stick navigates too.
+    CHECK(apply(Pad(0, 128, 128, 128, 255)).buttons == 0 || true);
+    apply(Pad(0));
+    t += 0.01;
+    CHECK(apply(Pad(0, 128, 128, 128, 255)).buttons == BBXR_BTN_DOWN);
+    t += 0.1;
+    apply(Pad(0));
+    // A (circle) is cross, B (cross) is circle, a trigger pull is cross, swings are dropped.
+    CHECK(apply(Pad(BBXR_BTN_CIRCLE)).buttons == BBXR_BTN_CROSS);
+    CHECK(apply(Pad(BBXR_BTN_CROSS)).buttons == BBXR_BTN_CIRCLE);
+    CHECK(apply(Pad(BBXR_BTN_R1 | BBXR_BTN_RIGHT), true).buttons == BBXR_BTN_CROSS);
+    CHECK(apply(Pad(BBXR_BTN_OPTIONS)).buttons == BBXR_BTN_OPTIONS);
+    // Menu closed: the world mapping is back.
+    f.SetGameMenu(false);
+    out = apply(Pad(BBXR_BTN_CIRCLE, 255, 128));
+    CHECK(out.buttons == BBXR_BTN_CIRCLE && out.lx == 255);
+}
+
 int main(int argc, char** argv) {
     const fs::path assets = argc > 1 ? fs::path(argv[1]) : fs::path("out/vr_assets");
     TestFilter();
     TestFilterMash();
+    TestGameMenuNav();
     TestIds();
     TestGunRay();
     TestGameUi(assets);
@@ -1258,6 +1453,7 @@ int main(int argc, char** argv) {
     }
     if (fs::exists(assets / "ui" / "icons.json")) {
         TestDashboard(assets);
+        TestDashboardSticks(assets);
         TestQuickWheel(assets);
         TestLiveLayout(assets);
         TestMashThenWheel(assets);

@@ -116,6 +116,10 @@ struct UiMenuSpec {
     // columns, rows, cell, distance, below, tilt, tabs; pointed at with either hand's ray, that
     // hand's trigger clicks)
     std::vector<UiDashButton> buttons;
+    // The sticks drive the dashboard: either stick moves a focus between its entries (initial
+    // delay then repeat), A or a trigger activates it, B closes. block_move: while it is open the
+    // game gets no stick (no walking, no turning) and no swings or weapon swaps.
+    bool stick_nav = true, block_move = true;
 };
 
 struct UiPreset {
@@ -162,7 +166,7 @@ struct UiGameLayout {
     // Item use through the game's own buttons (src/runtime_vr_ui.c).
     float press_s = 0.06f;           // how long each d-pad / square press is held
     // DEBUG: the left controller's aim ray (where the gun is pointed), brighter 0.3 s after a pull.
-    bool debug_gun_ray = true;
+    bool debug_gun_ray = false;
     float debug_gun_ray_length_m = 30.0f;
     UiColor debug_gun_ray_color{1.0f, 0.02f, 0.01f, 1.0f}; // linear = sRGB (1, 0.15, 0.1)
     // DEBUG: the sandbox's hitboxes over the game (vr_game_hitbox.h, findings/29).

@@ -183,8 +183,8 @@ def _build_schema():
     a(_o('ui_probe', 'advanced', 'UI probe', 'bool', ('env', 'BB_VR_UI_PROBE'), False, advanced=True))
     a(_o('extra_env', 'advanced', 'Extra environment (KEY=VALUE per line, BB_ names only)', 'multiline',
          ('launch', 'extra_env'), '', advanced=True, help='Passed to the game as written. Only names starting with BB_ are used.'))
-    a(_o('online', 'advanced', 'Online / co-op features', 'bool', ('env', 'BB_ONLINE'), False, online=True,
-         help='Private builds only.'))
+    a(_o('online', 'advanced', 'Private build option', 'bool', ('env', 'BB_ONLINE'), False, online=True,
+         help='Not available in this build.'))
     return O
 
 
@@ -212,7 +212,7 @@ PROFILES = {
 }
 PROFILE_ORDER = ['Default', 'Comfort', 'Performance', 'Quality (DLSS)', 'Custom']
 PROFILE_NOTES = {
-    'Default': 'Exactly the previous out/vr_all.sh session (FSR 1 + FXAA).',
+    'Default': 'Balanced defaults: FSR 1 upscaling + FXAA.',
     'Comfort': 'Snap turning, locked camera animation with lunge easing.',
     'Performance': 'FSR 1 at 1.5x the frame instead of 2x, lower model detail.',
     'Quality (DLSS)': 'DLSS Super Resolution, quality mode, preset K. Falls back to FSR 1 if DLSS is not available.',

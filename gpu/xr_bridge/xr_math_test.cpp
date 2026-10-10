@@ -590,6 +590,44 @@ static void TestTriggerEdge() {
     CHECK(!e.Update(0.8f));
 }
 
+void TestGripTap() {
+    // Quick squeeze and release: one tap, on the release.
+    xrpad::GripTap g;
+    CHECK(!g.Update(0, 0.0f, false));
+    CHECK(!g.Update(100, 0.9f, false));
+    CHECK(!g.Update(200, 0.8f, false));
+    CHECK(g.Update(300, 0.1f, false)); // 200 ms: swap the right weapon
+    CHECK(!g.Update(400, 0.0f, false)); // once only
+    // Held long without a swing: nothing, even after the release.
+    CHECK(!g.Update(1000, 0.9f, false));
+    CHECK(!g.Update(1500, 0.9f, false));
+    CHECK(!g.Update(1600, 0.0f, false));
+    // Grip held with a swing (heavy R2): no swap on the release.
+    CHECK(!g.Update(2000, 0.9f, false));
+    CHECK(!g.Update(2100, 0.9f, true));
+    CHECK(!g.Update(2200, 0.0f, false));
+    // A swing in the same frame as the press also cancels it.
+    CHECK(!g.Update(3000, 0.9f, true));
+    CHECK(!g.Update(3100, 0.0f, false));
+    // A swing before the press does not: the next quick tap works.
+    CHECK(!g.Update(3500, 0.0f, true));
+    CHECK(!g.Update(3600, 0.9f, false));
+    CHECK(g.Update(3700, 0.0f, false));
+    // A hysteresis wobble between 0.4 and 0.6 is not a release.
+    CHECK(!g.Update(4000, 0.9f, false));
+    CHECK(!g.Update(4050, 0.5f, false));
+    CHECK(!g.Update(4100, 0.9f, false));
+    CHECK(g.Update(4150, 0.2f, false));
+    // The limit is configurable.
+    xrpad::GripTap h;
+    h.max_ms = 150.0;
+    CHECK(!h.Update(0, 0.9f, false));
+    CHECK(!h.Update(300, 0.0f, false));
+    // The default is 350 ms.
+    CHECK(!g.Update(5000, 0.9f, false));
+    CHECK(!g.Update(5400, 0.0f, false));
+}
+
 void TestSwingDirection() {
     const xrpad::V3 head{0.0f, 1.6f, 0.0f}, hand{0.2f, 1.2f, -0.4f};
     CHECK(xrpad::SwingAwayFromHead({0.5f, 0.0f, -3.0f}, hand, head));  // forward
@@ -856,6 +894,7 @@ int main() {
     TestYBeforeL3StaysTriangle();
     TestL3Touchpad();
     TestTriggerEdge();
+    TestGripTap();
     TestSwingDirection();
     TestSwingGate();
     TestHeavyCharge();

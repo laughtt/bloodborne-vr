@@ -251,48 +251,92 @@ def console_menu(settings_path, caps, say=print, ask=input):
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bloodborne VR settings</title>
+<title>Bloodborne VR</title>
 <style>
-:root{--bg:#15161a;--panel:#1e2026;--line:#33363f;--text:#e8e4d8;--dim:#9a978c;--accent:#c8453a;--ok:#5fae6b;--warn:#d6a642;--live:#3d8f9a;--field:#0f1013}
-@media (prefers-color-scheme: light){:root{--bg:#f3f1ec;--panel:#fff;--line:#d5d1c6;--text:#23221f;--dim:#6b685f;--field:#faf9f6}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 system-ui,Segoe UI,sans-serif}
-header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-h1{font-size:17px;margin:0 8px 0 0;font-weight:600}
-select,input,textarea,button{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
-button{cursor:pointer}button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:7px 16px}
-nav{display:flex;flex-wrap:wrap;gap:4px;padding:10px 16px 0}nav button{border-radius:6px 6px 0 0;border-bottom:none;background:transparent;color:var(--dim)}
-nav button.on{background:var(--panel);color:var(--text);border-color:var(--line)}
-main{padding:0 16px 40px;max-width:980px}.card{background:var(--panel);border:1px solid var(--line);border-radius:0 8px 8px 8px;padding:6px 16px 12px}
-.row{display:grid;grid-template-columns:minmax(150px,260px) 1fr;gap:6px 16px;padding:10px 0;border-bottom:1px solid var(--line);align-items:start}
-.row:last-child{border-bottom:none}.row.off{opacity:.5}.lab b{font-weight:600}.hint{color:var(--dim);font-size:13px;margin-top:3px}
-.badge{font-size:11px;border-radius:9px;padding:1px 7px;margin-left:6px;border:1px solid;vertical-align:middle}.live{color:var(--live);border-color:var(--live)}.restart{color:var(--warn);border-color:var(--warn)}
-.banner{margin:10px 0;padding:10px 12px;border-radius:6px;border:1px solid var(--warn);color:var(--text);background:color-mix(in srgb,var(--warn) 14%,transparent)}
-.banner.info{border-color:var(--live);background:color-mix(in srgb,var(--live) 12%,transparent)}.banner.bad{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
-input[type=number],input[type=text]{width:12em}textarea{width:100%;min-height:70px}input[type=range]{width:min(260px,60%);vertical-align:middle;padding:0}
-.status{color:var(--dim);font-size:13px;margin-left:auto}.small{font-size:13px;color:var(--dim)}label.chk{display:inline-flex;gap:6px;align-items:center}
-[hidden]{display:none!important}.consent{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:16px}
-.consentbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 20px 14px;max-width:560px}
-@media (max-width:640px){.row{grid-template-columns:1fr}}
+:root{--bg:#0d0f14;--panel:#151922;--high:#1e2330;--line:#262c3b;--text:#e9ecf2;--dim:#8b93a7;--faint:#5a6275;--accent:#e3262f;--accent2:#f23b44;--blue:#3b82f6;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--live:#3b82f6;--field:#1e2330;--hero:#2a0d12;--sans:"Inter","Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
+@media (prefers-color-scheme: light){:root{--bg:#eef0f5;--panel:#fff;--high:#f1f3f8;--line:#d9dde7;--text:#171a22;--dim:#5d667a;--faint:#8a92a5;--field:#f1f3f8;--hero:#fbe4e5}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 var(--sans)}
+.hero{display:flex;align-items:center;gap:16px;padding:22px 28px;background:radial-gradient(900px 220px at 15% -40%,rgba(227,38,47,.35),transparent 70%),linear-gradient(180deg,var(--hero),var(--bg));border-bottom:1px solid var(--line)}
+.logo{width:60px;height:60px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ff6a70,var(--accent) 55%,#7d0f15);display:grid;place-items:center;font-weight:800;font-size:22px;color:#fff;box-shadow:0 4px 18px rgba(227,38,47,.4)}
+.brand h1{font-size:30px;line-height:1;margin:0;font-weight:800;letter-spacing:.02em;text-transform:uppercase;display:flex;align-items:center;gap:10px}
+.tag{font-size:11.5px;font-weight:700;letter-spacing:.06em;color:#ff7878;border:1.5px solid var(--accent);border-radius:6px;padding:2px 7px}
+.sub{color:var(--dim);font-size:14px;margin-top:6px}
+.herop{margin-left:auto;display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}
+.pill{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--dim);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--faint)}.pill.run{color:var(--ok)}.pill.run i{background:var(--ok);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}@media (prefers-reduced-motion:reduce){.pill.run i{animation:none}}
+nav{display:flex;flex-wrap:wrap;gap:4px;padding:0 20px;border-bottom:1px solid var(--line);align-items:center}
+nav button{background:transparent;border:none;border-bottom:3px solid transparent;border-radius:0;color:var(--dim);font-weight:600;padding:14px 12px 11px}
+nav button:hover{color:var(--text)}nav button.on{color:var(--text);border-bottom-color:var(--accent)}
+.bar{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;padding:10px 28px;color:var(--dim);font-size:13px}
+.bar .status{margin-left:auto;color:var(--dim)}
+main{padding:6px 28px 48px;max-width:1040px}
+h2.cap{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 6px;font-weight:700}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin-bottom:16px}
+.row{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,320px);gap:6px 20px;padding:12px 0;border-bottom:1px solid var(--line);align-items:center}
+.row:last-child{border-bottom:none}.row.off{opacity:.5}.lab b{font-weight:600;font-size:15px}.hint{color:var(--dim);font-size:13px;margin-top:3px}
+.ctl{justify-self:end;max-width:100%}
+.badge{font-size:11px;border-radius:9px;padding:1px 7px;margin-left:8px;border:1px solid;vertical-align:middle}.live{color:var(--live);border-color:var(--live)}.restart{color:var(--warn);border-color:var(--warn)}
+.banner{margin:0 0 12px;padding:12px 16px;border-radius:12px;border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 12%,var(--panel))}
+.banner.info{border-color:var(--blue);background:color-mix(in srgb,var(--blue) 12%,var(--panel))}.banner.bad{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--panel))}
+select,input,textarea,button{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+button{cursor:pointer}button:hover{border-color:var(--faint)}
+input[type=number],input[type=text]{width:12em}textarea{width:100%;min-height:70px;font-family:var(--mono);font-size:13px}input[type=range]{width:min(200px,50%);vertical-align:middle;padding:0;accent-color:var(--blue)}
+input[type=checkbox]{appearance:none;-webkit-appearance:none;width:42px;height:24px;border-radius:999px;padding:0;position:relative;cursor:pointer;background:var(--line);border:none;vertical-align:middle;transition:background .15s}
+input[type=checkbox]::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);transition:transform .15s}
+input[type=checkbox]:checked{background:var(--blue)}input[type=checkbox]:checked::after{transform:translateX(18px)}
+input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+label.chk{display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.chk-row{display:flex;gap:14px;align-items:center}.dot{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:14px;font-weight:700;flex:none;background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
+.dot.warn{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}.dot.bad{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}
+.profs{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.prof{text-align:left;padding:12px 14px;border-radius:12px;background:var(--high)}.prof b{display:block;margin-bottom:3px}.prof span{color:var(--dim);font-size:13px}
+.prof.on{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.start{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:18px;border:none;border-radius:14px;font-size:18px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#fff;background:linear-gradient(180deg,var(--accent2),var(--accent));box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 6px 22px rgba(227,38,47,.3)}
+.start:hover{background:linear-gradient(180deg,#ff5059,var(--accent2));border-color:transparent}.start:disabled{opacity:.55;cursor:default}
+.start.sm{width:auto;padding:10px 22px;font-size:14px;border-radius:10px}
+button.quit{background:var(--high)}
+[hidden]{display:none!important}.consent{position:fixed;inset:0;z-index:20;background:rgba(5,5,10,.72);display:flex;align-items:center;justify-content:center;padding:16px}
+.consentbox{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px 24px 18px;max-width:560px}
+.consentbox .start{width:auto;padding:10px 18px;font-size:14px}
+@media (max-width:640px){.row{grid-template-columns:1fr}.ctl{justify-self:start}.hero{padding:16px}.bar,main{padding-left:16px;padding-right:16px}.herop{margin-left:0}}
 </style></head><body>
-<header><h1>Bloodborne VR</h1>
-<label>Profile <select id="profile"></select></label><span id="pnote" class="small"></span>
-<span class="status" id="status"></span>
-<label class="chk"><input type="checkbox" id="adv"> advanced</label>
+<div class="hero"><div class="logo">BB</div><div class="brand"><h1>Bloodborne <span class="tag">VR</span></h1>
+<div class="sub">Settings and start-up for Bloodborne in VR</div></div>
+<div class="herop"><span class="pill" id="runpill"><i></i><span id="runtxt">Ready</span></span><button class="start sm" id="start">Start VR</button><button class="quit" id="quit">Quit</button></div></div>
+<div id="consent" class="consent" hidden><div class="consentbox"><b>Help fix crashes?</b>
+<p>If the game crashes, it can send an anonymous crash report to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at the report on your PC first, and change this later with the "send crash reports" switch under the tabs.</p>
+<p><button class="start" id="crashyes">Yes, send crash reports</button> <button id="crashno">No, keep them on my PC</button></p></div></div>
+<nav id="tabs"></nav>
+<div class="bar"><label class="chk"><input type="checkbox" id="adv"> advanced options</label>
 <label class="chk"><input type="checkbox" id="showmenu" checked> show this menu next time</label>
 <label class="chk" id="crashwrap" hidden><input type="checkbox" id="crashbox"> send crash reports</label>
-<button class="primary" id="start">Start game</button><button id="quit">Quit</button></header>
-<div id="consent" class="consent" hidden><div class="consentbox"><b>Help fix crashes?</b>
-<p>If the game crashes, it can send an anonymous crash report to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at the report on your PC first, and change this later with the "send crash reports" box at the top of this page.</p>
-<p><button class="primary" id="crashyes">Yes, send crash reports</button> <button id="crashno">No, keep them on my PC</button></p></div></div>
-<nav id="tabs"></nav><main><div id="banners"></div><div class="card" id="card"></div></main>
+<span class="status" id="status"></span></div>
+<main><div id="banners"></div><div id="card"></div></main>
 <script>
-const TOKEN="__TOKEN__";let S=null,tab=localStorage.getItem('bbvr_tab')||'display',saveTimer=null,values={};
+const TOKEN="__TOKEN__";let S=null,tab=localStorage.getItem('bbvr_tab')||'play',saveTimer=null,values={};
 const $=id=>document.getElementById(id);
 const el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!==undefined)e.textContent=txt;return e};
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-BB-Token':TOKEN,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw new Error(r.status);return r.json()}
 function applyState(s){S=s;values=Object.assign({},s.values);render()}
 function renderCrash(){const c=S.crash||{available:false,asked:true};$('consent').hidden=!(c.available&&!c.asked);$('crashwrap').hidden=!(c.available&&c.asked);$('crashbox').checked=c.mode==='on'}
 async function crashMode(m){try{applyState(await api('/api/crash',{mode:m}))}catch(e){$('status').textContent='save failed'}}
+function chk(parent,state,title,detail){const r=el('div','row');const l=el('div','lab chk-row');l.appendChild(el('span','dot '+state,state==='ok'?'✓':'!'));const t=el('div');t.appendChild(el('b',null,title));t.appendChild(el('div','hint',detail));l.appendChild(t);r.appendChild(l);parent.appendChild(r);return r}
+function renderPlay(card){
+ const pc=el('div','card');pc.appendChild(el('h2','cap','This PC'));
+ const gp=(S.caps.gpus||[]).map(g=>typeof g==='string'?g:(g.name||'')).filter(Boolean);
+ chk(pc,gp.length?'ok':'warn','Graphics card',gp.length?gp.join(', '):'Not detected');
+ const rt=chk(pc,S.caps.runtimes.length?'ok':'bad','VR runtime',S.caps.runtimes.length?'Active: '+(S.caps.active_runtime||'none'):'No OpenXR runtime found. Install your headset software and set it as the OpenXR runtime.');
+ const ro=S.options.find(o=>o.kind==='runtime');if(ro){const w=el('div','ctl');w.appendChild(mk(ro));rt.appendChild(w)}
+ chk(pc,dlssOK()?'ok':'warn','DLSS',dlssOK()?'Available. Pick the Quality (DLSS) profile to use it.':'Not available: '+S.caps.dlss.reason+'. The game falls back to FSR 1.');
+ card.appendChild(pc);
+ const pf=el('div','card');pf.appendChild(el('h2','cap','Profile'));const g=el('div','profs');
+ S.profiles.forEach(p=>{const b=el('button','prof'+(p===S.profile?' on':''));b.appendChild(el('b',null,p));b.appendChild(el('span',null,S.profile_notes[p]||''));
+  b.onclick=async()=>{try{applyState(await api('/api/save',{profile:p}))}catch(e){$('status').textContent='save failed'}};g.appendChild(b)});
+ pf.appendChild(g);card.appendChild(pf);
+ const go=el('button','start go','▶  Start VR');go.disabled=startBusy;go.onclick=doStart;card.appendChild(go);
+ if(S.game_running)card.appendChild(el('div','hint','The game is running. Switch to another tab to change live options.'));
+}
 function dlssOK(){return S.caps.dlss.ok}
 function schedule(){clearTimeout(saveTimer);saveTimer=setTimeout(async()=>{try{applyState(await api('/api/save',{values:values}))}catch(e){$('status').textContent='save failed'}},400)}
 function mk(o){
@@ -314,33 +358,36 @@ function mk(o){
  return c}
 function dependsOff(o){if(o.only_if){for(const k in o.only_if){const cur=values[k];if(cur!==o.only_if[k])return 'only with '+k+' = '+o.only_if[k]}}return ''}
 function render(){
- $('profile').innerHTML='';S.profiles.forEach(p=>{const op=el('option',null,p);op.value=p;$('profile').appendChild(op)});$('profile').value=S.profile;
- renderCrash();$('pnote').textContent=S.profile_notes[S.profile]||'';$('showmenu').checked=S.show_menu;$('status').textContent=S.status||'';
- const tabs=$('tabs');tabs.innerHTML='';S.tabs.forEach(t=>{const b=el('button',t.id===tab?'on':'',t.label);b.onclick=()=>{tab=t.id;try{localStorage.setItem('bbvr_tab',tab)}catch(e){};render()};tabs.appendChild(b)});
+ renderCrash();$('showmenu').checked=S.show_menu;$('status').textContent=S.status||'';
+ const tabs=$('tabs');tabs.innerHTML='';[{id:'play',label:'Play'}].concat(S.tabs).forEach(t=>{const b=el('button',t.id===tab?'on':'',t.label);b.onclick=()=>{tab=t.id;try{localStorage.setItem('bbvr_tab',tab)}catch(e){};render()};tabs.appendChild(b)});
  const bn=$('banners');bn.innerHTML='';(S.warnings||[]).forEach(w=>bn.appendChild(el('div','banner',w)));
  if(S.game_running)bn.appendChild(el('div','banner info','The game is running. Live options (blue badge) apply within a second; the others need a restart.'));
  const card=$('card');card.innerHTML='';
+ $('runpill').className='pill'+(S.game_running?' run':'');$('runtxt').textContent=S.game_running?'Game running':'Ready';
+ if(tab==='play'){renderPlay(card);return}
  if(tab==='dlss'){
   if(!dlssOK())card.appendChild(el('div','banner bad','DLSS is greyed out: '+S.caps.dlss.reason));
-  else card.appendChild(el('div','banner info','DLSS is available'+(S.dlss_native?'.':' (using the DLSS build in out/dlss-vr until the main executable is rebuilt).')));
+  else card.appendChild(el('div','banner info','DLSS is available.'));
   card.appendChild(el('div','banner info',S.dlss_note));
   if(S.game_running&&!S.dlss_native)card.appendChild(el('div','hint','To switch to DLSS while playing, the game must have been started with Upscaler = DLSS (it then uses the DLSS-capable executable).'));
  }
- const adv=$('adv').checked;
+ const adv=$('adv').checked;const box=el('div','card');card.appendChild(box);
  S.options.filter(o=>o.tab===tab&&(adv||!o.advanced)).forEach(o=>{
   const off=dependsOff(o)||((o.id==='upscale'||o.only_if)&&!dlssOK()&&o.only_if&&o.only_if.upscale==='dlss'?'DLSS not available':'');
   const row=el('div','row'+(off?' off':''));const lab=el('div','lab');const b=el('b',null,o.label);lab.appendChild(b);
   lab.appendChild(el('span','badge '+(o.live?'live':'restart'),o.live?'live':'restart'));
   if(o.help)lab.appendChild(el('div','hint',o.help));if(off)lab.appendChild(el('div','hint',off));
-  row.appendChild(lab);const c=mk(o);if(o.kind==='runtime'){const w=el('div');w.appendChild(c);row.appendChild(w)}else row.appendChild(c);card.appendChild(row)});
- if(!card.querySelector('.row'))card.appendChild(el('div','hint','Nothing here (tick "advanced" for more).'));
+  row.appendChild(lab);const c=mk(o);const w=el('div','ctl');w.appendChild(c);row.appendChild(w);box.appendChild(row)});
+ if(!box.querySelector('.row'))box.appendChild(el('div','hint','Nothing here (switch on "advanced options" for more).'));
 }
 $('adv').onchange=render;
 $('crashyes').onclick=()=>crashMode('on');$('crashno').onclick=()=>crashMode('off');
 $('crashbox').onchange=()=>crashMode($('crashbox').checked?'on':'off');
-$('profile').onchange=async()=>{applyState(await api('/api/save',{profile:$('profile').value}))};
 $('showmenu').onchange=async()=>{applyState(await api('/api/save',{show_menu:$('showmenu').checked}))};
-$('start').onclick=async()=>{$('start').disabled=true;try{applyState(await api('/api/launch',{values:values}));$('status').textContent='Starting the game - put the headset on. You can keep changing live options here.'}catch(e){$('start').disabled=false}};
+let startBusy=false;
+function setBusy(b){startBusy=b;document.querySelectorAll('.start.go,#start').forEach(x=>x.disabled=b)}
+async function doStart(){setBusy(true);try{applyState(await api('/api/launch',{values:values}));$('status').textContent='Starting the game - put the headset on. You can keep changing live options here.'}catch(e){setBusy(false)}}
+$('start').classList.add('go');$('start').onclick=doStart;
 $('quit').onclick=async()=>{try{await api('/api/quit',{})}catch(e){};document.body.textContent='You can close this window.'};
 api('/api/state').then(applyState).catch(()=>{document.body.textContent='This page needs the launcher running.'});
 setInterval(async()=>{if(!S||saveTimer)return;try{const s=await api('/api/state');S.game_running=s.game_running;if(s.status!==S.status){S.status=s.status;$('status').textContent=s.status}}catch(e){}},3000);

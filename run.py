@@ -127,6 +127,12 @@ def main():
     out = data / 'out'
     out.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_CONFIG', str(data / 'bbport.ini'))
+    # A globally installed ReShade Vulkan layer breaks the emulator's GPU path (and our DLSS):
+    # keep it out unless BB_ALLOW_RESHADE=1.
+    if env.get('BB_ALLOW_RESHADE') != '1':
+        env.setdefault('DISABLE_VK_LAYER_reshade_1', '1')
+    # The headset's grey controller-position markers: off unless BB_XR_HANDS=1 (the arms show the hands).
+    env.setdefault('BB_XR_HANDS', '0')
     config = env['BB_CONFIG']
     if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['BB_FSR411_DIR'] = str(data / 'fsr4_411')

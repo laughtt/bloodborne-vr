@@ -18,6 +18,9 @@
  *   BB_DEBUG_GIVE      "goods:<id>[xN];...;insight:+N": gives those once, from the in-game step hook, after a
  *                      living character is loaded (co-op tests without playing for the bells); runs the
  *                      game's own add-item routine 0x1f5c8c0; works without BB_VR_UI
+ *                      "weapon:<id>[xN]" gives a weapon (plain EquipParamWeapon id, category 0)
+ *   BB_DEBUG_GIVE_FILE a file with one entry per line ("goods:..", "weapon:..", "insight:+N", # comments), no
+ *                      length limit; one item is given per hook call; an empty value is ignored
  *   BB_DEBUG_USE       goods:<id>: uses that item once the character is in the world (the quick-slot
  *                      path of the dashboard: 0x1f63e00 into a quick slot, d-pad down, square)
  *   BB_DEBUG_USE_FILE  a control file polled twice a second: write "goods:205" (or just 205) into it to
@@ -136,6 +139,27 @@ static int vu_ptr(uint64_t a, uint64_t *out) {
     return 1;
 }
 static uint64_t vu_va(uint32_t v) { return (uint64_t)(uintptr_t)(vu.image + (v - VA_BASE)); }
+
+/* The game's "a menu is up" bitmask 0x1b6b7e0, from the menu manager's own fields f = [0x5962878]
+ * (+0..0x2DC; the few global bytes it also reads are left out). The game drops pad input when
+ * mask & 0x7ffff77f (0x1705fc9). Live: closed 0; the Options menu sets +0x54 (2, 7 in a sub-page). */
+static uint32_t vu_menu_mask(const uint32_t *f) {
+    static const struct { uint16_t off; uint32_t bit; } bits[] = {
+        {0x3c, 0x200}, {0x40, 0x1}, {0x7c, 0x4}, {0xb0, 0x800}, {0x100, 0x40000000}, {0xb8, 0x20},
+        {0xb4, 0x10}, {0xa0, 0x400}, {0x54, 0x40}, {0x104, 0x100000}, {0x60, 0x1000}, {0x64, 0x2000},
+        {0x68, 0x4000}, {0x134, 0x2}, {0x114, 0x2000000}, {0x138, 0x8000}, {0xc4, 0x10000},
+        {0xd4, 0x40000}, {0x88, 0x400000}, {0x90, 0x200000}, {0x98, 0x800000}, {0x9c, 0x1000000},
+        {0x2dc, 0x100}};
+    uint32_t m = 0;
+    for (size_t i = 0; i < sizeof bits / sizeof bits[0]; ++i)
+        if (f[bits[i].off / 4]) m |= bits[i].bit;
+    if (f[0x78 / 4]) m |= 0x8;
+    if (f[0xdc / 4] || f[0x80 / 4] || f[0x120 / 4]) m |= 0x8000000;
+    if (f[0x58 / 4] == 4) m |= 0x80;
+    else if (f[0x58 / 4] >= 1 && f[0x58 / 4] <= 3) m |= 0x80000;
+    if (f[0xf0 / 4]) m |= 0x10000000;
+    return m;
+}
 
 static void vu_init(void) {
     if (vu.checked) return;
@@ -468,6 +492,12 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
                 s->items[i].count = g->items[i].count;
             }
         }
+    }
+    {
+        uint64_t mm;
+        uint32_t f[0x2E0 / 4];
+        if (vu_ptr(vu_va(VA_MENU_MAN), &mm) && vu_read(NULL, mm, f, sizeof f) && (vu_menu_mask(f) & 0x7ffff77fu))
+            s->flags |= BBXR_GAME_MENU_OPEN;
     }
     if (vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE)) s->flags |= BBXR_GAME_BUSY;
     {

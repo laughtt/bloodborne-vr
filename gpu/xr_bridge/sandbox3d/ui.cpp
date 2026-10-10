@@ -282,6 +282,11 @@ struct UiSystem::Impl {
         std::map<int, DashInfo> dash; // per element id, from the last draw
         bool use_mode = true;         // a quick slot click: use it (else only make it current)
         bool remove_mode = false;     // one-shot: the next quick item pointed at leaves the quick slots
+        // stick focus (m.hover is the focus the highlight is drawn on)
+        int ray_hover = -1;           // what the rays pointed at last frame
+        bool stick_focus = false;     // the stick moved the focus after the rays last changed
+        int nav_dir = 0;              // 1 up 2 right 3 down 4 left (the stick, 0 centered)
+        double nav_next = 0.0;
     };
     // Dashboard element ids (Element::id).
     static constexpr int kDashWeapon = 1000, kDashQuick = 1100, kDashTab = 1200,
@@ -1379,6 +1384,82 @@ struct UiSystem::Impl {
                       (item.empty() ? std::string() : Display(item)) + "\n";
     }
 
+    static constexpr double kNavFirstS = 0.35, kNavRepeatS = 0.14;
+    static constexpr float kNavDeflect = 0.55f;
+
+    /// The pushed direction of the stronger stick: 1 up, 2 right, 3 down, 4 left, 0 centered.
+    int StickDir() const {
+        const float* st = in.stick[0];
+        if (in.stick[1][0] * in.stick[1][0] + in.stick[1][1] * in.stick[1][1] >
+            st[0] * st[0] + st[1] * st[1]) {
+            st = in.stick[1];
+        }
+        if (std::sqrt(st[0] * st[0] + st[1] * st[1]) < kNavDeflect) {
+            return 0;
+        }
+        return std::fabs(st[0]) > std::fabs(st[1]) ? (st[0] > 0 ? 2 : 4) : (st[1] > 0 ? 1 : 3);
+    }
+
+    /// Moves the stick focus one entry toward `dir` (0: only picks a starting entry): the nearest
+    /// entry whose center lies that way (disabled ones too, as when pointing), the cross-axis offset counting double.
+    void NavMove(Menu& m, int dir, UiEvents& events) {
+        m.stick_focus = true;
+        const auto usable = [&](const Element& e) {
+            const auto info = m.dash.find(e.id);
+            return info == m.dash.end() || info->second.enabled;
+        };
+        const Element* from = nullptr;
+        for (const Element& e : m.elements) {
+            if (e.id == m.hover) {
+                from = &e;
+            }
+        }
+        const Element* best = nullptr;
+        if (!from) { // start: the current quick slot, else the first inventory card, else any
+            const int cur = Selected("quick");
+            for (const Element& e : m.elements) {
+                if (usable(e) && cur >= 0 && e.id == kDashQuick + cur) {
+                    best = &e;
+                }
+            }
+            for (const Element& e : m.elements) {
+                if (!best && usable(e) && e.id >= kDashItem) {
+                    best = &e;
+                }
+            }
+            for (const Element& e : m.elements) {
+                if (!best && usable(e)) {
+                    best = &e;
+                }
+            }
+        } else if (dir) {
+            const float cx = 0.5f * (from->x0 + from->x1), cy = 0.5f * (from->y0 + from->y1);
+            float best_score = 1e9f;
+            for (const Element& e : m.elements) {
+                if (&e == from) {
+                    continue;
+                }
+                const float dx = 0.5f * (e.x0 + e.x1) - cx, dy = 0.5f * (e.y0 + e.y1) - cy;
+                const float along = dir == 2 ? dx : dir == 4 ? -dx : dir == 1 ? dy : -dy;
+                const float across = (dir == 2 || dir == 4) ? std::fabs(dy) : std::fabs(dx);
+                if (along < 0.004f) {
+                    continue;
+                }
+                const float score = along + 2.0f * across;
+                if (score < best_score) {
+                    best_score = score;
+                    best = &e;
+                }
+            }
+        }
+        if (best && best->id != m.hover) {
+            m.hover = best->id;
+            m.hover_hand = 1;
+            ++m.hover_changes;
+            Haptic(events, 1, layout.style.haptic_hover);
+        }
+    }
+
     void UpdateDashboard(Menu& m, UiWorld&, UiEvents& events) {
         const UiMenuSpec& s = *m.spec;
         if (m.open ? Pressed(s.open) : PressedExact(s.open)) {
@@ -1392,6 +1473,10 @@ struct UiSystem::Impl {
             m.base = UiGridPanel(s, in.head); // world-locked where it opened
             Open(m, events);
             m.tab = 0;
+            m.ray_hover = -1;
+            m.stick_focus = false;
+            m.nav_dir = StickDir(); // a stick already pushed at open waits until it recenters
+            m.nav_next = 1e18;
             return;
         }
         if (!m.open) {
@@ -1422,12 +1507,50 @@ struct UiSystem::Impl {
                 ShowPointer(h, from, from + dir * 1.2f, false, 1e9f);
             }
         }
-        if (hovered != m.hover) {
+        // Focus (m.hover): the rays move it when they change target, the sticks after that.
+        if (hovered != m.ray_hover) {
+            m.ray_hover = hovered;
+            if (hovered >= 0) {
+                m.stick_focus = false;
+            }
+        }
+        if (hovered >= 0 && !m.stick_focus && hovered != m.hover) {
             m.hover = hovered;
             m.hover_hand = by;
-            if (hovered >= 0) {
-                ++m.hover_changes;
-                Haptic(events, by, layout.style.haptic_hover);
+            ++m.hover_changes;
+            Haptic(events, by, layout.style.haptic_hover);
+        }
+        if (s.stick_nav) {
+            const int dir = StickDir();
+            if (dir != m.nav_dir) {
+                m.nav_dir = dir;
+                if (dir) {
+                    NavMove(m, dir, events);
+                    m.nav_next = now + kNavFirstS;
+                }
+            } else if (dir && now >= m.nav_next) {
+                NavMove(m, dir, events);
+                m.nav_next = now + kNavRepeatS;
+            }
+            int trigger_hand = -1;
+            for (int h = 1; h >= 0; --h) {
+                if (PressedKey(h ? UiInputId::RightTrigger : UiInputId::LeftTrigger)) {
+                    trigger_hand = h;
+                }
+            }
+            const bool a = PressedKey(UiInputId::A) && !Held(UiInputId::RightGrip);
+            if (a || (trigger_hand >= 0 && m.stick_focus)) {
+                if (m.hover < 0) {
+                    NavMove(m, 0, events); // the first press only picks a starting entry
+                } else {
+                    hovered = m.hover;
+                    by = trigger_hand >= 0 ? trigger_hand : 1;
+                    clicked = true;
+                }
+            }
+            if (PressedKey(UiInputId::B) && !Held(UiInputId::RightGrip)) {
+                Close(m, "close");
+                return;
             }
         }
         if (!clicked || hovered < 0) {
@@ -2489,6 +2612,9 @@ bool UiSystem::UsesStick(int hand) const {
         if (m.spec->type == "grid" && m.spec->page_stick == hand) {
             return true;
         }
+        if (m.spec->type == "dashboard" && (m.spec->block_move || m.spec->stick_nav)) {
+            return true;
+        }
     }
     return false;
 }
@@ -2559,7 +2685,9 @@ const UiLayout& UiSystem::Layout() const {
 
 bool UiSystem::UsesSticks() const {
     for (const Impl::Menu& m : impl->menus) {
-        if (m.open && (m.spec->type == "radial" || m.spec->type == "grid")) {
+        if (m.open && (m.spec->type == "radial" || m.spec->type == "grid" ||
+                       (m.spec->type == "dashboard" &&
+                        (m.spec->block_move || m.spec->stick_nav)))) {
             return true;
         }
     }

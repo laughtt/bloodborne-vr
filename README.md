@@ -5,8 +5,7 @@ own PS4 x86-64 code runs natively on a shadPS4-derived Vulkan renderer; an OpenX
 stereo rendering, head tracking, first-person view, controller-driven arms and weapons, and VR
 menus.
 
-> **Alpha, single-player only.** Expect bugs and comfort issues. Online and co-op features are
-> not part of this release.
+> **Alpha, single-player only.** Expect bugs and comfort issues.
 >
 > **No game files are included.** You need your own legally obtained, decrypted dump. This is an
 > unofficial fan project, not affiliated with, endorsed or sponsored by Sony Interactive
@@ -16,8 +15,38 @@ menus.
 ## Play (testers)
 
 Download the latest `BloodborneVR-<version>.zip` from Releases, unzip it, double-click
-`BloodborneVR.bat` and follow the first-run questions. The zip's `README.txt` has the install
-steps, controls, known issues and how to report bugs.
+`BloodborneVR.exe` and follow the first-run questions. The zip's `README.txt` has the install
+steps, controls, known issues and how to report bugs. The controls are summarised below.
+
+## Controls
+
+![Bloodborne VR controls](docs/images/controls.png)
+
+| Controller input | In game |
+|---|---|
+| Left stick | Move |
+| Right stick | Camera / turn (smooth or snap, see the Comfort tab) |
+| Right-hand swing | Light attack (R1) |
+| Swing with the right grip held, or a very hard swing | Heavy attack (R2); keep the grip held after the swing to charge |
+| Quick right-grip tap (under 0.35 s, no swing) | Swap the right-hand weapon |
+| Right trigger | Nothing in the world |
+| Left trigger (hold) | Hold the gun (L2) |
+| Left-hand thrust forward (gun held) | Shoot |
+| Left grip (squeeze) | L1 (transform) |
+| A / B / X / Y | Circle (dodge, sprint) / Cross (interact) / Square (use quick item) / Triangle (blood vial) |
+| Right stick click (tap) | Open the item wheel: pick with your right hand (touch or point) or the stick |
+| Left stick click while standing | Open the VR dashboard (equipment, items, options) |
+| Left stick click while moving | Jump |
+| Left stick click, held 1 s | Recenter |
+| Left menu button | Options (pause) |
+| Swing at a staggered enemy | Visceral attack (stagger one with a gun parry, or a charged heavy from behind) |
+
+Lock-on is off by default: a right stick click opens the item wheel instead.
+
+**In the game's own menus** (Options, pause): either stick moves the cursor (hold to repeat), **A or either
+trigger** confirms, **B** goes back, and the menu button closes the menu.
+
+TODO: verify every row on the current build in the headset before release.
 
 ## What works (see `docs/vr/`)
 
@@ -33,7 +62,7 @@ sandbox. Research notes and design documents are in `docs/vr/findings/`.
    (outputs in `out/`: `bb-probe.exe`, `bb-gpu-capabilities.exe`, `bbport_xr.dll`).
    `build.sh` also applies the patch series in `gpu/patches/fsr-vulkan/` to the `gpu/third_party/fsr-vulkan`
    submodule (needed; the submodules are pinned in this repository). The optional DLSS bridge (`bbport_dlss.dll`,
-   needs NVIDIA's DLSS SDK) is not part of this repository yet.
+   needs NVIDIA's DLSS SDK; you supply it and `nvngx_dlss.dll` yourself) is not part of this repository yet.
 3. Run with your own dump:
    `BB_GAME_DIR=/c/games/CUSA03173 python run.py` (flat) or see `tools/release/zip/bbvr_launcher.py`
    for the VR environment variables.

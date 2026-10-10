@@ -80,8 +80,8 @@ class GoldenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = S.build_launch(S.effective_values(S.default_settings()), paths_in(tmp), NO_GPU, public=False)['env']
         for key, want in old.items():
-            if key in ('BB_PROBE', 'BB_GAME_DIR'):
-                continue
+            if key in ('BB_PROBE', 'BB_GAME_DIR') or key.startswith('BB_DEBUG_') or want == '':
+                continue  # debug-only (not in the release) or empty-expanding entries
             if key in PATH_VARS:
                 self.assertEqual(Path(env[key]).name, Path(want).name)
             else:

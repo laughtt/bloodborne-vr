@@ -477,8 +477,7 @@ def finish(code):
     something went wrong, or only checks ran, keep it open until Enter so the text can be read."""
     if os.environ.get('BBVR_EXE') == '1' and (code or '--check' in sys.argv or '--dry-run' in sys.argv):
         try:
-            input('
-Press Enter to close this window.')
+            input('\nPress Enter to close this window.')
         except (EOFError, OSError, KeyboardInterrupt):
             pass
     sys.exit(code)

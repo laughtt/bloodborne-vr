@@ -8,18 +8,21 @@
 //   right stick        camera / turn; click = R3 (lock-on)
 //   A circle (dodge, sprint), B cross (interact), X square (use the quick item, weak haptic tick),
 //   Y triangle (blood vial)
-//   triggers           with gestures (BB_XR_TRIGGERS=gun, the default): the left trigger is L2
-//                      (shoot, held, with the analog L2); each right pull is ONE d-pad right pulse
-//                      (120 ms, logged: swap the right weapon); pull above 0.6, release below 0.3
-//                      to pull again; a haptic tick. BB_XR_TRIGGERS=switch: the left trigger is a
-//                      d-pad left pulse too (swap the left weapon) and does not shoot. While the dashboard is open they are its
-//                      pointer's click (the game does not see them). BB_XR_TRIGGERS=attack or
-//                      gestures off: right trigger R1, left trigger L2 (held, with the analog L2).
+//   triggers           with gestures (BB_XR_TRIGGERS unset, the default): the left trigger is L2
+//                      (shoot, held, with the analog L2); the RIGHT trigger does nothing in the world.
+//                      BB_XR_TRIGGERS=switch: the left trigger is a d-pad left pulse (swap the left
+//                      weapon) and does not shoot; the right one still does nothing.
+//                      BB_XR_TRIGGERS=attack or gestures off: right trigger R1, left trigger L2
+//                      (held, with the analog L2). While the dashboard is open they are its pointer's
+//                      click (the game does not see them); in the game's own menu a pull is cross.
 //   left grip          L1 (transform): ONE 100 ms pulse when the grip is squeezed (a held L1 locked the
 //                      character's locomotion in the game, and a controller held in the hand reads as squeezed)
 //   right grip         gestures off = R2. Gestures on = heavy modifier: a swing with the grip held
 //                      is a heavy attack (R2); keeping the grip held after the swing keeps R2 down
 //                      until release (charged attack); a grip held without a swing does nothing.
+//                      A grip TAP (squeezed and released within 0.35 s, no swing during the press;
+//                      BB_XR_GRIP_TAP_MS overrides) is ONE d-pad right pulse (120 ms, logged,
+//                      haptic tick): swap the right weapon. A tap-then-swing or a held grip never swaps.
 //   left menu button   options (pause) on release; held 1 s = recenter (bbport_xr_bridge.cpp).
 //                      Pimax keeps that button for its system menu: the dashboard has Options and
 //                      Recenter buttons.
@@ -126,6 +129,7 @@ struct State {
     xrpad::MouthDwell mouth;
     xrpad::TurnGuard turn;
     xrpad::TriggerEdge trigger_edge[2];
+    xrpad::GripTap grip_tap;
     xrpad::RateLimit gesture_log;
     xrpad::RateLimit trigger_log;
     bool x_prev = false;
@@ -636,11 +640,17 @@ bool Create(XrInstance instance, XrSession session, LogFn log) {
     s->session = session;
     const char* gestures = std::getenv("BB_XR_GESTURES");
     s->gestures = !(gestures && gestures[0] == '0');
-    // BB_XR_TRIGGERS=switch (default with gestures: the swing attacks, the triggers swap the
-    // right/left weapon) or attack (right trigger R1, left trigger L2, as without gestures).
+    // BB_XR_TRIGGERS unset (default with gestures: the swing attacks, the right trigger does
+    // nothing, the left shoots), switch (the left trigger swaps the left weapon) or attack
+    // (right trigger R1, left trigger L2, as without gestures). The right weapon swap is the
+    // right grip tap (BB_XR_GRIP_TAP_MS, default 350).
     const char* triggers = std::getenv("BB_XR_TRIGGERS");
     s->trigger_switch = triggers ? std::strcmp(triggers, "attack") != 0 : s->gestures;
     s->left_gun = !(triggers && std::strcmp(triggers, "switch") == 0);
+    if (const char* tap = std::getenv("BB_XR_GRIP_TAP_MS")) {
+        const double v = std::atof(tap);
+        if (v >= 50.0 && v <= 2000.0) s->grip_tap.max_ms = v;
+    }
     const char* chords = std::getenv("BB_XR_CHORDS");
     s->chords = chords && chords[0] == '1';
     s->layer.chords = s->chords;
@@ -725,7 +735,7 @@ bool Create(XrInstance instance, XrSession session, LogFn log) {
     s->view = ReferenceSpace(XR_REFERENCE_SPACE_TYPE_VIEW);
     s->log(0, "controllers ready (gestures %s, triggers %s, %s)", s->gestures ? "on" : "off",
            !s->trigger_switch ? "attack"
-           : s->left_gun      ? "left shoots, right swaps the right weapon"
+           : s->left_gun      ? "left shoots, right does nothing; right grip tap swaps the right weapon"
                               : "swap weapons",
            s->chords ? "L3 chords on (BB_XR_CHORDS=1)"
                      : "one button one action (the dashboard has the d-pad, options, gestures)");
@@ -783,15 +793,15 @@ void Update(XrTime time, bool focused) {
         // Edge triggered: one d-pad pulse per pull, not a held d-pad.
         const uint32_t pad[2] = {BBXR_BTN_LEFT, BBXR_BTN_RIGHT};
         if (s->left_gun && trigger[0] > 0.5f) buttons |= BBXR_BTN_L2;
-        for (int hand = s->left_gun ? 1 : 0; hand < 2; ++hand) {
+        // The right trigger does nothing (the right weapon swap is the right grip tap).
+        for (int hand = s->left_gun ? 2 : 0; hand < 1; ++hand) {
             if (s->trigger_edge[hand].Update(trigger[hand])) {
                 Pulse(pad[hand], now, TriggerPulseMs);
                 Haptic(hand, 0.3f, 0.04f);
                 const double ms = std::chrono::duration<double, std::milli>(now - s->start).count();
                 if (s->trigger_log.Allow(hand, ms)) {
-                    s->log(0, "%s trigger pulled: d-pad %s pulse %.0f ms (swap the %s weapon)",
-                           hand ? "right" : "left", hand ? "right" : "left", TriggerPulseMs,
-                           hand ? "right" : "left");
+                    s->log(0, "left trigger pulled: d-pad left pulse %.0f ms (swap the left weapon)",
+                           TriggerPulseMs);
                 }
             }
         }
@@ -846,6 +856,7 @@ void Update(XrTime time, bool focused) {
 
     // Gestures.
     bool swing_in_progress = false;
+    bool swing_fired = false;
     if (s->gestures) {
         // Head yaw guard for the gun thrust (snap turn, recenter).
         bool turning = false;
@@ -866,6 +877,7 @@ void Update(XrTime time, bool focused) {
                     {in.head.position[0], in.head.position[1], in.head.position[2]});
             }
             if (s->swing.Update(speed, away, l3)) {
+                swing_fired = true;
                 const bool heavy = grip[1] > 0.6f || speed > HeavySpeed;
                 Fire(heavy ? BBXR_GESTURE_HEAVY : BBXR_GESTURE_SWING,
                      heavy ? BBXR_BTN_R2 : BBXR_BTN_R1, 1, now, speed);
@@ -876,6 +888,14 @@ void Update(XrTime time, bool focused) {
         }
         if (s->charge.Update(now_ms, grip[1])) {
             buttons |= BBXR_BTN_R2; // charged attack: R2 stays down while the grip is held
+        }
+        if (s->grip_tap.Update(now_ms, grip[1], swing_fired)) {
+            Pulse(BBXR_BTN_RIGHT, now, TriggerPulseMs);
+            Haptic(1, 0.3f, 0.04f);
+            if (s->trigger_log.Allow(1, now_ms)) {
+                s->log(0, "right grip tap: d-pad right pulse %.0f ms (swap the right weapon)",
+                       TriggerPulseMs);
+            }
         }
         swing_in_progress = !s->swing.armed || s->charge.active || s->charge.pending;
         if (in.active && in.aim[0].valid && in.grip[0].valid) {
