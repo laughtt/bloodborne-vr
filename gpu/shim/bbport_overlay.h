@@ -32,6 +32,19 @@ bool Visible();
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 
+/// The VR UI over the game image in the window (bridge ABI 9, docs/vr/findings/26-game-ui.md):
+/// a premultiplied-alpha image (SHADER_READ_ONLY_OPTIMAL, `view_format` a UNORM view of it) whose
+/// top-left uv_w x uv_h part is drawn into the window rectangle x, y, w, h. Present thread: set
+/// it before Visible()/Render() for this frame; Render() takes it (one frame).
+struct Mirror {
+    vk::Image image;
+    vk::Format view_format;
+    float uv_w, uv_h;
+    s32 x, y;
+    u32 w, h;
+};
+void SetMirror(const Mirror& mirror);
+
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();
 

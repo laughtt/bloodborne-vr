@@ -22,7 +22,7 @@
 //                              the hands move the arms and the motion vectors are camera-only
 //   BB_XR_DLSS_MASK_M=<metres> that distance from the camera (default 0.9; 0 = no mask)
 //   control file keys: upscale=dlss dlss_quality=quality dlss_preset=K dlss_sharpen=0.2
-//                      dlss_mask=1 dlss_mask_m=0.9
+//                      dlss_mask=1 dlss_mask_m=0.9 dlss_jitter=0|1 (0 = no jitter, A/B test)
 //
 // The passes apply to frames with a scene camera (3D frames: what the eyes get); title, menus
 // and loading screens without one stay as they are.
@@ -47,6 +47,7 @@ struct Settings {
     float dlss_sharpen = 0.0f;     ///< RCAS after DLSS, 0..1
     bool dlss_mask = true;         ///< bias-current-colour mask of the near surfaces (arms)
     float dlss_mask_m = 0.9f;      ///< its view distance in metres (0 = off)
+    bool dlss_jitter = true;       ///< false: zero jitter (projection and DLSS), an A/B diagnostic
 };
 
 /// The current settings: the environment, then the control file (re-read when it changes, at

@@ -34,6 +34,7 @@
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
 #include "vr_ui_game.h"
 #include "vr_hitbox.h"
+#include "vr_gun.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,7 +142,7 @@ static int vu_ptr(uint64_t a, uint64_t *out) {
 static uint64_t vu_va(uint32_t v) { return (uint64_t)(uintptr_t)(vu.image + (v - VA_BASE)); }
 
 /* The game's "a menu is up" bitmask 0x1b6b7e0, from the menu manager's own fields f = [0x5962878]
- * (+0..0x2DC; the few global bytes it also reads are left out). The game drops pad input when
+ * (+0..0x2FC; its global bytes: vu_menu_mask_globals). The game drops pad input when
  * mask & 0x7ffff77f (0x1705fc9). Live: closed 0; the Options menu sets +0x54 (2, 7 in a sub-page). */
 static uint32_t vu_menu_mask(const uint32_t *f) {
     static const struct { uint16_t off; uint32_t bit; } bits[] = {
@@ -154,10 +155,26 @@ static uint32_t vu_menu_mask(const uint32_t *f) {
     for (size_t i = 0; i < sizeof bits / sizeof bits[0]; ++i)
         if (f[bits[i].off / 4]) m |= bits[i].bit;
     if (f[0x78 / 4]) m |= 0x8;
-    if (f[0xdc / 4] || f[0x80 / 4] || f[0x120 / 4]) m |= 0x8000000;
+    if (f[0xdc / 4] || f[0x80 / 4] || f[0x120 / 4] || f[0x2f8 / 4]) m |= 0x8000000;
     if (f[0x58 / 4] == 4) m |= 0x80;
     else if (f[0x58 / 4] >= 1 && f[0x58 / 4] <= 3) m |= 0x80000;
     if (f[0xf0 / 4]) m |= 0x10000000;
+    return m;
+}
+
+/* The bits 0x1b6b7e0 takes from globals beside the menu manager: the level-up / shop / dialog
+ * screens set these rather than the manager's own fields (live: the Options menu sets 0x800008). */
+static uint32_t vu_menu_mask_globals(const uint32_t *f) {
+    uint8_t b = 0;
+    uint32_t m = 0;
+    if (vu_read(NULL, vu_va(0x593b1bau), &b, 1) && b) m |= 0x8;
+    if (vu_read(NULL, vu_va(0x5960ff0u), &b, 1) && b) m |= 0x8000000;
+    if (f[0x2f4 / 4] && vu_read(NULL, vu_va(0x5960e72u), &b, 1) && b) m |= 0x8000000;
+    if (vu_read(NULL, vu_va(0x5961424u), &b, 1) && (b & 1)) m |= 0x10000000;
+    uint64_t o, v = 0;
+    if (vu_read(NULL, vu_va(0x5962882u), &b, 1) && b && vu_ptr(vu_va(0x5962870u), &o) &&
+        vu_read(NULL, o + 0xa88, &v, 8) && v)
+        m |= 0x800008;
     return m;
 }
 
@@ -437,6 +454,8 @@ static void vu_request_equip(const BbXrUiAction *a, double now) {
  * `buttons`: what the game gets so far this read (the swap check). */
 #define vu_debug_use(now, player) ((void)0)
 
+static double vu_no_player_since; /* when vu_player() first returned 0 (0: there is a player) */
+
 uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
     vu_init();
     if (!vu.on && !vu.probe && !vu.dbg) return 0;
@@ -468,7 +487,16 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
     }
     memset(s, 0, sizeof(*s));
     s->size = sizeof(*s);
-    if (player) s->flags |= BBXR_GAME_IN_WORLD;
+    if (player) {
+        s->flags |= BBXR_GAME_IN_WORLD;
+        vu_no_player_since = 0.0;
+    } else {
+        /* No PlayerIns under WorldChrMan: title, character creation, loading, system dialogs. Held
+         * for 0.4 s first so a one-poll blip never takes the world's controls; the bridge turns the
+         * sticks into the d-pad. The player appearing clears it at once. */
+        if (vu_no_player_since == 0.0) vu_no_player_since = now;
+        if (now - vu_no_player_since >= 0.4) s->flags |= BBXR_GAME_PRE_WORLD;
+    }
     if (player == 2 && max > 0) {
         s->flags |= BBXR_GAME_STAMINA;
         s->stamina = stamina;
@@ -495,8 +523,11 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
     }
     {
         uint64_t mm;
-        uint32_t f[0x2E0 / 4];
-        if (vu_ptr(vu_va(VA_MENU_MAN), &mm) && vu_read(NULL, mm, f, sizeof f) && (vu_menu_mask(f) & 0x7ffff77fu))
+        uint32_t f[0x300 / 4];
+        /* The game's pad gate (0x7ffff77f), plus 0x80 (+0x58 == 4): live, the talk/choice panels
+         * (the Doll's level-up choices) set only that, and need the sticks as much. */
+        if (vu_ptr(vu_va(VA_MENU_MAN), &mm) && vu_read(NULL, mm, f, sizeof f) &&
+            ((vu_menu_mask(f) | vu_menu_mask_globals(f)) & (0x7ffff77fu | 0x80u)))
             s->flags |= BBXR_GAME_MENU_OPEN;
     }
     if (vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE)) s->flags |= BBXR_GAME_BUSY;
@@ -547,16 +578,25 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
     /* The user's choices: one at a time (a new one waits while one runs). */
     if (vu.on && !vrui_exec_busy(&vu.exec) && __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) == 0) {
         BbXrUiAction a;
-        if (bbgpu_vr_ui_actions(&a, 1) == 1) {
+        while (bbgpu_vr_ui_actions(&a, 1) == 1) {
+            if (a.kind == BBXR_UI_THROW_ORIGIN || a.kind == BBXR_UI_THROW_DIR) {
+                /* a thrown item's release (physical items): arms the launch hook, then the use follows */
+                const int32_t v[3] = {a.a, a.b, a.c};
+                if (a.kind == BBXR_UI_THROW_ORIGIN) vr_gun_throw_origin(v);
+                else vr_gun_throw_dir(v);
+                continue;
+            }
             if (a.kind == BBXR_UI_EQUIP_ITEM || a.kind == BBXR_UI_ASSIGN_QUICK || a.kind == BBXR_UI_CLEAR_QUICK)
                 vu_request_equip(&a, now);
             else {
                 vrui_exec_start(&vu.exec, (int)a.kind, (int)a.a, (uint32_t)a.b, now);
                 if (a.kind == BBXR_UI_USE_ITEM || a.kind == BBXR_UI_PRESS) vu.exec.item = (uint32_t)a.a;
                 vu.exec_reported = 0;
-                fprintf(stderr, "VR UI: action %u (slot %d, item %#x) from the headset\n", a.kind, (int)a.a, (unsigned)a.b);
+                fprintf(stderr, "VR UI: action %u (slot %d, item %#x) from the headset%s\n", a.kind, (int)a.a, (unsigned)a.b,
+                        a.kind == BBXR_UI_USE_QUICK && a.c > 0 ? " (a thrown item)" : "");
                 fflush(stderr);
             }
+            break;
         }
     }
     const uint32_t buttons = vrui_exec_step(&vu.exec, now, g, vu.press_s);

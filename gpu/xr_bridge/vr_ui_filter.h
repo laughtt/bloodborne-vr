@@ -96,6 +96,17 @@ public:
         claim = mask;
     }
 
+    /// Pad buttons hidden from the game while an item is in a hand (vr_held_items.h BlockMask: the
+    /// swings, the right grip tap's weapon swap, L1), so a throw is not also an attack (UI thread).
+    void SetHoldMask(uint32_t mask) {
+        std::scoped_lock lock{mutex};
+        hold_mask = mask;
+    }
+    uint32_t HoldMask() const {
+        std::scoped_lock lock{mutex};
+        return hold_mask;
+    }
+
     /// The menus' view of the latest mapped input (UI thread, every headset frame).
     UiView Step(double now, const BbXrInput& in) {
         std::scoped_lock lock{mutex};
@@ -159,6 +170,7 @@ public:
             }
             in.l2 = in.r2 = 0;
         }
+        b &= ~hold_mask;
         // A combo's key pressed while its modifiers are held stays hidden until released.
         sticky |= in.buttons & claim & ~last_applied;
         last_applied = in.buttons;
@@ -306,7 +318,7 @@ private:
     int nav_dir = 0;
     double nav_until = -1.0, nav_next = 0.0;
     bool stick_used[2] = {};
-    uint32_t last_raw = 0, sticky = 0, claim = 0, last_applied = 0;
+    uint32_t last_raw = 0, sticky = 0, claim = 0, last_applied = 0, hold_mask = 0;
     bool r3_down = false, r3_held_fired = false;
     bool episode_ready = false, episode_hold = false;
     double episode_s = 0.0;

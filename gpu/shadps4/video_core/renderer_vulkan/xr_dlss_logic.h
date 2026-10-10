@@ -365,6 +365,113 @@ inline float AxisCosine(const std::array<float, 12>& a, const std::array<float, 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Per-eye feature (re)creation: why, and a guard against a recreate loop
+
+/// What identifies a DLSS feature (the fields of the bridge's feature description that make NGX
+/// create a new one). Kept per eye slot: never compare one eye's wish with the other's feature.
+struct FeatureKey {
+    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0;
+    int quality = 0;
+    uint32_t preset = 0;
+    bool hdr = false;
+    bool operator==(const FeatureKey&) const = default;
+};
+
+enum class CreateReason { None, FirstUse, Resize, Quality, Preset, Reset };
+
+/// Why the feature of an eye must be (re)created: `have` is that eye's current feature (none ->
+/// first use, or `reset` when it was released by a settings reset / DLSS toggle), `want` what the
+/// frame needs. None = keep it.
+inline CreateReason CreateReasonFor(const FeatureKey* have, const FeatureKey& want,
+                                    bool released_by_reset = false) {
+    if (!have) {
+        return released_by_reset ? CreateReason::Reset : CreateReason::FirstUse;
+    }
+    if (*have == want) {
+        return CreateReason::None;
+    }
+    if (have->render_w != want.render_w || have->render_h != want.render_h ||
+        have->out_w != want.out_w || have->out_h != want.out_h) {
+        return CreateReason::Resize;
+    }
+    if (have->quality != want.quality) {
+        return CreateReason::Quality;
+    }
+    if (have->preset != want.preset) {
+        return CreateReason::Preset;
+    }
+    return CreateReason::Reset; // hdr flag: a format change
+}
+
+inline const char* CreateReasonName(CreateReason r) {
+    switch (r) {
+    case CreateReason::None:
+        return "none";
+    case CreateReason::FirstUse:
+        return "first use";
+    case CreateReason::Resize:
+        return "resize";
+    case CreateReason::Quality:
+        return "quality change";
+    case CreateReason::Preset:
+        return "preset change";
+    case CreateReason::Reset:
+        return "reset";
+    }
+    return "?";
+}
+
+/// Counts the creates of each eye in a sliding window; Note() returns true ONCE per eye when it
+/// has been created more than `max_creates` times within `window_ms` (a recreate loop).
+class RecreateGuard {
+public:
+    explicit RecreateGuard(uint32_t max_creates = 3, double window_ms = 2000.0)
+        : max_(max_creates), window_(window_ms) {}
+
+    bool Note(int eye, double now_ms) {
+        Eye& e = eyes_[eye & 1];
+        // Drop the creates that left the window, then add this one.
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < e.count; ++i) {
+            if (now_ms - e.times[i] <= window_) {
+                e.times[keep++] = e.times[i];
+            }
+        }
+        e.count = keep;
+        if (e.count < kMax) {
+            e.times[e.count++] = now_ms;
+        } else {
+            e.times[kMax - 1] = now_ms;
+        }
+        if (e.count > max_ && !e.warned) {
+            e.warned = true;
+            return true;
+        }
+        if (e.count <= max_) {
+            e.warned = false; // calmed down: a later loop warns again
+        }
+        return false;
+    }
+    [[nodiscard]] uint32_t InWindow(int eye) const noexcept { return eyes_[eye & 1].count; }
+
+private:
+    static constexpr uint32_t kMax = 16;
+    struct Eye {
+        std::array<double, kMax> times{};
+        uint32_t count = 0;
+        bool warned = false;
+    };
+    uint32_t max_;
+    double window_;
+    std::array<Eye, 2> eyes_{};
+};
+
+/// dlss_jitter: 0/off/false zeroes the jitter (A/B diagnostic), anything else is on.
+inline bool ParseJitterOn(std::string_view text) {
+    return !(text == "0" || text == "off" || text == "false");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Per-eye temporal bookkeeping
 
 struct Config {
@@ -391,11 +498,12 @@ public:
     /// The jitter of the next frame's scene draws, chosen once per frame at its first jittered
     /// draw (after the previous frame's eye is known). `stereo`: alternate eyes (the predicted
     /// eye is the other one than the last eye frame), else one stream (eye 0).
-    std::array<float, 2> ChooseJitter(bool stereo, float scale) {
+    std::array<float, 2> ChooseJitter(bool stereo, float scale, bool jitter_on = true) {
         const int eye = stereo ? (last_eye_ < 0 ? 0 : 1 - last_eye_) : 0;
         const uint32_t phases = JitterPhases(scale);
         pending_eye_ = eye;
-        pending_ = JitterAt(eyes_[eye].jitter_seq % phases + 1);
+        pending_ = jitter_on ? JitterAt(eyes_[eye].jitter_seq % phases + 1)
+                             : std::array<float, 2>{0.0f, 0.0f}; // dlss_jitter=0 (A/B)
         return pending_;
     }
 

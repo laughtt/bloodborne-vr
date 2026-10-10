@@ -21,6 +21,13 @@ namespace vrui {
 
 class GameUi;
 
+/// An extra target drawn in the same submission (the desktop mirror, vr_mirror_ui.h).
+struct MirrorTarget {
+    VkImage image;
+    uint32_t width, height; // the used part of the image
+    m3::Mat4 view_proj;
+};
+
 class UiLayerGpu {
 public:
     bool Create(const sb::Renderer::Device& device, std::string& error);
@@ -30,11 +37,25 @@ public:
     /// Records and submits the UI into color[eye] (COLOR_ATTACHMENT_OPTIMAL in and out). The
     /// submission is not waited for.
     bool Render(GameUi& ui, const VkImage color[2], VkFormat format, uint32_t width,
-                uint32_t height, const m3::Mat4 view_proj[2]);
+                uint32_t height, const m3::Mat4 view_proj[2],
+                const MirrorTarget* mirror = nullptr);
+    /// Creates the 3 mirror images of this size (idempotent); slot < 3 names one afterwards.
+    bool EnsureMirror(VkFormat format, uint32_t width, uint32_t height);
+    VkImage MirrorImage(int slot) const { return mirror_images[slot].image; }
+    uint32_t MirrorWidth() const { return mirror_w; }
+    uint32_t MirrorHeight() const { return mirror_h; }
     const std::string& LastError() const { return last_error; }
 
 private:
     VkImageView ViewFor(VkImage image, VkFormat format);
+    void DestroyMirror();
+    struct MirrorImage_ {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    MirrorImage_ mirror_images[3];
+    VkFormat mirror_format = VK_FORMAT_UNDEFINED;
+    uint32_t mirror_w = 0, mirror_h = 0;
 
     sb::Renderer::Device dev;
     VkCommandPool pool = VK_NULL_HANDLE;

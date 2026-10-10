@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <setjmp.h>
+#if defined(_WIN32) && !defined(sigsetjmp)
+typedef jmp_buf sigjmp_buf; // mingw has no sigjmp_buf; the stub only stores a pointer
+#endif
 // Renderer tests have no guest process. Clock/host-thread services work; guest accesses abort.
 extern "C" {
 thread_local sigjmp_buf* runtime_fault_recover = nullptr;

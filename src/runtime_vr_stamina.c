@@ -373,9 +373,25 @@ static ABI void vs_hook_cost(BbHookContext *ctx) {
  * ticket is open prints itself. */
 static struct { unsigned unmatched[3], last_total, floor, floor_shown; double next_sum; } vh;
 
+/* Haptics for every weapon contact the game reports (BBXR_EV_WEAPON_CONTACT), ticket or not, any mode.
+ * A repeat of the same contact (same kind and AtkParam id) within VS_CONTACT_REPEAT_S is one contact;
+ * the player's body contacts (AtkParam 304/307) and the floor never pulse. */
+#define VS_CONTACT_REPEAT_S 0.5
+static struct { int contact, atk; double t; } vk = { 0, -1, -1.0e9 };
+static int vs_contact_new(int contact, int atk_id, double now) { /* 1: not a repeat; notes it */
+    const int fresh = contact != vk.contact || atk_id != vk.atk || now - vk.t > VS_CONTACT_REPEAT_S;
+    vk.contact = contact; vk.atk = atk_id; vk.t = now;
+    return fresh;
+}
+static void vs_contact_pulse(int contact, int atk_id, int32_t cost, double now) {
+    if (!vrst_contact_pays(contact) || atk_id < 0 || atk_id == 304 || atk_id == 307) return;
+    if (!vs_contact_new(contact, atk_id, now)) return;
+    runtime_vr_ui_event(BBXR_EV_WEAPON_CONTACT, cost, contact == VRST_HIT_WALL ? 1 : contact == VRST_HIT_OBJ ? 2 : 0,
+                        1 /* the right hand: the contact record does not say which weapon */);
+}
+
 static void vs_hit(BbHookContext *ctx, uint32_t site, int kind, uint64_t rec, uint64_t attacker, int bounced) {
     vs_init();
-    if (vs.mode == VRST_OFF) return;
     vs_image_from(ctx, site);
     const uintptr_t player = vs_player();
     if (!player || attacker != player) return;
@@ -386,7 +402,15 @@ static void vs_hit(BbHookContext *ctx, uint32_t site, int kind, uint64_t rec, ui
     if (vrst_contact_pays(contact)) /* the hitbox overlay's hit markers (findings/29) */
         vr_hitbox_hit(contact == VRST_HIT_WALL ? 1 : contact == VRST_HIT_OBJ ? 2 : 0, atk_id, (uintptr_t)rec);
     const double now = vs_now();
+    int32_t open_cost = 0; /* the cost of the open ticket of this attack: the pulse's strength */
+    for (int i = 0; i < vs.tickets.n; ++i)
+        if (vs.tickets.t[i].atk_id == atk_id) open_cost = vs.tickets.t[i].cost;
+    if (vs.mode == VRST_OFF) { /* no stamina feature: the contact still pulses */
+        vs_contact_pulse(contact, atk_id, open_cost, now);
+        return;
+    }
     if (!vs.tickets.n) { /* nothing to pay: count, no further reads */
+        vs_contact_pulse(contact, atk_id, 0, now);
         ++vh.unmatched[kind];
         ++vs.unmatched;
         if (vs.log) {
@@ -401,7 +425,7 @@ static void vs_hit(BbHookContext *ctx, uint32_t site, int kind, uint64_t rec, ui
         }
         return;
     }
-    if (!vrst_contact_pays(contact)) { /* the floor: never pays; the first few print (the hit's point) */
+    if (!vrst_contact_pays(contact)) { /* the floor: never pays, never pulses; the first few print (the hit's point) */
         ++vh.floor;
         if (vs.log && vh.floor_shown < 12) {
             ++vh.floor_shown;
@@ -428,9 +452,13 @@ static void vs_hit(BbHookContext *ctx, uint32_t site, int kind, uint64_t rec, ui
         for (int i = 0; i < vs.tickets.n; ++i)
             if (vs.tickets.t[i].id == e.ticket.id && !vs.tickets.t[i].hit_kind) vs.tickets.t[i].hit_kind = contact;
     if (e.kind == VRST_EV_CHARGED) ++vs.charged;
-    if (e.kind == VRST_EV_CHARGED || e.kind == VRST_EV_PAID || e.kind == VRST_EV_SUPPRESSED) /* "HIT -20" */
+    if (e.kind == VRST_EV_CHARGED || e.kind == VRST_EV_PAID || e.kind == VRST_EV_SUPPRESSED) { /* "HIT -20" */
         runtime_vr_ui_event(BBXR_EV_SWING_HIT, e.kind == VRST_EV_CHARGED ? e.amount : e.ticket.paid,
                             contact == VRST_HIT_WALL ? 1 : contact == VRST_HIT_OBJ ? 2 : 0, (int32_t)e.ticket.id);
+        vs_contact_new(contact, atk_id, now); /* it pulsed already: its repeats stay quiet */
+    } else {
+        vs_contact_pulse(contact, atk_id, open_cost, now);
+    }
     if (e.kind == VRST_EV_UNMATCHED) {
         ++vs.unmatched;
         ++vh.unmatched[kind];
@@ -666,7 +694,7 @@ static void vs_lock(void) {
         while (__atomic_load_n(&vs_lock_word, __ATOMIC_RELAXED)) __builtin_ia32_pause();
 }
 static void vs_unlock(void) { __atomic_store_n(&vs_lock_word, 0, __ATOMIC_RELEASE); }
-static int vs_active(void) { /* vs_init once, under the lock; then: is anything on */
+static void vs_ensure_init(void) { /* vs_init once, under the lock */
     static volatile int inited;
     if (!__atomic_load_n(&inited, __ATOMIC_ACQUIRE)) {
         vs_lock();
@@ -674,7 +702,14 @@ static int vs_active(void) { /* vs_init once, under the lock; then: is anything 
         vs_unlock();
         __atomic_store_n(&inited, 1, __ATOMIC_RELEASE);
     }
+}
+static int vs_active(void) { /* is anything on */
+    vs_ensure_init();
     return vs.mode != VRST_OFF || vt.on;
+}
+static int vs_active_hits(void) { /* the hit hooks always run: weapon contacts pulse in every mode */
+    vs_ensure_init();
+    return 1;
 }
 
 static ABI void vs_hook_cost_entry(BbHookContext *ctx) {
@@ -685,21 +720,21 @@ static ABI void vs_hook_cost_entry(BbHookContext *ctx) {
     vs_unlock();
 }
 static ABI void vs_hook_hit_chr(BbHookContext *ctx) {
-    if (!vs_active()) return;
+    if (!vs_active_hits()) return;
     vs_lock();
     vt_count(ctx, VA_SITE_HIT_CHR, 0);
     vs_hit(ctx, VA_SITE_HIT_CHR, 0, ctx->rdi, ctx->rdx, 0);
     vs_unlock();
 }
 static ABI void vs_hook_hit_map(BbHookContext *ctx) {
-    if (!vs_active()) return;
+    if (!vs_active_hits()) return;
     vs_lock();
     vt_count(ctx, VA_SITE_HIT_MAP, 1);
     vs_hit(ctx, VA_SITE_HIT_MAP, 1, ctx->rbx, ctx->r14, (int)(ctx->r15 & 0xFF));
     vs_unlock();
 }
 static ABI void vs_hook_hit_obj(BbHookContext *ctx) {
-    if (!vs_active()) return;
+    if (!vs_active_hits()) return;
     vs_lock();
     vt_count(ctx, VA_SITE_HIT_OBJ, 2);
     vs_hit(ctx, VA_SITE_HIT_OBJ, 2, ctx->rdi, ctx->rdx, 0);

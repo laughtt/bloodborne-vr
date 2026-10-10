@@ -43,6 +43,7 @@ struct MaskConstants {
 struct JitterState {
     std::mutex mutex;
     std::atomic<bool> armed{false}; ///< the presenter runs DLSS: jitter the scene
+    std::atomic<bool> jitter_on{true}; ///< dlss_jitter=0 zeroes the jitter (A/B diagnostic)
     XrDlssLogic::Tracker tracker;
     bool stereo = false;
     float scale = 1.0f;
@@ -88,7 +89,7 @@ std::array<float, 2> XrDlss::SceneJitter() {
     }
     std::scoped_lock lock{s.mutex};
     if (!s.chosen) {
-        s.jitter = s.tracker.ChooseJitter(s.stereo, s.scale);
+        s.jitter = s.tracker.ChooseJitter(s.stereo, s.scale, s.jitter_on.load());
         s.chosen = true;
     }
     return s.jitter;
@@ -127,8 +128,12 @@ struct XrDlss::Impl {
         vk::Format sample_format = vk::Format::eUndefined;
         u32 width = 0, height = 0;
         bool feature = false;
+        XrDlssLogic::FeatureKey key{};  ///< this eye's own feature (never shared with the other)
+        bool released_by_reset = false; ///< released by a settings change / DLSS toggle
         u64 evaluated = 0, resets = 0;
     };
+    XrDlssLogic::RecreateGuard recreate_guard; ///< >3 creates of one eye in 2 s: warns once
+    int jitter_logged = -1;                    ///< dlss_jitter state last logged
     std::array<Eye, 2> eyes;
 
     bool requested = false; ///< upscale=dlss in the last frame
@@ -172,6 +177,10 @@ struct XrDlss::Impl {
             if (eyes[e].feature) {
                 dlss->ReleaseFeature(Dlss::EyeSlot0 + e);
                 eyes[e].feature = false;
+                eyes[e].released_by_reset = true;
+                std::printf("VR DLSS: eye %c feature released (%s): %ux%u -> %ux%u\n",
+                            e ? 'R' : 'L', why, eyes[e].key.render_w, eyes[e].key.render_h,
+                            eyes[e].key.out_w, eyes[e].key.out_h);
             }
         }
         std::printf("VR DLSS: features released (%s)\n", why);
@@ -469,6 +478,27 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     }
     impl->Log(s);
 
+    // dlss_jitter=0|1 (control file): zero jitter for A/B comparisons, in both the projection
+    // offset (SceneJitter) and the value passed to DLSS (below); histories restart on a change.
+    {
+        const int want_jitter = s.dlss_jitter ? 1 : 0;
+        if (impl->jitter_logged != want_jitter) {
+            const bool first = impl->jitter_logged < 0;
+            impl->jitter_logged = want_jitter;
+            JitterState& jit = State();
+            std::scoped_lock lock{jit.mutex};
+            jit.jitter_on.store(s.dlss_jitter);
+            if (!first || !s.dlss_jitter) {
+                jit.tracker.Reset();
+            }
+            std::printf("VR DLSS: jitter %s%s\n",
+                        s.dlss_jitter ? "on"
+                                      : "OFF (dlss_jitter=0: projection and DLSS jitter are zero)",
+                        first ? " (initial)" : "");
+            std::fflush(stdout);
+        }
+    }
+
     // The finished frame's jitter (its display pass came before this flip).
     JitterState& js = State();
     bool fresh;
@@ -478,6 +508,9 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
         fresh = js.finished_fresh;
         jitter = js.finished_jitter;
         js.finished_fresh = false;
+    }
+    if (!s.dlss_jitter) {
+        jitter = {}; // a frame drawn before the switch still carries its old offset
     }
 
     // Frames DLSS does not take: FSR 1 fills the eye image size this once.
@@ -545,11 +578,17 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     const Quality quality = XrDlssLogic::FeatureQuality(
         s.dlss_quality_set, Quality(s.dlss_quality), w, ow);
     const Dlss::FeatureDesc desc{w, h, ow, oh, int(quality), false, s.dlss_preset};
+    // Per eye: compared with this eye's own slot/key, not a cache shared with the other eye.
+    const XrDlssLogic::FeatureKey want{w, h, ow, oh, int(quality), s.dlss_preset, false};
     if (!dlss->HasFeature(desc, slot)) {
+        const XrDlssLogic::CreateReason why = XrDlssLogic::CreateReasonFor(
+            eye.feature ? &eye.key : nullptr, want, eye.released_by_reset);
         if (eye.feature) {
             impl->scheduler.WaitSubmitted();
             dlss->ReleaseFeature(slot);
             eye.feature = false;
+            std::printf("VR DLSS: eye %c feature released (%s)\n", eye_frame.slot ? 'R' : 'L',
+                        XrDlssLogic::CreateReasonName(why));
         }
         if (!dlss->CreateFeature(cmdbuf, desc, slot)) {
             impl->failed = true;
@@ -559,10 +598,19 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
             return result;
         }
         eye.feature = true;
+        eye.key = want;
+        eye.released_by_reset = false;
         eye_frame.reset = true;
-        std::printf("VR DLSS: eye %c feature %ux%u -> %ux%u, %s, preset %c\n",
-                    eye_frame.slot ? 'R' : 'L', w, h, ow, oh, XrDlssLogic::QualityName(quality),
-                    XrDlssLogic::PresetLetter(s.dlss_preset));
+        std::printf("VR DLSS: eye %c feature created (%s): render %ux%u -> output %ux%u, %s, "
+                    "preset %c\n",
+                    eye_frame.slot ? 'R' : 'L', XrDlssLogic::CreateReasonName(why), w, h, ow, oh,
+                    XrDlssLogic::QualityName(quality), XrDlssLogic::PresetLetter(s.dlss_preset));
+        if (impl->recreate_guard.Note(eye_frame.slot, NowMs())) {
+            std::printf("VR DLSS: WARNING: eye %c feature created %u times within 2 s (last "
+                        "reason: %s): a recreate loop drops the history every time\n",
+                        eye_frame.slot ? 'R' : 'L', impl->recreate_guard.InWindow(eye_frame.slot),
+                        XrDlssLogic::CreateReasonName(why));
+        }
         std::fflush(stdout);
     }
 

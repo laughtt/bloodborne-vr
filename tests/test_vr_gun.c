@@ -149,7 +149,79 @@ static void test_ids(void) {
     if (!failures) printf("PASS: the bullet id list\n");
 }
 
+/* ---- Physical items: the throw mode (findings/39) ---- */
+#define THROW_IDS "100,105,120,121,150,170,180,410,460,470" /* = BBXR_THROW_BULLET_IDS (checked in vr_game_ui_test) */
+
+static void test_rel_to_world(void) {
+    float rows[3][4];
+    set_rows(rows, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1));
+    /* a head-frame forward (-Z) is the camera's forward; right is right; up is up */
+    CHECK(near_v(vg_rel_dir_to_world(vr_v3(0, 0, -1), (const float (*)[4])rows), vr_v3(0, 0, 1), 1e-5f), "forward");
+    CHECK(near_v(vg_rel_dir_to_world(vr_v3(1, 0, 0), (const float (*)[4])rows), vr_v3(1, 0, 0), 1e-5f), "right");
+    CHECK(near_v(vg_rel_dir_to_world(vr_v3(0, 1, 0), (const float (*)[4])rows), vr_v3(0, 1, 0), 1e-5f), "up");
+    /* the same through a turned camera and the vg_aim_in_world path (identity head, a pose pointing 30 deg up) */
+    float turned[3][4];
+    set_rows(turned, vr_v3(0, 0, -1), vr_v3(0, 1, 0), vr_v3(1, 0, 0));
+    const VrQuat id = vr_qidentity();
+    const VrQuat up = vr_qaxis(vr_v3(1, 0, 0), 30.0f * VR_DEG);
+    const VrVec3 pointing = vr_qrotate(up, vr_v3(0, 0, -1));
+    CHECK(near_v(vg_rel_dir_to_world(pointing, (const float (*)[4])turned),
+                 vg_aim_in_world(id, up, (const float (*)[4])turned), 1e-5f), "agrees with the controller ray");
+    /* a position: the camera plus the offset (0.3 m right, 0.2 m below, 0.4 m ahead of the head) */
+    const VrVec3 p = vg_rel_pos_to_world(vr_v3(0.3f, -0.2f, -0.4f), (const float (*)[4])rows, vr_v3(10, 2, -5));
+    CHECK(near_v(p, vr_v3(10.3f, 1.8f, -4.6f), 1e-5f), "position %f %f %f", p.x, p.y, p.z);
+    if (!failures) printf("PASS: head-frame vectors in the game world\n");
+}
+
+static void test_throw_launch(void) {
+    float m[3][4], t[3];
+    const VrVec3 muzzle = vr_v3(0, 1.4f, 0), hand = vr_v3(0.3f, 1.2f, 0.4f);
+    set_launch(m, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    t[0] = 0; t[1] = 1.4f; t[2] = 6.0f; /* the game's aim point: 6 m ahead */
+    const VrVec3 dir = vam_norm(vr_v3(1, 0.4f, 1), vr_v3(0, 0, 1));
+    int moved = 0;
+    VrVec3 before, after;
+    const float turn = vg_throw_launch(m, t, hand, dir, 2.0f, &moved, &before, &after);
+    CHECK(moved == 1, "hand within reach of the muzzle");
+    CHECK(near_v(vg_launch_origin((const float (*)[4])m), hand, 1e-5f), "origin at the hand");
+    CHECK(near_v(vam_norm(vg_launch_axis((const float (*)[4])m, 2), vr_v3(0, 0, 1)), dir, 1e-4f), "Z along the release");
+    CHECK(near_v(after, dir, 1e-4f) && near_v(before, vr_v3(0, 0, 1), 1e-5f), "old and new directions");
+    CHECK(near_f(turn, vg_angle_deg(vr_v3(0, 0, 1), dir), 1e-3f), "turn angle");
+    CHECK(near_v(vr_v3(t[0], t[1], t[2]), vr_add(hand, vr_scale(dir, 6.0f)), 1e-4f), "aim point 6 m along the release from the hand");
+    /* no roll: X stays horizontal, handedness kept */
+    const VrVec3 x = vg_launch_axis((const float (*)[4])m, 0), y = vg_launch_axis((const float (*)[4])m, 1), z = vg_launch_axis((const float (*)[4])m, 2);
+    CHECK(near_f(x.y, 0.0f, 1e-4f) && near_v(vr_cross(x, y), z, 1e-4f), "level, right-handed");
+    /* a hand 3 m from the muzzle (a wrong world assumption): the game's origin is kept, the direction still turns */
+    set_launch(m, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    vg_throw_launch(m, NULL, vr_v3(3, 1.4f, 0), dir, 2.0f, &moved, NULL, NULL);
+    CHECK(moved == 0 && near_v(vg_launch_origin((const float (*)[4])m), muzzle, 1e-6f), "far hand: origin kept");
+    CHECK(near_v(vam_norm(vg_launch_axis((const float (*)[4])m, 2), vr_v3(0, 0, 1)), dir, 1e-4f), "far hand: direction still turned");
+    /* a lock-on (no aim point): 10 m default distance is only used for a point target, none given here */
+    set_launch(m, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    vg_throw_launch(m, NULL, hand, vr_v3(0, 0, 1), 2.0f, &moved, NULL, NULL);
+    CHECK(moved == 1 && near_v(vg_launch_origin((const float (*)[4])m), hand, 1e-6f), "no target");
+    /* straight up (vertical release): the fallback rotation, still a unit direction */
+    set_launch(m, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    vg_throw_launch(m, NULL, hand, vr_v3(0, 1, 0), 2.0f, &moved, NULL, NULL);
+    CHECK(near_v(vg_launch_axis((const float (*)[4])m, 2), vr_v3(0, 1, 0), 1e-4f), "vertical");
+    if (!failures) printf("PASS: the throw launch (origin at the hand, Z along the release, aim point moved)\n");
+}
+
+static void test_throw_ids(void) {
+    static const int listed[] = {100, 105, 120, 121, 150, 170, 180, 410, 460, 470};
+    for (size_t i = 0; i < sizeof listed / sizeof *listed; ++i) CHECK(vg_id_in_list(THROW_IDS, listed[i]), "bullet %d is listed", listed[i]);
+    /* the self-targeted and non-flying ones are never redirected: Antidote 200, Sedative 230, Lead Elixir 320,
+     * the rope molotovs 110 / 114, Pungent Blood 160, Shining Coins 300, Executioner's Gloves 350, the
+     * firearms 500-999 (the gun's own list) and the burst children */
+    static const int excluded[] = {200, 230, 320, 110, 114, 160, 300, 350, 101, 106, 151, 600, 601, 0};
+    for (size_t i = 0; i < sizeof excluded / sizeof *excluded; ++i) CHECK(!vg_id_in_list(THROW_IDS, excluded[i]), "bullet %d is not listed", excluded[i]);
+    if (!failures) printf("PASS: the thrown bullet id list\n");
+}
+
 int main(void) {
+    test_rel_to_world();
+    test_throw_launch();
+    test_throw_ids();
     test_aim_in_world();
     test_turn();
     test_redirect();

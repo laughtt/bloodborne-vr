@@ -246,6 +246,8 @@ struct App {
     bool log_follow = true;
     std::atomic<bool> running{false};
     HANDLE job = nullptr;
+    int crash_base = -1;           // crash reports saved when the game was started (-1: no game started yet)
+    std::string crash_new;         // path of the report saved by the session that just ended ("" = none / dismissed)
     std::string tab = "play";
     std::string group = "display";
     bool advanced = false;
@@ -315,6 +317,8 @@ static void start_game()
     }
     bool send_values = A.dirty.exchange(false);
     std::string body = default_save_body(send_values);
+    A.crash_base = A.st.value("crash", json::object()).value("count", 0);
+    A.crash_new.clear();
     A.running = true;
     if (A.job) CloseHandle(A.job);
     A.job = make_job();
@@ -554,6 +558,13 @@ static void open_url(const std::string& url)
     SDL_OpenURL(url.c_str());
 }
 
+static void open_folder(const std::string& utf8_path)
+{
+    if (utf8_path.empty()) return;
+    std::wstring p = W(utf8_path);
+    ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 // ---------------------------------------------------------------------------------------------
 // This PC rows
 
@@ -598,6 +609,7 @@ static void draw_rows(const std::vector<Row>& rows, float width)
             if (Button(r.button, ImVec2(bw, S(30)), r.primary)) {
                 if (r.action == 1) SDL_ShowOpenFolderDialog(folder_cb, nullptr, A.window, nullptr, false);
                 if (r.action == 2) cli_async({"state"});
+                if (r.action == 3) open_folder(jstr(A.st.value("crash", json::object()), "dir"));
             }
         }
         ImGui::SetCursorPos(ImVec2(start.x, start.y + S(46)));
@@ -651,15 +663,20 @@ static std::vector<Row> pc_rows()
     std::string missing;
     if (!a) missing += "nvngx_dlss.dll";
     if (!b) missing += std::string(missing.empty() ? "" : ", ") + "bbport_dlss.dll";
-    d.detail = (a && b) ? "bin\\nvngx_dlss.dll and bin\\bbport_dlss.dll found" : "Optional. Missing: " + missing + ". Without them the game uses FSR 1.";
+    d.detail = (a && b) ? "bin\\nvngx_dlss.dll and bin\\bbport_dlss.dll found" : "Missing: " + missing + " (they ship in bin/ with the release; reinstall or unzip again). Without them the game uses FSR 1.";
     rows.push_back(d);
 
     Row c;
     c.title = "Crash reports";
     const json cr = A.st.value("crash", json::object());
-    bool avail = cr.value("available", false), asked = cr.value("asked", true), on = jstr(cr, "mode") == "on";
-    c.color = !avail ? MUTED : (!asked ? AMBER : (on ? GREEN : MUTED));
-    c.detail = !avail ? "Not part of this build" : (!asked ? "Not asked yet" : (on ? "On: an anonymous report is sent if the game crashes" : "Off: crash data stays on this PC"));
+    int ncrash = cr.value("count", 0);
+    c.color = !cr.value("available", false) ? MUTED : (ncrash ? AMBER : GREEN);
+    c.detail = !cr.value("available", false) ? "Not part of this build"
+               : std::to_string(ncrash) + " saved in " + jstr(cr, "dir") + ". Never sent automatically.";
+    if (cr.value("available", false)) {
+        c.button = "Open folder";
+        c.action = 3;
+    }
     rows.push_back(c);
     return rows;
 }
@@ -983,6 +1000,16 @@ static void switch_row(const char* id, const char* title, const char* detail, bo
     ImGui::PopID();
 }
 
+// Update switch shared by the About tab and the Options page (Advanced).
+static void update_switch()
+{
+    const json up = A.st.value("update", json::object());
+    bool on = up.value("enabled", true);
+    bool changed = false;
+    switch_row("updsw", "Check for updates at start", "Asks GitHub (the release list; nothing about you is sent) whether a newer version exists and says so here. Switch it off to never connect.", &on, changed);
+    if (changed) cli_async({"update-opt", on ? "on" : "off"});
+}
+
 static void tab_options(ImVec2 avail)
 {
     static const struct { const char* id; const char* label; } groups[] = {
@@ -1019,6 +1046,10 @@ static void tab_options(ImVec2 avail)
     ImGui::SameLine(0, S(16));
     if (BeginCard("opts", ImVec2(avail.x - side - S(16), avail.y))) {
         draw_options_list(A.group, false);
+        if (A.group == "advanced") {
+            ImGui::Dummy(ImVec2(0, S(8)));
+            update_switch();
+        }
         if (jstr(A.st, "profile") == "Custom") {
             ImGui::Dummy(ImVec2(0, S(4)));
             Muted("Profile: Custom (your edits). Pick another profile on the Play tab to go back.");
@@ -1115,12 +1146,17 @@ static void tab_about(ImVec2 avail)
         Heading("Licence");
         MutedWrapped("Free software under the GPL (see LICENSE and THIRD_PARTY_NOTICES.md next to this program). No game files are included and none are ever uploaded: you must own Bloodborne and use your own legally obtained dump. Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne are trademarks of their owners.");
         ImGui::Dummy(ImVec2(0, S(10)));
+        Heading("Credits");
+        MutedWrapped("This program uses NVIDIA DLSS (nvngx_dlss.dll, NVIDIA RTX SDKs LICENSE: see licenses/NVIDIA-DLSS-LICENSE.txt). Not sponsored or endorsed by NVIDIA.");
+        ImGui::Dummy(ImVec2(0, S(10)));
         Heading("Links");
         if (Button("GitHub repository", ImVec2(S(170), S(34)))) open_url("https://github.com/laughtt/bloodborne-vr");
         ImGui::SameLine();
         if (Button("Open the logs folder", ImVec2(S(180), S(34)))) {
-            std::wstring logs = U8(A.env.exe_dir).empty() ? L"" : A.env.exe_dir + L"\\logs";
-            if (!dir_exists(logs)) logs = A.env.exe_dir;
+            std::string dd = jstr(A.st.value("app", json::object()), "data_dir");
+            std::wstring base = dd.empty() ? A.env.exe_dir : W(dd);
+            std::wstring logs = base + L"\\logs";
+            if (!dir_exists(logs)) logs = base;
             ShellExecuteW(nullptr, L"open", logs.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
     }
@@ -1128,14 +1164,33 @@ static void tab_about(ImVec2 avail)
     ImGui::EndGroup();
     ImGui::SameLine(0, gap);
     if (BeginCard("about2", ImVec2(avail.x - lw - gap, avail.y))) {
+        Heading("Updates");
+        {
+            const json up = A.st.value("update", json::object());
+            std::string stt = jstr(up, "status");
+            std::string line = !up.value("enabled", true) ? "Update check is off."
+                : stt == "newer" ? "New version " + jstr(up, "latest") + " is available."
+                : stt == "current" ? "You have the newest version."
+                : stt == "unavailable" ? "Update check unavailable right now."
+                : "Not checked yet.";
+            ImGui::PushStyleColor(ImGuiCol_Text, CV(stt == "newer" ? GREEN : MUTED));
+            ImGui::TextUnformatted(line.c_str());
+            ImGui::PopStyleColor();
+            if (up.value("enabled", true) && Button("Check for updates", ImVec2(S(170), S(34)))) cli_async({"update-check"});
+            if (stt == "newer") {
+                ImGui::SameLine();
+                if (Button("Open download page", ImVec2(S(190), S(34)), true)) open_url(jstr(up, "url"));
+            }
+            ImGui::Dummy(ImVec2(0, S(6)));
+            update_switch();
+        }
         Heading("Crash reports");
         const json cr = A.st.value("crash", json::object());
-        bool avail_ = cr.value("available", false);
-        bool on = jstr(cr, "mode") == "on";
-        if (avail_) {
-            bool changed = false;
-            switch_row("crash", "Send crash reports", "If the game crashes, an anonymous report is sent to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at a report on your PC first.", &on, changed);
-            if (changed) cli_async({"crash", on ? "on" : "off"});
+        if (cr.value("available", false)) {
+            MutedWrapped("If the game crashes, a report is saved on this PC: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. Nothing is sent automatically. If you want to help, send the report file to the developer.");
+            MutedWrapped(std::to_string(cr.value("count", 0)) + " saved in " + jstr(cr, "dir"));
+            ImGui::Dummy(ImVec2(0, S(4)));
+            if (Button("Open crash reports folder", ImVec2(S(250), S(34)))) open_folder(jstr(cr, "dir"));
         } else
             MutedWrapped("Crash reports are not part of this build.");
         ImGui::Dummy(ImVec2(0, S(10)));
@@ -1161,8 +1216,6 @@ static void tab_about(ImVec2 avail)
 
 static const char* LEGAL =
     "Bloodborne VR is an unofficial fan project. It contains no game files: you must own Bloodborne and use your own legally obtained dump. It is not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne are trademarks of their owners.";
-static const char* CRASH_TEXT =
-    "If the game crashes, it can send an anonymous crash report to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at the report on your PC first, and change this later on the About tab.";
 
 static void centered_popup(const char* name, ImVec2 size)
 {
@@ -1177,11 +1230,9 @@ static void prompts()
 {
     if (!A.have_state) return;
     const json app = A.st.value("app", json::object());
-    const json cr = A.st.value("crash", json::object());
     bool need_legal = !app.value("accepted", false);
-    bool need_crash = !need_legal && cr.value("available", false) && !cr.value("asked", true);
     bool quit = A.quit_confirm;
-    const char* which = need_legal ? "Welcome" : (need_crash ? "Help fix crashes?" : (quit ? "Quit" : nullptr));
+    const char* which = need_legal ? "Welcome" : (quit ? "Quit" : nullptr);
     if (!which) return;
     ImGui::OpenPopup(which);
     centered_popup(which, ImVec2(S(560), 0));
@@ -1195,15 +1246,9 @@ static void prompts()
         if (need_legal) {
             ImGui::TextUnformatted(LEGAL);
             ImGui::Dummy(ImVec2(0, S(6)));
-            ImGui::TextUnformatted("Single-player alpha. Free software under the GPL.");
+            ImGui::TextUnformatted("Single-player alpha. Free software under the GPL. If the game crashes, a report is saved on this PC (the About tab shows where); nothing is ever sent automatically.");
             ImGui::Dummy(ImVec2(0, S(10)));
             if (Button("I own a legal copy of Bloodborne - continue", ImVec2(-1, S(44)), true)) cli_async({"accept"});
-        } else if (need_crash) {
-            ImGui::TextUnformatted(CRASH_TEXT);
-            ImGui::Dummy(ImVec2(0, S(10)));
-            if (Button("Yes, send crash reports", ImVec2(S(250), S(44)), true)) cli_async({"crash", "on"});
-            ImGui::SameLine();
-            if (Button("No, keep them on my PC", ImVec2(S(250), S(44)))) cli_async({"crash", "off"});
         } else {
             ImGui::TextUnformatted("The game is running. Quitting the dashboard stops it. Quit anyway?");
             ImGui::Dummy(ImVec2(0, S(10)));
@@ -1285,6 +1330,22 @@ static void draw_ui(float w, float h)
     // content
     ImVec2 avail(w - 2 * mx, h - S(124) - S(12));
     ImGui::SetCursorScreenPos(ImVec2(mx, S(122)));
+    if (!A.crash_new.empty()) {  // the game crashed: say so plainly (the report is already saved)
+        float bh = S(64);
+        dl->AddRectFilled(ImVec2(mx, S(122)), ImVec2(mx + avail.x, S(122) + bh), C(0x2a1114), S(10));
+        dl->AddRect(ImVec2(mx, S(122)), ImVec2(mx + avail.x, S(122) + bh), C(ACCENT), S(10));
+        std::string msg = "The game crashed. A crash report was saved to " + A.crash_new + ". If you want to help, send that file to the developer.";
+        ImGui::SetCursorScreenPos(ImVec2(mx + S(14), S(122) + S(8)));
+        ImGui::PushTextWrapPos(mx + avail.x - S(280));
+        ImGui::TextUnformatted(msg.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::SetCursorScreenPos(ImVec2(mx + avail.x - S(260), S(122) + S(15)));
+        if (Button("Open folder", ImVec2(S(120), S(34)), true)) open_folder(jstr(A.st.value("crash", json::object()), "dir"));
+        ImGui::SameLine();
+        if (Button("Dismiss", ImVec2(S(110), S(34)))) A.crash_new.clear();
+        avail.y -= bh + S(10);
+        ImGui::SetCursorScreenPos(ImVec2(mx, S(122) + bh + S(10)));
+    }
     ImGui::BeginChild("content", avail, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     if (!A.have_state) {
         ImGui::Dummy(ImVec2(0, S(20)));
@@ -1330,9 +1391,11 @@ static void pump_state()
             A.st["app"]["accepted"] = true;
             A.st["app"]["eboot"] = true;
             A.st["app"]["game_dir"] = R"(C:\Dumps\Bloodborne\CUSA03173)";
-            A.st["crash"]["available"] = true;
-            A.st["crash"]["asked"] = true;
-            A.st["crash"]["mode"] = "on";
+        }
+        const json cr = A.st.value("crash", json::object());
+        if (!A.running && A.crash_base >= 0 && cr.value("count", 0) > A.crash_base) {  // the session that just ended crashed
+            A.crash_new = jstr(cr, "latest");
+            A.crash_base = -1;
         }
     } else if (A.has_incoming && !A.have_state) {
         A.st = A.incoming;
@@ -1408,6 +1471,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     setup_theme();
 
     if (A.env.ok) cli_async({"state"});
+    if (A.env.ok && shot.empty()) cli_async({"update-check"});  // quiet and non-blocking; the helper honours the opt-out
     bool done = false;
     int frames = 0, settle = 0;
     while (!done) {

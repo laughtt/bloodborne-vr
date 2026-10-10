@@ -1149,6 +1149,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
                          vk::Filter::eLinear);
+        // bbport VR: the VR menus in the window too (recordings), where the frame landed.
+        if (Xr* xr = Xr::Get()) {
+            if (const auto mirror = xr->LatestMirrorUi()) {
+                const vk::Rect2D fit =
+                    FitImage(frame->width, frame->height, extent.width, extent.height);
+                BbOverlay::SetMirror({mirror->image, mirror->view_format, mirror->uv_w,
+                                      mirror->uv_h, fit.offset.x, fit.offset.y,
+                                      fit.extent.width, fit.extent.height});
+            }
+        }
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
         const std::array post_barriers{

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Builds BloodborneVR.exe (tools/release/zip/exe) with the MSYS2 CLANG64 toolchain.
 
-    python tools/release/build_stub.py [--version 0.1.0-alpha3] [--out out/release_cache/BloodborneVR.exe]
+    python tools/release/build_stub.py [--version 0.1.0-alpha5] [--out out/release_cache/BloodborneVR.exe]
 Exits non-zero with a message when clang or llvm-rc is missing or the build fails.
 """
 import argparse

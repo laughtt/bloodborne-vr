@@ -57,6 +57,19 @@ bool text_entry_active = false;
 std::string text_entry_prompt, text_entry_text;
 float base_scale = 1.0f;
 
+// The VR UI mirror for this frame (SetMirror), and the ImGui textures made for its images.
+bool mirror_set = false;
+Mirror mirror_now{};
+vk::Device mirror_device;
+VkSampler mirror_sampler = VK_NULL_HANDLE;
+struct MirrorTexture {
+    vk::Image image;
+    vk::Format format;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+};
+std::vector<MirrorTexture> mirror_textures; // the bridge cycles 3 images
+
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
@@ -502,6 +515,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         ImGui::DestroyContext();
         return;
     }
+    mirror_device = instance.GetDevice();
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
 }
@@ -612,8 +626,55 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps);
+    return initialized &&
+           (menu_open || text_entry_active || BbSettings::Get().show_fps || mirror_set);
 }
+
+void SetMirror(const Mirror& mirror) {
+    mirror_now = mirror;
+    mirror_set = initialized && mirror.image;
+}
+
+namespace {
+
+/// The ImGui texture of a mirror image (made once per image, kept).
+VkDescriptorSet MirrorSet(const Mirror& m) {
+    for (const MirrorTexture& t : mirror_textures) {
+        if (t.image == m.image && t.format == m.view_format) {
+            return t.set;
+        }
+    }
+    if (mirror_textures.size() >= 6) { // the bridge recreated its images: start over
+        for (MirrorTexture& t : mirror_textures) {
+            ImGui_ImplVulkan_RemoveTexture(t.set);
+            mirror_device.destroyImageView(t.view);
+        }
+        mirror_textures.clear();
+    }
+    if (!mirror_sampler) {
+        const vk::SamplerCreateInfo sampler{
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        };
+        mirror_sampler = mirror_device.createSampler(sampler).value;
+    }
+    const vk::ImageView view = mirror_device.createImageView(vk::ImageViewCreateInfo{
+        .image = m.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = m.view_format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    }).value;
+    MirrorTexture t{m.image, m.view_format, view, VK_NULL_HANDLE};
+    t.set = ImGui_ImplVulkan_AddTexture(mirror_sampler, view,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    mirror_textures.push_back(t);
+    return t.set;
+}
+
+} // namespace
 
 bool CapturesInput() {
     return menu_open || text_entry_active;
@@ -652,6 +713,18 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
+    if (mirror_set) {
+        // Behind the menu and the counter. The image is premultiplied, ImGui blends straight:
+        // translucent edges come out a little thin, opaque parts exact.
+        const Mirror m = mirror_now;
+        mirror_set = false;
+        if (const VkDescriptorSet set = MirrorSet(m)) {
+            ImGui::GetBackgroundDrawList()->AddImage(
+                ImTextureID(set), ImVec2(float(m.x), float(m.y)),
+                ImVec2(float(m.x + s32(m.w)), float(m.y + s32(m.h))), ImVec2(0.0f, 0.0f),
+                ImVec2(m.uv_w, m.uv_h));
+        }
+    }
     if (menu_open) {
         Menu();
     }

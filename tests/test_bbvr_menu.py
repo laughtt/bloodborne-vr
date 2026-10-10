@@ -21,8 +21,8 @@ import bbvr_settings as S  # noqa: E402
 # The env block of the old out/vr_all.sh session (kept here so the test also runs without out/).
 GOLDEN_ENV = {
     'BB_XR_AA': 'fxaa', 'BB_XR_UPSCALE': 'fsr1', 'BB_XR_SHARPEN': '0.5', 'BB_VR': '1', 'BB_XR_MODE': 'alt',
-    'BB_VR_HEAD': '1', 'BB_VR_HEAD_LEVEL': '1', 'BB_VR_FP': '1', 'BB_VR_FP_LOG': '1', 'BB_VR_DASH': '1',
-    'BB_VR_DASH_LOG': '1', 'BB_VR_STEREO_LOG': '1', 'BB_VR_STAMINA': 'defer', 'BB_VR_STAMINA_LOG': '1',
+    'BB_VR_HEAD': '1', 'BB_VR_HEAD_LEVEL': '1', 'BB_VR_FP': '1', 'BB_VR_FP_LOG': '0', 'BB_VR_DASH': '1',
+    'BB_VR_DASH_LOG': '0', 'BB_VR_STEREO_LOG': '0', 'BB_VR_STAMINA': 'defer', 'BB_VR_STAMINA_LOG': '0',
     'BB_VR_STAMINA_TRACE': '0', 'BB_VR_ARMS': '1', 'BB_VR_UI': '1', 'BB_VR_UI_PROBE': '0', 'BB_VR_GUN_AIM': '1',
     'BB_VR_HIT_SCALE': '1', 'BB_UPSCALER': 'off', 'BB_FPS_LIMIT': '72',
     'BB_PATCHES': 'Disable Motion Blur (perf increase);Disable AA;Disable DoF;Disable Chromatic Aberration',
@@ -80,8 +80,8 @@ class GoldenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = S.build_launch(S.effective_values(S.default_settings()), paths_in(tmp), NO_GPU, public=False)['env']
         for key, want in old.items():
-            if key in ('BB_PROBE', 'BB_GAME_DIR') or key.startswith('BB_DEBUG_') or want == '':
-                continue  # debug-only (not in the release) or empty-expanding entries
+            if key in ('BB_PROBE', 'BB_GAME_DIR') or key.startswith('BB_DEBUG_') or key.endswith('_LOG') or want == '':
+                continue  # debug-only (not in the release), debug logs (off by default in the release) or empty entries
             if key in PATH_VARS:
                 self.assertEqual(Path(env[key]).name, Path(want).name)
             else:
@@ -178,6 +178,21 @@ class ProfileTests(unittest.TestCase):
 
 
 class DlssTests(unittest.TestCase):
+    OK = {'gpus': [], 'dlss': {'ok': True, 'reason': '', 'exe': Path('bb-probe.exe'), 'native': True, 'dir': Path('.')},
+          'runtimes': {'active': None, 'runtimes': [], 'warnings': []}}
+
+    def test_default_is_dlss_when_the_dlss_check_passes_else_fsr1(self):
+        on = S.effective_values(S.default_settings(), self.OK)
+        self.assertEqual((on['upscale'], on['dlss_quality'], on['dlss_preset'], on['dlss_sharpen']), ('dlss', 'quality', 'K', 0.2))
+        self.assertEqual(S.effective_values(S.default_settings(), NO_GPU)['upscale'], 'fsr1')
+        self.assertEqual(S.effective_values(S.default_settings())['upscale'], 'fsr1')
+
+    def test_a_saved_choice_wins_over_the_hardware_default(self):
+        perf = dict(S.default_settings(), profile='Performance')
+        self.assertEqual(S.effective_values(perf, self.OK)['upscale'], 'fsr1')
+        custom = dict(S.default_settings(), profile='Custom', custom={'upscale': 'fsr1'})
+        self.assertEqual(S.effective_values(custom, self.OK)['upscale'], 'fsr1')
+
     def make_exe(self, folder, marker=True, dlls=True):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / 'bb-probe.exe').write_bytes(b'MZ' + (b'BB_XR_DLSS_QUALITY dlss_sharpen' if marker else b'x') + b'\0' * 64)

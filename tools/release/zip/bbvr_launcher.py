@@ -44,9 +44,12 @@ import bbvr_settings as settings_mod  # noqa: E402
 # Source tree (tools/release/zip): the port is the repo root and the game data lives in out/.
 DEV = HERE.name.lower() == 'zip' and (HERE.parents[2] / 'run.py').is_file()
 PORT = HERE.parents[2] if DEV else (HERE.parent if HERE.name.lower() == 'launcher' else HERE)
-OUT = PORT / 'out'
-CONFIG = (OUT / 'bbvr_config.json') if DEV else (PORT / 'bbvr_config.json')
-LOGS = PORT / 'logs'
+# The player's own files (out/, user/, logs/, bbvr_config.json): the port folder for the portable zip and the
+# source tree, %LOCALAPPDATA%/BloodborneVR for a Setup.exe install (installed.flag), see bbvr_settings.data_root.
+DATA = settings_mod.data_root(PORT)
+OUT = DATA / 'out'
+CONFIG = (OUT / 'bbvr_config.json') if DEV else (DATA / 'bbvr_config.json')
+LOGS = DATA / 'logs'
 TITLE_ID = 'CUSA03173'
 APP_VERSION = '01.09'
 # SHA-256 of eboot.bin of the 01.09 dump the patches were written against (a hash, not game content).
@@ -89,6 +92,7 @@ def load_config():
 
 
 def save_config(config):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
 
 
@@ -199,7 +203,7 @@ def check_game(game, config):
         return True
     say('  eboot.bin differs from the known 01.09 dump (another dump or decryption tool).')
     say('  Checking that every byte the VR hooks expect is where it should be ...')
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     result = subprocess.run([sys.executable, str(PORT / 'scripts' / 'prepare.py'), str(game), '--out', str(OUT)],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     elf = OUT / 'eboot.elf'
@@ -283,7 +287,7 @@ def extract_assets(game, config):
 # --- start ------------------------------------------------------------------------------------
 
 def ensure_defaults():
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     for name in ('fp.txt', 'stereo.txt'):
         target, source = OUT / name, (PORT / 'defaults' if (PORT / 'defaults').is_dir() else HERE / 'defaults') / name
         if not target.exists() and source.is_file():
@@ -295,7 +299,10 @@ def launch(env_extra, menu=None):
     env = dict(os.environ)
     env.update({'PYTHONIOENCODING': 'utf-8'})
     env.update(env_extra)
-    LOGS.mkdir(exist_ok=True)
+    if DATA != PORT:  # installed build: generated files, saves and settings are outside the program folder
+        env.setdefault('BB_DATA_DIR', str(DATA))
+        env.setdefault('BB_PATCHES_DIR', str(PORT / 'patches'))  # run.py defaults these to <data>/patches
+    LOGS.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S')
     log = LOGS / f'bbvr-{stamp}.log'
     for old in sorted(LOGS.glob('bbvr-*.log'))[:-9]:
@@ -303,8 +310,7 @@ def launch(env_extra, menu=None):
     say(f'Starting. Put the headset on. Log: {log}')
     if menu:
         menu.game_running = True
-    # The game's output goes to the console and to the log; stdin stays attached so the one-time
-    # crash-report question (docs/CRASH_REPORTS.md) can be answered.
+    # The game's output goes to the console and to the log (a crash report is saved by run.py, docs/CRASH_REPORTS.md).
     with open(log, 'w', encoding='utf-8', errors='replace') as handle:
         child = subprocess.Popen([sys.executable, str(PORT / 'run.py')], cwd=PORT, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -329,14 +335,14 @@ def launch(env_extra, menu=None):
 
 
 def settings_path():
-    return PORT / 'user' / 'bbvr_settings.json'
+    return DATA / 'user' / 'bbvr_settings.json'
 
 
 def run_with_settings(game, args):
     """The settings step: profile / menu, control files, environment; then the game."""
     caps = settings_mod.detect_all(PORT)
     spath = settings_path()
-    paths = settings_mod.make_paths(PORT, game)
+    paths = settings_mod.make_paths(PORT, game, DATA)
     if args.reset_settings:
         spath.unlink(missing_ok=True)
         settings_mod.apply_ui_overrides(paths['assets'], {})  # back to the pristine ui_layouts.json
@@ -382,7 +388,7 @@ def run_with_settings(game, args):
             say(f'Unknown profile "{args.profile}". Profiles: ' + ', '.join(settings_mod.PROFILE_ORDER))
             return 5
         saved = dict(saved, profile=wanted)
-    values = settings_mod.effective_values(saved)
+    values = settings_mod.effective_values(saved, caps)
     if args.mono:
         values['mode'] = 'mono'
     plan = settings_mod.build_launch(values, paths, caps)
@@ -391,7 +397,7 @@ def run_with_settings(game, args):
     wr = settings_mod.runtime_warning(caps['runtimes'], values.get('runtime') or '')
     if wr:
         say('  Warning: ' + wr)
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
     changed = settings_mod.apply_files(plan, paths)
     if changed:
         say('  Updated: ' + ', '.join(Path(c).name for c in changed))

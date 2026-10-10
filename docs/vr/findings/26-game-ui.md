@@ -428,3 +428,15 @@ Steps:
 | Bridge | `gpu/xr_bridge/vr_game_ui.{h,cpp}` (the UI on game state), `vr_ui_filter.h` (input rules), `vr_ui_layer.{h,cpp}` (Vulkan), `bbport_xr_bridge.{h,cpp}` (ABI 8, UI thread, layer, GetInput filter), `vr_game_ui_test.cpp`, `CMakeLists.txt` |
 | Shared with the sandbox | `sandbox3d/combat_hud.{h,cpp}` (new, from `combat_view.cpp`); `ui.{h,cpp}`: `UiWorld`/`UiAction`/live data, `LoadGame`, `Build()` without lines, `Engaged`, `UsesStick`, `CloseAll`, exact-match bindings, `confirm`, consumables only count down, body-slot grab needs the hand on the slot first; `ui_layout.*`: the `"game"` object; `ui_render.*`: `UiPose`, `UiItem::Consumable`, `SetAccumulateAlpha`; the sandbox's swings are blocked by `ui.Engaged()` |
 | Host | `src/runtime_vr_ui.c`, `src/vr_ui_game.h`, `tests/test_vr_ui.c`; hooks in `runtime_pad.c`, `probe.c`, `runtime.h`, `runtime_vr_stamina.c` (ticket events); `gpu/bbgpu.h`, `gpu/shim/bbgpu.cpp`, `vk_xr.{h,cpp}` |
+
+## Menus in the desktop window (recordings)
+
+The menus, wrist counters, toasts and held-item visuals reach the headset as a projection layer (ABI 8) that only the runtime composites, so a screen recording of the desktop window (OBS) misses them. `BB_XR_MIRROR_UI` draws them into the window too.
+
+- **How.** The UI thread draws the same UI geometry a third time in the same submission as the two eye images, from the view the latest flat (mono) image was rendered with (`ReleaseFlatView`: head pose and frustum), into a ring of 3 bridge-owned images (up to 1920x1080, square pixels, cleared to transparent, premultiplied alpha, left in `SHADER_READ_ONLY_OPTIMAL`; `vr_mirror_ui.h` has the math). Bridge ABI 9 `GetMirrorUi` hands the latest finished image to the host; the presenter fits it into the window where the game frame landed (the same letterbox rectangle) and `BbOverlay` draws it with ImGui behind the settings menu. Cost: one more UI pass on the GPU, one textured quad in the window.
+- **Option.** `BB_XR_MIRROR_UI=1|0`; default on with `BB_XR_MODE=mono`, off otherwise. It needs `BB_VR_UI=1`. Live: a file `bb_xr_mirror_ui.txt` in the working directory containing `1`/`0` (or `on`/`off`), polled once a second.
+- **Limits.**
+  - Mono only. In `alt` mode the window shows alternating eyes and there is no single view to draw the UI from: record in mono.
+  - The view is the one of the last flat image (up to a frame old); wrist and hand menus can trail by that much in fast motion.
+  - The image is premultiplied, ImGui blends straight: translucent edges come out slightly thinner, opaque parts are exact.
+  - The 2D game HUD layer (`BB_XR_HUD`) is not part of this; it is in or over the game image as before.

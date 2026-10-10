@@ -130,10 +130,15 @@ def _build_schema():
          help='Used with lock 2.'))
     a(_o('smooth', 'comfort', 'Camera smoothing (s)', 'float', ('fp', 'smooth'), None, min=0.0, max=2.0, step=0.05))
     # ---- Combat ----
-    a(_o('hit', 'combat', 'Bigger hit shapes', 'bool', ('fp', 'hit'), True, help='Swing-shaped hitboxes scaled for VR.'))
-    a(_o('hit_scale', 'combat', 'Hit shape radius scale', 'float', ('fp', 'hit_scale'), 1.5, min=0.5, max=5.0, step=0.05))
-    a(_o('hit_reach', 'combat', 'Hit shape reach (m)', 'float', ('fp', 'hit_reach'), 2.0, min=0.0, max=6.0, step=0.1))
-    a(_o('atk_speed', 'combat', 'Attack animation speed', 'float', ('fp', 'atk_speed'), 3.0, min=0.0, max=6.0, step=0.1,
+    a(_o('hit', 'combat', 'Hitboxes', 'choice', ('fp', 'hit'), 'big', choices=['big', 'original'],
+         labels={'big': 'Big (default)', 'original': 'Original (as the game shipped)'},
+         help='Your weapon hit shapes. Big: wider and a little longer, easier to land hits with motion controls. '
+              'Original: exactly the game own shapes. Enemies are never changed. Live.'))
+    a(_o('hit_scale', 'combat', 'Big hitboxes: radius scale', 'float', ('fp', 'hit_scale'), 1.5, min=0.25, max=4.0, step=0.05,
+         advanced=True, only_if={'hit': 'big'}, help='Used when Hitboxes = Big.'))
+    a(_o('hit_reach', 'combat', 'Big hitboxes: extra reach (m)', 'float', ('fp', 'hit_reach'), 1.0, min=-0.3, max=1.0, step=0.05,
+         advanced=True, only_if={'hit': 'big'}, help='Used when Hitboxes = Big.'))
+    a(_o('atk_speed', 'combat', 'Attack animation speed', 'float', ('fp', 'atk_speed'), 3.0, min=0.0, max=3.0, step=0.1,
          help='Your attacks play this many times faster so the body keeps up with your arm (0 / 1 = off).'))
     a(_o('face', 'combat', 'Body faces', 'choice', ('fp', 'face'), 'attack',
          choices=['off', 'view', 'head', 'controller', 'attack']))
@@ -176,9 +181,10 @@ def _build_schema():
          help='Blank = the one next to the launcher (bin\\bb-probe.exe, or out\\bb-probe.exe in a source tree).'))
     a(_o('runtime', 'advanced', 'OpenXR runtime', 'runtime', ('launch', 'runtime'), '',
          help='Blank = the system\'s active runtime. A choice only affects this game (XR_RUNTIME_JSON).'))
-    a(_o('fp_log', 'advanced', 'First-person log', 'bool', ('env', 'BB_VR_FP_LOG'), True, advanced=True))
-    a(_o('dash_log', 'advanced', 'Dash log', 'bool', ('env', 'BB_VR_DASH_LOG'), True, advanced=True))
-    a(_o('stereo_log', 'advanced', 'Stereo log', 'bool', ('env', 'BB_VR_STEREO_LOG'), True, advanced=True))
+    a(_o('fp_log', 'advanced', 'First-person log', 'bool', ('env', 'BB_VR_FP_LOG'), False, advanced=True))
+    a(_o('dash_log', 'advanced', 'Dash log', 'bool', ('env', 'BB_VR_DASH_LOG'), False, advanced=True))
+    a(_o('stereo_log', 'advanced', 'Stereo log', 'bool', ('env', 'BB_VR_STEREO_LOG'), False, advanced=True))
+    a(_o('stamina_log', 'advanced', 'Stamina log', 'bool', ('env', 'BB_VR_STAMINA_LOG'), False, advanced=True))
     a(_o('stamina_trace', 'advanced', 'Stamina trace', 'bool', ('env', 'BB_VR_STAMINA_TRACE'), False, advanced=True))
     a(_o('ui_probe', 'advanced', 'UI probe', 'bool', ('env', 'BB_VR_UI_PROBE'), False, advanced=True))
     a(_o('extra_env', 'advanced', 'Extra environment (KEY=VALUE per line, BB_ names only)', 'multiline',
@@ -212,7 +218,7 @@ PROFILES = {
 }
 PROFILE_ORDER = ['Default', 'Comfort', 'Performance', 'Quality (DLSS)', 'Custom']
 PROFILE_NOTES = {
-    'Default': 'Balanced defaults: FSR 1 upscaling + FXAA.',
+    'Default': 'Balanced defaults: DLSS (quality, preset K) on an NVIDIA RTX GPU, otherwise FSR 1 upscaling; FXAA.',
     'Comfort': 'Snap turning, locked camera animation with lunge easing.',
     'Performance': 'FSR 1 at 1.5x the frame instead of 2x, lower model detail.',
     'Quality (DLSS)': 'DLSS Super Resolution, quality mode, preset K. Falls back to FSR 1 if DLSS is not available.',
@@ -224,8 +230,18 @@ def base_values():
     return {o['id']: o['default'] for o in SCHEMA}
 
 
-def effective_values(settings):
+def auto_defaults(caps=None):
+    """Defaults that depend on the hardware: DLSS (quality, preset K, sharpen 0.2: the 'Quality (DLSS)' profile)
+    when the DLSS check passes (NVIDIA RTX GPU, DLSS-capable exe, both DLLs present), else the schema's FSR 1.
+    A profile or the saved Custom values are applied over it, so a choice is never overridden."""
+    if ((caps or {}).get('dlss') or {}).get('ok'):
+        return dict(PROFILES['Quality (DLSS)'])
+    return {}
+
+
+def effective_values(settings, caps=None):
     values = base_values()
+    values.update(auto_defaults(caps))
     name = settings.get('profile', 'Default')
     if name == 'Custom':
         values.update({k: v for k, v in settings.get('custom', {}).items() if k in BY_ID})
@@ -275,6 +291,8 @@ def to_text(opt, value):
     """The file / environment spelling of a value."""
     if value is None:
         return None
+    if opt['id'] == 'hit':  # the runtime key is a flag: big = 1, original = 0 (no shape is touched)
+        return '0' if value == 'original' else '1'
     if opt['kind'] == 'bool':
         return '1' if value else '0'
     if opt['kind'] in ('int', 'float'):
@@ -319,7 +337,7 @@ def save_settings(path, settings):
     os.replace(tmp, path)
 
 
-def apply_edit(settings, values_from_page, profile=None):
+def apply_edit(settings, values_from_page, profile=None, caps=None):
     """The page sent the full value set of what it shows. Same as the profile: keep the profile; any
     difference: the profile becomes Custom holding the values. Returns the new settings."""
     s = copy.deepcopy(settings)
@@ -331,7 +349,7 @@ def apply_edit(settings, values_from_page, profile=None):
     for oid, v in values_from_page.items():
         if oid in BY_ID:
             page[oid] = coerce(BY_ID[oid], v)
-    reference = effective_values(s)
+    reference = effective_values(s, caps)
     changed = {k: v for k, v in page.items() if reference.get(k) != v}
     if s['profile'] == 'Custom':
         merged = reference
@@ -615,7 +633,7 @@ def build_launch(values, paths, caps=None, public=None):
     e('BB_VR_STEREO_CONTROL', str(paths['stereo']))
     e('BB_VR_STEREO_LOG', _flag(v['stereo_log']))
     e('BB_VR_STAMINA', v['stamina'] or 'defer')
-    e('BB_VR_STAMINA_LOG', '1')
+    e('BB_VR_STAMINA_LOG', _flag(v.get('stamina_log')))
     e('BB_VR_STAMINA_TRACE', _flag(v['stamina_trace']))
     e('BB_VR_ARMS', _flag(v['arms']))
     e('BB_VR_UI', _flag(v['ui']))
@@ -825,10 +843,38 @@ def apply_files(plan, paths):
     return changed
 
 
-def make_paths(port, game_dir):
-    out = Path(port) / 'out'
-    return {'port': Path(port), 'out': out, 'fp': out / 'fp.txt', 'stereo': out / 'stereo.txt', 'iq': out / 'iq.txt',
-            'assets': out / 'vr_assets', 'game_dir': game_dir, 'settings': Path(port) / 'user' / 'bbvr_settings.json'}
+INSTALLED_FLAG = 'installed.flag'  # written by the Setup.exe next to BloodborneVR.exe; absent in the portable zip
+
+
+def data_root(port, env=None):
+    """Where the player's own files live (out/, user/ = saves + settings + crash reports + shader caches, logs/,
+    bbvr_config.json). Portable zip and source tree: the port folder itself. Installed build (Setup.exe,
+    installed.flag present): %LOCALAPPDATA%/BloodborneVR, so an uninstall / upgrade never touches them.
+    BBVR_DATA_DIR overrides both."""
+    env = os.environ if env is None else env
+    if env.get('BBVR_DATA_DIR'):
+        return Path(env['BBVR_DATA_DIR'])
+    if (Path(port) / INSTALLED_FLAG).is_file():
+        base = env.get('LOCALAPPDATA') or str(Path.home() / 'AppData' / 'Local')
+        return Path(base) / 'BloodborneVR'
+    return Path(port)
+
+
+def release_defaults(port):
+    """defaults/release.json of the package (crash server, update-check address; written by make_release.py)."""
+    try:
+        data = json.loads((Path(port) / 'defaults' / 'release.json').read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def make_paths(port, game_dir, data=None):
+    data = Path(data) if data else Path(port)
+    out = data / 'out'
+    return {'port': Path(port), 'data': data, 'out': out, 'fp': out / 'fp.txt', 'stereo': out / 'stereo.txt',
+            'iq': out / 'iq.txt', 'assets': out / 'vr_assets', 'game_dir': game_dir,
+            'settings': data / 'user' / 'bbvr_settings.json'}
 
 
 # ---- page data ----------------------------------------------------------------------------------
@@ -846,7 +892,7 @@ def page_state(settings, caps, public=None):
         d['target'] = o['target'][0]
         d['live'] = is_live(o)
         opts.append(d)
-    values = {k: v for k, v in effective_values(settings).items() if not (public and BY_ID[k].get('online'))}
+    values = {k: v for k, v in effective_values(settings, caps).items() if not (public and BY_ID[k].get('online'))}
     runtimes = caps['runtimes']
     return {
         'public': public, 'tabs': [{'id': t, 'label': l} for t, l in TABS], 'options': opts, 'values': values,

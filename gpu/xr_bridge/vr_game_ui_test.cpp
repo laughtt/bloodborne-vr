@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "vr_game_ui.h"
+#include "vr_mirror_ui.h"
 #include "vr_ui_filter.h"
 
 using namespace m3;
@@ -204,6 +205,9 @@ struct Rig {
     vrui::FrameInput in;
     std::vector<vrui::Haptic> haptics;
     std::string log;
+    std::string all_log;   // every frame's log
+    BbXrGameState state{}; // fed again every frame when `feed` (long scripts outlive the 1 s staleness)
+    bool feed = false;
 
     Rig() {
         in.head = {true, {0.0f, 1.6f, 0.0f}, {0, 0, 0, 1}};
@@ -222,7 +226,11 @@ struct Rig {
         in.pad = pad;
         haptics.clear();
         log.clear();
+        if (feed) {
+            ui.SetGameState(state, t);
+        }
         ui.Update(in, haptics, log);
+        all_log += log;
         ui.Build();
     }
     float StrongestHaptic(int hand) const {
@@ -324,7 +332,7 @@ void TestGameUi(const fs::path& assets) {
     // still available in the layout file, though no longer the default (the dashboard is).
     {
         std::ofstream old(dir / "ui_layouts.json", std::ios::binary);
-        old << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"quick_ring\", "
+        old << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false, \"active\": [\"quick_ring\", "
                "\"inventory\", \"weapon_wheel\", \"wrist_counters\"]}\n}\n";
     }
     Rig r;
@@ -365,7 +373,7 @@ void TestGameUi(const fs::path& assets) {
     CHECK(r.ui.Readout().result == sb::SwingReadout::Result::Hit);
     CHECK(r.ui.Readout().label_paid == 20.0f);
     CHECK(r.ui.Readout().pending == 0.0f);
-    CHECK(std::fabs(r.StrongestHaptic(1) - 0.6f) < 1e-4f);
+    CHECK(std::fabs(r.StrongestHaptic(1) - 0.775f) < 1e-4f); // the weapon collision pulse: 20 of 40 stamina
     CHECK(sb::SwingLabelText(r.ui.Readout()) == "LIGHT  HIT  -20");
     // A heavy one that misses: free.
     r.in.ms_since_swing = 5.0;
@@ -571,6 +579,25 @@ void TestDashboard(const fs::path& assets) {
     const sb::UiGameLayout& game = r.ui.Menus().Layout().game;
     CHECK(game.version == 2);
     CHECK(game.active.size() == 2 && game.active[0] == "dashboard");
+    // The upgrade brought the held-items defaults in; these tests are about the dashboard's own
+    // actions (a click on a quick slot is the game's use), so turn them off in the file (reloaded).
+    CHECK(game.held_items && game.collision_haptics.on);
+    {
+        bool ok = false;
+        std::string text = sb::ReadText(dir / "ui_layouts.json", &ok);
+        const size_t at = text.find("\"held_items\": true");
+        CHECK(ok && at != std::string::npos);
+        if (at != std::string::npos) {
+            text.replace(at, 18, "\"held_items\": false");
+            std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
+            f << text;
+        }
+        for (int i = 0; i < 120; ++i) {
+            r.ui.SetGameState(GameState(60), r.t);
+            r.Frame(Pad());
+        }
+        CHECK(!r.ui.Menus().Layout().game.held_items);
+    }
     int recentered = 0;
     static int* recenter_count = nullptr;
     recenter_count = &recentered;
@@ -794,6 +821,10 @@ void TestDashboardSticks(const fs::path& assets) {
     for (const char* f : {"icons.json", "icons.png", "font.json", "font.png"}) {
         fs::copy_file(assets / "ui" / f, dir / "ui" / f, ec);
     }
+    {
+        std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false}\n}\n";
+    }
     Rig r;
     std::string log;
     CHECK(r.ui.Load(dir, nullptr, log));
@@ -906,7 +937,7 @@ void TestDashboardSticks(const fs::path& assets) {
     // block_move off: the sticks reach the game with the dashboard open (stick_nav off too).
     {
         std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
-        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"dashboard\"],\n"
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false, \"active\": [\"dashboard\"],\n"
              "    \"menus\": [{\"name\": \"dashboard\", \"type\": \"dashboard\", \"open\": \"l3\","
              " \"stick_nav\": false, \"block_move\": false}]}\n}\n";
     }
@@ -1040,7 +1071,7 @@ void TestQuickWheel(const fs::path& assets) {
     }
     {
         std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
-        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"quick_wheel\"]}\n}\n";
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false, \"active\": [\"quick_wheel\"]}\n}\n";
     }
     Rig r;
     std::string log;
@@ -1192,7 +1223,7 @@ void TestMashThenWheel(const fs::path& assets, const char* custom_active = nullp
     }
     if (custom_active) { // a layout with chords (grips are modifiers of some menu)
         std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
-        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": " << custom_active << "}\n}\n";
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false, \"active\": " << custom_active << "}\n}\n";
     } else {
         fs::copy_file(live, dir / "ui_layouts.json", ec);
     }
@@ -1285,7 +1316,7 @@ void TestGripDoesNotBlock(const fs::path& assets) {
     }
     {
         std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
-        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"quick_wheel\", \"quick_ring\", "
+        f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"held_items\": false, \"active\": [\"quick_wheel\", \"quick_ring\", "
              "\"weapon_wheel\"]}\n}\n";
     }
     Rig r;
@@ -1440,14 +1471,765 @@ void TestGameMenuNav() {
     CHECK(out.buttons == BBXR_BTN_CIRCLE && out.lx == 255);
 }
 
+// Before the world (title, character creation): PRE_WORLD turns the sticks into the d-pad without
+// the world UI; a player in the world takes it away again.
+void TestPreWorldNav() {
+    Rig r;
+    r.state.size = sizeof(r.state);
+    r.state.flags = BBXR_GAME_PRE_WORLD;
+    r.feed = true;
+    r.Frame(Pad());
+    CHECK(!r.ui.Active()); // the world UI stays off
+    // A (circle on the pad) is cross; the stick is centered for the game.
+    BbXrInput g = Pad(BBXR_BTN_CIRCLE, 255, 128);
+    r.ui.Filter().Apply(r.t, g);
+    CHECK((g.buttons & BBXR_BTN_CROSS) && g.lx == 128);
+    // Left on the stick repeats like d-pad left (character-creation sliders): 0.35 s, then 0.14 s.
+    double t = r.t + 5.0;
+    BbXrInput l = Pad(0, 0, 128);
+    r.ui.Filter().Apply(t, l);
+    CHECK(l.buttons == BBXR_BTN_LEFT);
+    l = Pad(0, 0, 128);
+    r.ui.Filter().Apply(t + 0.1, l);
+    CHECK(l.buttons == 0);
+    l = Pad(0, 0, 128);
+    r.ui.Filter().Apply(t + 0.4, l);
+    CHECK(l.buttons == BBXR_BTN_LEFT);
+    // The player arrives: the world mapping is back.
+    r.state.flags = BBXR_GAME_IN_WORLD;
+    r.Frame(Pad());
+    CHECK(r.ui.Active());
+    BbXrInput w = Pad(BBXR_BTN_CIRCLE, 255, 128);
+    r.ui.Filter().Apply(r.t, w);
+    CHECK(w.buttons == BBXR_BTN_CIRCLE && w.lx == 255);
+    // A stale pre-world state does nothing.
+    r.state.flags = BBXR_GAME_PRE_WORLD;
+    r.ui.SetGameState(r.state, r.t);
+    r.feed = false;
+    for (int i = 0; i < 300; ++i) r.Frame(Pad());
+    BbXrInput st = Pad(BBXR_BTN_CIRCLE, 255, 128);
+    r.ui.Filter().Apply(r.t, st);
+    CHECK(st.buttons == BBXR_BTN_CIRCLE && st.lx == 255);
+}
+
+// ---- Physical items (vr_held_items.h, docs/vr/findings/39-physical-items-plan.md) ----
+
+/// Parses BBXR_THROW_BULLET_IDS the way the host does.
+bool InThrowList(int bullet) {
+    return vrui::held::IdInList(BBXR_THROW_BULLET_IDS, bullet);
+}
+
+uint32_t Goods(int row) {
+    return BBXR_ITEM_GOODS | uint32_t(row);
+}
+
+void TestHeldClassify() {
+    using namespace vrui::held;
+    // The id list is the one the host defaults to (tests/test_vr_gun.c checks the same text).
+    CHECK(std::strcmp(BBXR_THROW_BULLET_IDS, "100,105,120,121,150,170,180,410,460,470") == 0);
+    // Heals, cures and body buffs go to the mouth, in the right hand.
+    for (const int g : {1000, 703, 706, 1100, 1101, 1110, 1120, 2030, 1500, 2060}) {
+        const ItemInfo i = Classify(Goods(g));
+        CHECK(i.kind == Kind::Mouth && HandFor(i) == 1);
+    }
+    // Weapon buffs: the paper touches the right weapon from the left hand; the ash the left weapon (gun).
+    for (const int g : {1300, 1320, 1310}) {
+        const ItemInfo i = Classify(Goods(g));
+        CHECK(i.kind == Kind::Blade && i.target_side == 1 && HandFor(i) == 0);
+    }
+    CHECK(Classify(Goods(1330)).kind == Kind::Blade && Classify(Goods(1330)).target_side == 0 &&
+          HandFor(Classify(Goods(1330))) == 1);
+    // Throwables: right hand; only the flying ones are aimed from the hand.
+    for (const int g : {1200, 1201, 1210, 1220, 1230, 1240, 1270, 2070, 2120, 2130}) {
+        const ItemInfo i = Classify(Goods(g));
+        CHECK(i.kind == Kind::Throw && i.aimed && HandFor(i) == 1 && InThrowList(i.bullet));
+    }
+    // Not aimed: the rope molotovs (a back throw at the player), Pungent Blood, coins, gloves.
+    for (const int g : {1250, 1251, 1260, 1410, 2080}) {
+        const ItemInfo i = Classify(Goods(g));
+        CHECK(i.kind == Kind::Throw && !i.aimed);
+    }
+    // The self-targeted cures' bullets are never in the list.
+    for (const int b : {200, 230, 320, 110, 114}) {
+        CHECK(!InThrowList(b));
+    }
+    // Everything else is used at once, as before; weapons are not goods.
+    for (const int g : {200, 205, 225, 900, 2040}) {
+        CHECK(Classify(Goods(g)).kind == Kind::None);
+    }
+    CHECK(Classify(7000000u).kind == Kind::None);
+    CHECK(Classify(BBXR_ITEM_NONE).kind == Kind::None);
+    // A drink grabbed from a body slot stays in the hand that grabbed it; a throw never does.
+    CHECK(HandFor(Classify(Goods(1000)), 0) == 0 && HandFor(Classify(Goods(1200)), 0) == 1);
+}
+
+vrui::held::Frame HeldFrame(double t) {
+    vrui::held::Frame f;
+    f.time = t;
+    f.head_valid = true;
+    f.head_pos = {0.0f, 1.6f, 0.0f};
+    f.head_rot = {0, 0, 0, 1};
+    for (int h = 0; h < 2; ++h) {
+        f.hand_valid[h] = true;
+        f.grip_rot[h] = {0, 0, 0, 1};
+        f.grip_pos[h] = {h ? 0.2f : -0.2f, 1.2f, -0.35f};
+    }
+    return f;
+}
+
+void TestHeldItemLogic() {
+    using namespace vrui::held;
+    const sb::UiHeldItems c; // the defaults
+    const m3::Vec3 hold = c.hold;
+    // -- geometry
+    CHECK(std::fabs(DistToSegment({0, 1, 0}, {-1, 0, 0}, {1, 0, 0}) - 1.0f) < 1e-5f);
+    CHECK(std::fabs(DistToSegment({3, 0, 0}, {-1, 0, 0}, {1, 0, 0}) - 2.0f) < 1e-5f);
+    CHECK(std::fabs(DistToSegment({1, 1, 1}, {0, 0, 0}, {0, 0, 0}) - std::sqrt(3.0f)) < 1e-5f);
+    // The mouth: 12 cm around head + (0, -0.10, -0.07), at least 3 cm below the head.
+    const m3::Vec3 head{0, 1.6f, 0};
+    const m3::Quat id{0, 0, 0, 1};
+    float d = 0.0f;
+    CHECK(NearMouth({0, 1.5f, -0.07f}, head, id, c, &d) && d < 1e-4f);
+    CHECK(NearMouth({0.08f, 1.5f, -0.07f}, head, id, c));
+    CHECK(!NearMouth({0.14f, 1.5f, -0.07f}, head, id, c));  // 14 cm to the side
+    CHECK(!NearMouth({0, 1.35f, -0.25f}, head, id, c));      // at the chest
+    sb::UiHeldItems high = c;
+    high.mouth = {0.0f, -0.01f, -0.07f}; // a mouth above the eyes' limit: never "below"
+    CHECK(!NearMouth(head + m3::Vec3{0, -0.01f, -0.07f}, head, id, high));
+    // turned head: the mouth turns with it (head yawed 90 deg left: its -Z points to -X)
+    const m3::Quat left = m3::AxisAngle({0, 1, 0}, 90.0f * m3::kDeg);
+    CHECK(NearMouth(head + m3::Rotate(left, {0, -0.10f, -0.07f}), head, left, c));
+    CHECK(!NearMouth({0, 1.5f, -0.25f}, head, left, c));
+    // The blade: from blade_start of the length to the tip, 10 cm.
+    const m3::Vec3 base{0, 1.2f, 0}, tip{0, 1.2f, -1.0f};
+    CHECK(TouchesBlade({0.05f, 1.2f, -0.6f}, base, tip, c));
+    CHECK(!TouchesBlade({0.15f, 1.2f, -0.6f}, base, tip, c));
+    CHECK(!TouchesBlade({0.0f, 1.2f, 0.0f}, base, tip, c));    // the handle (first 25 %) is not the blade
+    CHECK(!TouchesBlade({0.0f, 1.2f, -0.1f}, base, tip, c));
+    CHECK(TouchesBlade({0.0f, 1.2f, -0.3f}, base, tip, c));
+    CHECK(TouchesBlade({0.1f, 1.3f, 0.0f}, base, base, c, nullptr, true));   // approx: 18 cm around the bone
+    CHECK(!TouchesBlade({0.3f, 1.3f, 0.0f}, base, base, c, nullptr, true));
+
+    // -- velocity: 4 m/s along +X for 100 ms
+    VelocityTracker v;
+    for (int i = 0; i <= 9; ++i) {
+        v.Push(i / 90.0, {0.04f * float(i), 1.2f, 0});
+    }
+    const m3::Vec3 est = v.Estimate(0.08f, 0.5f);
+    CHECK(std::fabs(est.x - 3.6f) < 0.05f && std::fabs(est.y) < 1e-3f);
+    VelocityTracker still;
+    for (int i = 0; i <= 9; ++i) {
+        still.Push(i / 90.0, {0, 1.2f, 0});
+    }
+    CHECK(m3::Length(still.Estimate(0.08f, 0.5f)) < 1e-4f);
+    CHECK(m3::Length(VelocityTracker{}.Estimate(0.08f, 0.5f)) == 0.0f);
+
+    // -- Mouth: pick, squeeze, bring to the mouth, dwell 0.3 s -> use
+    {
+        HeldItem h;
+        CHECK(!h.Pick(Goods(200), 0, 0.0));         // a bell: not physical
+        CHECK(!h.Active());
+        CHECK(h.Pick(Goods(1000), 0, 0.0) && h.GetState() == HeldItem::State::Pending && h.Hand() == 1);
+        CHECK(!h.Pick(Goods(1100), 1, 0.0));         // one item at a time
+        Frame f = HeldFrame(0.1);
+        CHECK(h.Step(f, c).kind == Result::None);    // grip not closed yet
+        f.squeeze[1] = 0.9f;
+        f.time = 0.2;
+        Result r = h.Step(f, c);
+        CHECK(h.GetState() == HeldItem::State::Held && r.pulses.size() == 1 && r.pulses[0].hand == 1);
+        // the hand far from the mouth: no progress
+        f.time = 0.3;
+        CHECK(h.Step(f, c).kind == Result::None && h.Progress() == 0.0f);
+        // at the mouth: dwell
+        f.grip_pos[1] = m3::Vec3{0.0f, 1.5f, -0.07f} - hold;
+        f.time = 0.4;
+        r = h.Step(f, c);
+        CHECK(r.kind == Result::None && h.InContact() && !r.pulses.empty());
+        f.time = 0.55;
+        CHECK(h.Step(f, c).kind == Result::None && h.Progress() > 0.4f && h.Progress() < 0.6f);
+        f.time = 0.45; // (not monotone input is not a concern; keep going forward)
+        f.time = 0.71;
+        r = h.Step(f, c);
+        CHECK(r.kind == Result::Use && !r.thrown && r.item.goods == 1000 && r.hand == 1 && r.why == "mouth");
+        CHECK(!h.Active());
+        CHECK(h.BlockMask(0.72, c) != 0 && h.BlockMask(0.71 + 0.9, c) == 0); // lockout 0.8 s
+    }
+    // A pass through the mouth zone shorter than the hold does not use it.
+    {
+        HeldItem h;
+        h.Pick(Goods(1000), 0, 0.0);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[1] = 0.9f;
+        h.Step(f, c);
+        for (int i = 0; i < 8; ++i) { // 0.2 s in the zone
+            f.time = 0.1 + i * 0.025;
+            f.grip_pos[1] = m3::Vec3{0.0f, 1.5f, -0.07f} - hold;
+            CHECK(h.Step(f, c).kind == Result::None);
+        }
+        f.grip_pos[1] = {0.2f, 1.2f, -0.35f}; // away: the dwell restarts
+        f.time = 0.4;
+        CHECK(h.Step(f, c).kind == Result::None && h.Progress() == 0.0f);
+        CHECK(h.Active());
+    }
+    // -- Cancel: the grip opened without a gesture; a menu opened; tracking lost; no grip in time
+    {
+        HeldItem h;
+        h.Pick(Goods(1000), 0, 0.0);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[1] = 0.9f;
+        h.Step(f, c);
+        f.squeeze[1] = 0.1f;
+        f.time = 0.1;
+        Result r = h.Step(f, c);
+        CHECK(r.kind == Result::Cancel && r.why == "released" && !h.Active());
+        CHECK(r.pulses.size() == 1);
+        h.Pick(Goods(1000), 0, 1.0);
+        f.squeeze[1] = 0.9f;
+        f.time = 1.0;
+        h.Step(f, c);
+        f.blocked = true;
+        f.time = 1.1;
+        CHECK(h.Step(f, c).kind == Result::Cancel && !h.Active());
+        h.Pick(Goods(1000), 0, 2.0);
+        f = HeldFrame(2.1);
+        f.hand_valid[1] = false;
+        CHECK(h.Step(f, c).kind == Result::Cancel);
+        h.Pick(Goods(1000), 0, 3.0);
+        f = HeldFrame(3.5);
+        CHECK(h.Step(f, c).kind == Result::None && h.Active());         // still within the grace
+        f.time = 8.2;
+        r = h.Step(f, c);
+        CHECK(r.kind == Result::Cancel && !h.Active() && r.pulses.empty()); // 5 s without a grip
+        h.Pick(Goods(1000), 0, 9.0);
+        CHECK(h.Cancel(9.1, c, "wheel").kind == Result::Cancel && !h.Active());
+    }
+    // -- Blade: the paper in the left hand touches the right weapon's blade
+    {
+        HeldItem h;
+        CHECK(h.Pick(Goods(1300), 2, 0.0) && h.Hand() == 0);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[0] = 0.9f;
+        f.blade[1] = {true, false, {0.2f, 1.2f, -0.35f}, {0.2f, 1.2f, -1.35f}};
+        h.Step(f, c);
+        // the right controller (the weapon's grip) is not touched: the item is at the left grip
+        for (int i = 1; i <= 5; ++i) {
+            f.time = i * 0.02;
+            CHECK(h.Step(f, c).kind == Result::None);
+        }
+        CHECK(!h.InContact());
+        f.grip_pos[0] = m3::Vec3{0.22f, 1.25f, -0.9f} - hold; // 5 cm from the blade
+        f.time = 0.2;
+        CHECK(h.Step(f, c).kind == Result::None && h.InContact());
+        f.time = 0.25;
+        CHECK(h.Step(f, c).kind == Result::None);
+        f.time = 0.33; // 0.13 s of touch >= 0.12 s
+        Result r = h.Step(f, c);
+        CHECK(r.kind == Result::Use && r.why == "blade" && r.hand == 0 && r.item.goods == 1300);
+        CHECK((h.BlockMask(0.4, c) & BBXR_BTN_L1) != 0); // the left grip's L1 stays off while it is held
+    }
+    // Bone Marrow Ash: the right hand dusts the left weapon
+    {
+        HeldItem h;
+        CHECK(h.Pick(Goods(1330), 1, 0.0) && h.Hand() == 1);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[1] = 0.9f;
+        f.blade[0] = {true, true, {-0.2f, 1.2f, -0.35f}, {-0.2f, 1.2f, -0.35f}}; // no hitbox data: the bone
+        f.grip_pos[1] = {-0.25f, 1.2f, -0.3f};
+        h.Step(f, c);
+        f.time = 0.05;
+        CHECK(h.Step(f, c).kind == Result::None && h.InContact());
+        f.time = 0.2;
+        CHECK(h.Step(f, c).kind == Result::Use);
+        CHECK((h.BlockMask(0.3, c) & BBXR_BTN_L1) == 0);
+    }
+    // No weapon pose: the blade never touches (nothing happens, the item stays)
+    {
+        HeldItem h;
+        h.Pick(Goods(1300), 2, 0.0);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[0] = 0.9f;
+        for (int i = 0; i < 10; ++i) {
+            f.time = i * 0.05;
+            CHECK(h.Step(f, c).kind == Result::None);
+        }
+        CHECK(h.Active() && !h.InContact());
+    }
+    // -- Throw: letting go fast throws along the release; slow puts it back
+    {
+        HeldItem h;
+        CHECK(h.Pick(Goods(1200), 1, 0.0) && h.Info().aimed);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[1] = 0.9f;
+        h.Step(f, c);
+        for (int i = 1; i <= 8; ++i) { // 3.6 m/s along +X
+            f.time = i / 90.0;
+            f.grip_pos[1] = m3::Vec3{0.2f + 0.04f * float(i), 1.2f, -0.35f};
+            CHECK(h.Step(f, c).kind == Result::None);
+        }
+        f.time = 9 / 90.0;
+        f.grip_pos[1] = {0.2f + 0.04f * 9.0f, 1.2f, -0.35f};
+        f.squeeze[1] = 0.0f;
+        const Result r = h.Step(f, c);
+        CHECK(r.kind == Result::Use && r.thrown && r.why == "thrown");
+        CHECK(r.throw_speed > 3.0f && r.throw_dir.x > 0.99f);
+        CHECK(std::fabs(m3::Length(r.throw_dir) - 1.0f) < 1e-4f);
+        CHECK(std::fabs(r.throw_origin.x - (0.2f + 0.36f)) < 1e-4f && std::fabs(r.throw_origin.z - (-0.35f + hold.z)) < 1e-4f);
+        CHECK(!h.Active() && h.BlockMask(0.2, c) != 0);
+    }
+    {
+        HeldItem h;
+        h.Pick(Goods(1230), 3, 0.0);
+        Frame f = HeldFrame(0.0);
+        f.squeeze[1] = 0.9f;
+        h.Step(f, c);
+        for (int i = 1; i <= 8; ++i) { // 0.9 m/s
+            f.time = i / 90.0;
+            f.grip_pos[1] = m3::Vec3{0.2f + 0.01f * float(i), 1.2f, -0.35f};
+            h.Step(f, c);
+        }
+        f.squeeze[1] = 0.0f;
+        f.time = 9 / 90.0;
+        const Result r = h.Step(f, c);
+        CHECK(r.kind == Result::Cancel && r.why.find("slowly") != std::string::npos);
+    }
+    // A throwable that is not aimed (rope molotov) still throws: the game's own direction
+    {
+        HeldItem h;
+        h.Pick(Goods(1250), 0, 0.0);
+        CHECK(!h.Info().aimed && h.Info().kind == Kind::Throw);
+    }
+    // -- the buttons hidden from the game while an item is in a hand
+    {
+        HeldItem h;
+        CHECK(h.BlockMask(0.0, c) == 0);
+        h.Pick(Goods(1000), 0, 0.0);
+        const uint32_t m = h.BlockMask(0.0, c);
+        CHECK((m & BBXR_BTN_R1) && (m & BBXR_BTN_R2) && (m & BBXR_BTN_RIGHT) && !(m & BBXR_BTN_L1));
+    }
+
+    // -- collision haptics: the mapping
+    {
+        sb::UiCollisionHaptics ch;
+        const Pulse light = CollisionPulse(ch, 1, 0, 0);    // a hit, cost unknown: the weak pulse
+        CHECK(light.hand == 1 && std::fabs(light.amplitude - 0.55f) < 1e-5f && std::fabs(light.seconds - 0.07f) < 1e-5f);
+        const Pulse mid = CollisionPulse(ch, 1, 0, 20);     // 20 of 40: half way
+        CHECK(std::fabs(mid.amplitude - 0.775f) < 1e-4f && std::fabs(mid.seconds - 0.115f) < 1e-4f);
+        const Pulse strong = CollisionPulse(ch, 1, 0, 80);  // over the reference: the strong one
+        CHECK(std::fabs(strong.amplitude - 1.0f) < 1e-5f && std::fabs(strong.seconds - 0.16f) < 1e-5f);
+        const Pulse wall = CollisionPulse(ch, 1, 1, 0);
+        CHECK(std::fabs(wall.amplitude - 0.9f) < 1e-5f && std::fabs(wall.seconds - 0.18f) < 1e-5f);
+        const Pulse obj = CollisionPulse(ch, 1, 2, 0);
+        CHECK(std::fabs(obj.amplitude - 0.7f) < 1e-5f && std::fabs(obj.seconds - 0.12f) < 1e-5f);
+        CHECK(CollisionPulse(ch, 1, 1, 40).amplitude >= wall.amplitude); // a stronger bounce is not weaker
+        CHECK(CollisionPulse(ch, 1, 1, 40).seconds >= wall.seconds);     // (even when hit_strong is shorter)
+        ch.scale_by_strength = false;
+        CHECK(std::fabs(CollisionPulse(ch, 1, 0, 80).amplitude - 0.55f) < 1e-5f);
+        ch.hit = {3.0f, 5.0f}; // out of range values are clamped
+        CHECK(CollisionPulse(ch, 1, 0, 0).amplitude <= 1.0f && CollisionPulse(ch, 1, 0, 0).seconds <= 1.0f);
+    }
+}
+
+/// Opens the quick wheel (R3 held) and picks quick slot `slot` with the right trigger.
+void PickOnWheel(Rig& r, int slot) {
+    r.in.grip[1].position = r.in.aim[1].position = {0.2f, 1.2f, -0.35f}; // where the wheel opens
+    r.Frame(Pad());
+    const m3::Vec3 tip0 = r.in.aim[1].position + m3::Vec3{0.0f, 0.0f, -0.06f};
+    for (int i = 0; i < 50; ++i) {
+        r.ui.SetGameState(r.state, r.t);
+        r.Frame(Pad(BBXR_BTN_R3));
+    }
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().IsOpen("quick_wheel"));
+    const m3::Vec3 facing = m3::Normalize(r.in.head.position - tip0, {0, 0, 1});
+    const m3::Vec3 px = m3::Normalize(m3::Cross({0, 1, 0}, facing), {1, 0, 0});
+    const m3::Vec3 py = m3::Cross(facing, px);
+    const float a = (90.0f - float(slot) * 360.0f / 8.0f) * kDeg; // 5 quick + 3 weapons
+    const m3::Vec3 g = m3::Vec3{0.2f, 1.2f, -0.35f} + px * (0.10f * std::cos(a)) + py * (0.10f * std::sin(a));
+    r.in.grip[1].position = r.in.aim[1].position = g;
+    r.Frame(Pad());
+    r.Frame(Pad());
+    CHECK(r.ui.Menus().Hovered("quick_wheel") == slot);
+    r.in.trigger[1] = 0.9f;
+    r.Frame(Pad());
+    r.in.trigger[1] = 0.0f;
+    r.Frame(Pad());
+    CHECK(!r.ui.Menus().IsOpen("quick_wheel"));
+    r.in.grip[1].position = r.in.aim[1].position = {0.2f, 1.2f, -0.35f};
+}
+
+fs::path HeldAssets(const fs::path& assets, const char* name, const std::string& game_extra) {
+    const fs::path dir = fs::temp_directory_path() / name;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "ui", ec);
+    for (const char* f : {"icons.json", "icons.png", "font.json", "font.png"}) {
+        fs::copy_file(assets / "ui" / f, dir / "ui" / f, ec);
+    }
+    std::ofstream f(dir / "ui_layouts.json", std::ios::binary);
+    f << "{\n  \"version\": 1,\n  \"game\": {\"version\": 2, \"active\": [\"quick_wheel\"]" << game_extra << "}\n}\n";
+    return dir;
+}
+
+void TestHeldItemsInGame(const fs::path& assets) {
+    const fs::path dir = HeldAssets(assets, "bbport_game_ui_held_test", "");
+    Rig r;
+    std::string log;
+    CHECK(r.ui.Load(dir, nullptr, log));
+    CHECK(r.ui.Menus().Layout().game.held_items);
+    CHECK(r.ui.Menus().Layout().game.collision_haptics.on);
+    r.feed = true;
+    r.state = GameState(80);
+    r.state.quick[2] = Goods(1300); // Fire Paper
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+    CHECK(r.ui.Active());
+    BbXrUiAction actions[8];
+
+    // -- A vial from the wheel is held, not used.
+    PickOnWheel(r, 0);
+    CHECK(r.ui.TakeActions(actions, 8) == 0);
+    CHECK(r.ui.HeldItemState().Active() && r.ui.HeldItemState().Info().goods == 1000 &&
+          r.ui.HeldItemState().Hand() == 1);
+    // Swings and the swap tap are hidden from the game while it is in the hand
+    BbXrInput raw = Pad(BBXR_BTN_R1 | BBXR_BTN_RIGHT | BBXR_BTN_CROSS);
+    raw.r2 = 255;
+    r.ui.Filter().Apply(r.t, raw);
+    CHECK(!(raw.buttons & (BBXR_BTN_R1 | BBXR_BTN_RIGHT)) && (raw.buttons & BBXR_BTN_CROSS));
+    // a swing gesture does not label an attack either
+    r.in.ms_since_swing = 5.0;
+    r.in.pad.hand_speed[1] = 3.0f;
+    const int swings = r.ui.Readout().swing_no;
+    r.Frame(Pad(BBXR_BTN_R1));
+    CHECK(r.ui.Readout().swing_no == swings);
+    r.in.ms_since_swing = 1e9;
+    // the grip closes, the hand goes to the mouth: used after the dwell
+    r.in.squeeze[1] = 0.9f;
+    r.Frame(Pad());
+    CHECK(r.ui.HeldItemState().Gripped());
+    CHECK(r.StrongestHaptic(1) >= 0.29f);                    // the pick pulse
+    r.in.grip[1].position = r.in.aim[1].position = m3::Vec3{0.0f, 1.5f, -0.07f} - m3::Vec3{0.0f, 0.0f, -0.05f};
+    for (int i = 0; i < 12; ++i) {
+        r.Frame(Pad());
+    }
+    CHECK(r.ui.HeldItemState().Active());
+    for (int i = 0; i < 30 && r.ui.HeldItemState().Active(); ++i) {
+        r.Frame(Pad());
+    }
+    CHECK(!r.ui.HeldItemState().Active());
+    uint32_t n = r.ui.TakeActions(actions, 8);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_USE_QUICK && actions[0].a == 0 && actions[0].b == int32_t(Goods(1000)));
+    CHECK(actions[0].c == 0);
+    // the lock-out ends: swings and the swap tap are the game's again
+    for (int i = 0; i < 100; ++i) {
+        r.Frame(Pad());
+    }
+    raw = Pad(BBXR_BTN_R1 | BBXR_BTN_RIGHT);
+    r.ui.Filter().Apply(r.t, raw);
+    CHECK((raw.buttons & BBXR_BTN_R1) && (raw.buttons & BBXR_BTN_RIGHT));
+    r.in.squeeze[1] = 0.0f;
+    r.Frame(Pad());
+
+    // -- A molotov is thrown: origin and direction, then the use
+    r.ui.PushEvent({BBXR_EV_ACTION_DONE, int32_t(BBXR_UI_USE_QUICK), 1, 0}, r.t);
+    r.Frame(Pad());
+    PickOnWheel(r, 1);
+    CHECK(r.ui.TakeActions(actions, 8) == 0);
+    CHECK(r.ui.HeldItemState().Info().kind == vrui::held::Kind::Throw && r.ui.HeldItemState().Info().bullet == 100);
+    r.in.squeeze[1] = 0.9f;
+    r.Frame(Pad());
+    CHECK(r.ui.HeldItemState().Gripped());
+    for (int i = 1; i <= 8; ++i) { // 3.6 m/s along +X, then forward
+        r.in.grip[1].position = r.in.aim[1].position = m3::Vec3{0.2f + 0.04f * float(i), 1.2f, -0.35f};
+        r.Frame(Pad());
+    }
+    r.in.squeeze[1] = 0.0f;
+    r.in.grip[1].position = r.in.aim[1].position = m3::Vec3{0.2f + 0.04f * 9.0f, 1.2f, -0.35f};
+    r.Frame(Pad());
+    CHECK(!r.ui.HeldItemState().Active());
+    n = r.ui.TakeActions(actions, 8);
+    CHECK(n == 3 && actions[0].kind == BBXR_UI_THROW_ORIGIN && actions[1].kind == BBXR_UI_THROW_DIR &&
+          actions[2].kind == BBXR_UI_USE_QUICK);
+    if (n == 3) {
+        // the head is level at (0, 1.6, 0) facing -Z: the head frame is the world minus the head
+        CHECK(std::abs(actions[0].a - 560) <= 2 && std::abs(actions[0].b - int(1000 * (1.2f - 1.6f))) <= 2 &&
+              std::abs(actions[0].c - int(1000 * (-0.35f - 0.05f))) <= 2);
+        CHECK(actions[1].a > 9900 && std::abs(actions[1].b) < 200 && std::abs(actions[1].c) < 200);
+        CHECK(actions[2].a == 1 && actions[2].b == int32_t(Goods(1200)) && actions[2].c > 300);
+    }
+    CHECK(r.all_log.find("goods 1200 thrown (bullet 100, aimed)") != std::string::npos);
+    r.ui.PushEvent({BBXR_EV_ACTION_DONE, int32_t(BBXR_UI_USE_QUICK), 1, 0}, r.t);
+    r.Frame(Pad());
+
+    // -- An item with none left is not held (the old path: the action goes out and the game refuses)
+    {
+        BbXrGameState empty = r.state;
+        for (uint32_t i = 0; i < empty.item_count; ++i) {
+            if (empty.items[i].id == Goods(1230)) {
+                empty.items[i].count = 0;
+            }
+        }
+        const BbXrGameState keep = r.state;
+        r.state = empty;
+        r.Frame(Pad());
+        PickOnWheel(r, 3); // pebble, none left
+        CHECK(!r.ui.HeldItemState().Active());
+        r.state = keep;
+        r.Frame(Pad());
+        r.ui.TakeActions(actions, 8);
+    }
+
+    // -- A slow release puts it back: no action
+    PickOnWheel(r, 3); // pebble
+    r.in.squeeze[1] = 0.9f;
+    r.Frame(Pad());
+    r.Frame(Pad());
+    r.in.squeeze[1] = 0.0f;
+    r.Frame(Pad());
+    CHECK(!r.ui.HeldItemState().Active() && r.ui.TakeActions(actions, 8) == 0);
+    CHECK(r.all_log.find("put back: released too slowly") != std::string::npos);
+
+    // -- Opening the wheel again cancels an item in the hand
+    PickOnWheel(r, 0);
+    CHECK(r.ui.HeldItemState().Active());
+    r.in.squeeze[1] = 0.9f;
+    for (int i = 0; i < 60; ++i) { // R3 held 0.5 s opens the wheel
+        r.ui.SetGameState(r.state, r.t);
+        r.Frame(Pad(BBXR_BTN_R3));
+    }
+    CHECK(!r.ui.HeldItemState().Active());
+    CHECK(r.ui.TakeActions(actions, 8) == 0);
+    r.Frame(Pad());
+    r.Frame(Pad(BBXR_BTN_R3)); // a tap closes the wheel
+    for (int i = 0; i < 5; ++i) {
+        r.Frame(Pad());
+    }
+    CHECK(!r.ui.Menus().IsOpen("quick_wheel"));
+    r.in.squeeze[1] = 0.0f;
+    for (int i = 0; i < 100; ++i) {
+        r.Frame(Pad());
+    }
+
+    // -- A game menu open blocks and cancels
+    PickOnWheel(r, 0);
+    CHECK(r.ui.HeldItemState().Active());
+    r.state.flags |= BBXR_GAME_MENU_OPEN;
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+    CHECK(!r.ui.HeldItemState().Active());
+    r.state.flags &= ~BBXR_GAME_MENU_OPEN;
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+
+    // -- The paper: the left hand holds it, the right weapon's bone is the target (no hitbox data: the bone)
+    for (int i = 0; i < 100; ++i) {
+        r.Frame(Pad());
+    }
+    PickOnWheel(r, 2);
+    CHECK(r.ui.HeldItemState().Active() && r.ui.HeldItemState().Info().kind == vrui::held::Kind::Blade &&
+          r.ui.HeldItemState().Hand() == 0);
+    r.state.debug.flags = BBXR_DEBUG_POSE;
+    r.state.debug.weapon_valid = 2u; // the right weapon
+    const float weapon[12] = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0.2f, 1.2f, -0.35f}; // at the right hand
+    std::memcpy(r.state.debug.weapon[1], weapon, sizeof(weapon));
+    r.ui.SetGameState(r.state, r.t);
+    r.in.squeeze[0] = 0.9f;
+    r.Frame(Pad());
+    for (int i = 0; i < 10; ++i) {
+        r.Frame(Pad());
+    }
+    CHECK(r.ui.HeldItemState().Active() && !r.ui.HeldItemState().InContact()); // the left hand is 40 cm away
+    r.in.grip[0].position = r.in.aim[0].position = {0.14f, 1.2f, -0.30f};
+    for (int i = 0; i < 20 && r.ui.HeldItemState().Active(); ++i) {
+        r.Frame(Pad());
+    }
+    CHECK(!r.ui.HeldItemState().Active());
+    n = r.ui.TakeActions(actions, 8);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_USE_QUICK && actions[0].a == 2 && actions[0].b == int32_t(Goods(1300)));
+    r.in.squeeze[0] = 0.0f;
+    r.in.grip[0].position = r.in.aim[0].position = {-0.2f, 1.2f, -0.35f};
+
+    // -- Items that are not physical (a bell) are used at once, as before
+    r.ui.PushEvent({BBXR_EV_ACTION_DONE, int32_t(BBXR_UI_USE_QUICK), 1, 0}, r.t);
+    for (int i = 0; i < 100; ++i) {
+        r.Frame(Pad());
+    }
+    r.state.quick[4] = Goods(200);
+    r.state.debug = {};
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+    PickOnWheel(r, 4);
+    CHECK(!r.ui.HeldItemState().Active());
+    n = r.ui.TakeActions(actions, 8);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_USE_QUICK && actions[0].a == 4 && actions[0].b == int32_t(Goods(200)));
+}
+
+void TestHeldItemsOff(const fs::path& assets) {
+    // held_items=false: picking uses the item at once, as before
+    const fs::path dir = HeldAssets(assets, "bbport_game_ui_held_off_test", ", \"held_items\": false");
+    Rig r;
+    std::string log;
+    CHECK(r.ui.Load(dir, nullptr, log));
+    CHECK(!r.ui.Menus().Layout().game.held_items);
+    r.feed = true;
+    r.state = GameState(80);
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+    PickOnWheel(r, 0);
+    CHECK(!r.ui.HeldItemState().Active());
+    BbXrUiAction actions[4];
+    const uint32_t n = r.ui.TakeActions(actions, 4);
+    CHECK(n == 1 && actions[0].kind == BBXR_UI_USE_QUICK && actions[0].a == 0);
+}
+
+void TestCollisionHaptics(const fs::path& assets) {
+    // Defaults parse; a custom block overrides; "on": false falls back to the old swing pulses.
+    sb::UiLayout l;
+    std::string error;
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2}}", l, error));
+    CHECK(l.game.collision_haptics.on && l.game.held_items);
+    CHECK(std::fabs(l.game.collision_haptics.wall.amplitude - 0.9f) < 1e-5f);
+    CHECK(std::fabs(l.game.held.mouth_radius_m - 0.12f) < 1e-6f && std::fabs(l.game.held.throw_min_speed - 1.5f) < 1e-6f);
+    sb::UiLayout c;
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"held_items\": false, \"held\": {\"mouth_radius_m\": 0.2, "
+                          "\"throw_min_speed\": 100, \"release_squeeze\": 2.0}, \"collision_haptics\": {\"on\": false, "
+                          "\"wall\": [0.3, 0.5], \"strength_ref\": 0}}}",
+                          c, error));
+    CHECK(!c.game.held_items && !c.game.collision_haptics.on);
+    CHECK(std::fabs(c.game.held.mouth_radius_m - 0.2f) < 1e-6f && c.game.held.throw_min_speed == 15.0f); // clamped
+    CHECK(c.game.held.release_squeeze <= c.game.held.grab_squeeze);
+    CHECK(std::fabs(c.game.collision_haptics.wall.seconds - 0.5f) < 1e-6f && c.game.collision_haptics.strength_ref == 1.0f);
+    // The shipped default text carries the new keys.
+    const std::string text = sb::DefaultLayoutText();
+    CHECK(text.find("\"held_items\": true") != std::string::npos && text.find("\"collision_haptics\"") != std::string::npos);
+
+    // In the UI: a hit, a wall bounce and an object bounce each buzz the weapon hand differently.
+    const fs::path dir = HeldAssets(assets, "bbport_game_ui_collision_test", "");
+    Rig r;
+    std::string log;
+    CHECK(r.ui.Load(dir, nullptr, log));
+    r.feed = true;
+    r.state = GameState(80);
+    r.ui.SetGameState(r.state, r.t);
+    r.Frame(Pad());
+    const auto hit = [&](int contact, int paid, int ticket) {
+        r.ui.PushEvent({BBXR_EV_SWING_OPEN, paid, 100000, ticket}, r.t);
+        r.Frame(Pad());
+        r.ui.PushEvent({BBXR_EV_SWING_HIT, paid, contact, ticket}, r.t);
+        r.Frame(Pad());
+        return r.StrongestHaptic(1);
+    };
+    const float weak = hit(0, 10, 11), strong = hit(0, 40, 12), wall = hit(1, 20, 13), object = hit(2, 20, 14);
+    CHECK(weak > 0.55f && weak < 0.7f);
+    CHECK(std::fabs(strong - 1.0f) < 1e-4f);
+    CHECK(wall > 0.9f && object > 0.7f && wall > object);
+    CHECK(r.all_log.find("weapon collision haptic: wall") != std::string::npos);
+    // Contacts the ticket path did not announce (no open ticket): haptics only, de-duplicated per hand.
+    for (int i = 0; i < 20; ++i) r.Frame(Pad()); // quiet past the 80 ms gap
+    const sb::SwingReadout before = r.ui.Readout();
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 0, 1, 1}, r.t); // a wall, strength unknown
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(1) >= 0.89f && r.StrongestHaptic(0) == 0.0f);
+    CHECK(r.all_log.find("weapon contact haptic: wall") != std::string::npos);
+    CHECK(r.ui.Readout().result == before.result && r.ui.Readout().label_paid == before.label_paid); // no "HIT -N"
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 0, 1, 1}, r.t); // the same burst, 11 ms later
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(1) == 0.0f);
+    for (int i = 0; i < 10; ++i) r.Frame(Pad()); // > 80 ms
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 40, 0, 1}, r.t); // a heavy character hit: the strong pulse
+    r.Frame(Pad());
+    CHECK(std::fabs(r.StrongestHaptic(1) - 1.0f) < 1e-4f);
+    for (int i = 0; i < 10; ++i) r.Frame(Pad());
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 0, 0, 0}, r.t); // the left hand has its own gap
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 0, 2, 1}, r.t);
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(0) > 0.5f && r.StrongestHaptic(1) > 0.5f);
+    for (int i = 0; i < 10; ++i) r.Frame(Pad());
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 0, 3, 1}, r.t); // a floor scrape: nothing
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(0) == 0.0f && r.StrongestHaptic(1) == 0.0f);
+    for (int i = 0; i < 10; ++i) r.Frame(Pad());
+    // A paid hit pulses once; a contact right after it (same burst) stays quiet.
+    r.ui.PushEvent({BBXR_EV_SWING_OPEN, 20, 100000, 77}, r.t);
+    r.Frame(Pad());
+    r.ui.PushEvent({BBXR_EV_SWING_HIT, 20, 0, 77}, r.t);
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(1) > 0.5f);
+    r.ui.PushEvent({BBXR_EV_WEAPON_CONTACT, 20, 0, 1}, r.t);
+    r.Frame(Pad());
+    CHECK(r.StrongestHaptic(1) == 0.0f);
+    // disabled: the old pulses (hit_light 0.6 for a light swing)
+    const fs::path off = HeldAssets(assets, "bbport_game_ui_collision_off_test", ", \"collision_haptics\": {\"on\": false}");
+    Rig q;
+    CHECK(q.ui.Load(off, nullptr, log));
+    q.feed = true;
+    q.state = GameState(80);
+    q.ui.SetGameState(q.state, q.t);
+    q.Frame(Pad());
+    q.ui.PushEvent({BBXR_EV_SWING_OPEN, 20, 100000, 1}, q.t);
+    q.Frame(Pad());
+    q.ui.PushEvent({BBXR_EV_SWING_HIT, 20, 1, 1}, q.t);
+    q.Frame(Pad());
+    CHECK(std::fabs(q.StrongestHaptic(1) - 0.6f) < 1e-4f);
+}
+
+// The desktop mirror (vr_mirror_ui.h): quad corners to window pixels.
+void TestMirrorProjection() {
+    const float pi = 3.14159265f;
+    const vrmirror::Fov fov{-pi / 4, pi / 4, pi / 4, -pi / 4}; // 90 x 90 deg
+    const Quat id{0, 0, 0, 1};
+    const Mat4 vp = vrmirror::ViewProj(id, {0, 0, 0}, fov);
+    float x = 0, y = 0;
+    // Straight ahead (-Z): the center.
+    CHECK(vrmirror::ProjectToPixel(vp, {0, 0, -2}, 1000, 500, &x, &y));
+    CHECK(std::fabs(x - 500) < 0.01f && std::fabs(y - 250) < 0.01f);
+    // A 2 m x 2 m quad at 2 m: its corners are the image corners (90 deg fov).
+    CHECK(vrmirror::ProjectToPixel(vp, {-2, 2, -2}, 1000, 500, &x, &y));
+    CHECK(std::fabs(x) < 0.01f && std::fabs(y) < 0.01f); // up-left is the top left
+    CHECK(vrmirror::ProjectToPixel(vp, {2, -2, -2}, 1000, 500, &x, &y));
+    CHECK(std::fabs(x - 1000) < 0.01f && std::fabs(y - 500) < 0.01f);
+    // Right of center lands right, higher lands higher (smaller y).
+    CHECK(vrmirror::ProjectToPixel(vp, {1, 1, -2}, 1000, 500, &x, &y));
+    CHECK(x > 500 && y < 250);
+    // Behind the camera: not drawn.
+    CHECK(!vrmirror::ProjectToPixel(vp, {0, 0, 2}, 1000, 500, &x, &y));
+    // The head moved 1 m right and turned 90 deg left: a point 2 m to the left of the origin is
+    // straight ahead of the head.
+    const Mat4 turned = vrmirror::ViewProj(AxisAngle({0, 1, 0}, pi / 2), {1, 0, 0}, fov);
+    CHECK(vrmirror::ProjectToPixel(turned, {-1, 0, 0}, 1000, 500, &x, &y));
+    CHECK(std::fabs(x - 500) < 0.1f && std::fabs(y - 250) < 0.1f);
+    CHECK(!vrmirror::ProjectToPixel(turned, {3, 0, 0}, 1000, 500, &x, &y));
+    // An asymmetric frustum shifts the center of the view axis.
+    const vrmirror::Fov skew{-pi / 6, pi / 3, pi / 4, -pi / 4};
+    const Mat4 vs = vrmirror::ViewProj(id, {0, 0, 0}, skew);
+    CHECK(vrmirror::ProjectToPixel(vs, {0, 0, -1}, 800, 400, &x, &y));
+    CHECK(std::fabs(x - 200) < 0.1f && std::fabs(y - 200) < 0.1f); // tan(30) / (tan(30) + tan(60))
+    // Image size: square pixels, inside the maximum, 16:9 for a 16:9 frustum.
+    uint32_t w = 0, h = 0;
+    vrmirror::ImageSize({-0.8f, 0.8f, 0.45f, -0.45f}, 1920, 1080, &w, &h);
+    CHECK(w <= 1920 && h <= 1080 && (h == 1080 || w == 1920));
+    vrmirror::ImageSize({-pi / 4, pi / 4, pi / 4, -pi / 4}, 1920, 1080, &w, &h);
+    CHECK(w == 1080 && h == 1080);
+    vrmirror::ImageSize({-pi / 4, pi / 4, pi / 8, -pi / 8}, 1000, 1080, &w, &h);
+    CHECK(w == 1000 && h < 1080);
+    // Fitting a frame into the window: letterbox bars, centered.
+    vrmirror::Rect r = vrmirror::FitRect(1920, 1080, 1000, 1000);
+    CHECK(r.w == 1000 && r.h == 562 && r.x == 0 && r.y == 219);
+    r = vrmirror::FitRect(1000, 1000, 1920, 1080);
+    CHECK(r.w == 1080 && r.h == 1080 && r.x == 420 && r.y == 0);
+}
+
 int main(int argc, char** argv) {
     const fs::path assets = argc > 1 ? fs::path(argv[1]) : fs::path("out/vr_assets");
     TestFilter();
+    TestMirrorProjection();
     TestFilterMash();
     TestGameMenuNav();
+    TestPreWorldNav();
     TestIds();
     TestGunRay();
     TestGameUi(assets);
+    TestHeldClassify();
+    TestHeldItemLogic();
     if (fs::exists(assets / "hitbox" / "index.json")) {
         TestHitboxes(assets);
     }
@@ -1459,6 +2241,9 @@ int main(int argc, char** argv) {
         TestMashThenWheel(assets);
         TestMashThenWheel(assets, "[\"quick_wheel\", \"quick_ring\", \"weapon_wheel\"]");
         TestGripDoesNotBlock(assets);
+        TestHeldItemsInGame(assets);
+        TestHeldItemsOff(assets);
+        TestCollisionHaptics(assets);
     }
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

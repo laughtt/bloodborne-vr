@@ -335,9 +335,80 @@ void TestColorOrder() {
     assert(DlssColorFormat(43) == 37 && DlssColorFormat(37) == 37);
 }
 
+void TestFeatureRecreate() {
+    const FeatureKey a{1000, 1100, 2000, 2200, 3, 11, false};
+    FeatureKey b = a;
+    // Per eye: each eye has its own key, the same wish never recreates a feature it already has.
+    FeatureKey eye_l = a, eye_r = a;
+    assert(CreateReasonFor(&eye_l, a) == CreateReason::None);
+    assert(CreateReasonFor(&eye_r, a) == CreateReason::None);
+    assert(CreateReasonFor(nullptr, a) == CreateReason::FirstUse);
+    assert(CreateReasonFor(nullptr, a, true) == CreateReason::Reset);
+    b.out_w = 2400;
+    assert(CreateReasonFor(&eye_l, b) == CreateReason::Resize);
+    assert(CreateReasonFor(&eye_r, a) == CreateReason::None); // the other eye is unaffected
+    b = a;
+    b.render_h = 900;
+    assert(CreateReasonFor(&a, b) == CreateReason::Resize);
+    b = a;
+    b.quality = 1;
+    assert(CreateReasonFor(&a, b) == CreateReason::Quality);
+    b = a;
+    b.preset = 12;
+    assert(CreateReasonFor(&a, b) == CreateReason::Preset);
+    b = a;
+    b.hdr = true;
+    assert(CreateReasonFor(&a, b) == CreateReason::Reset);
+
+    // Recreate guard: more than 3 creates of one eye within 2 s warns, once; the other eye and a
+    // slow cadence do not.
+    RecreateGuard g;
+    assert(!g.Note(0, 0.0) && !g.Note(0, 100.0) && !g.Note(0, 200.0));
+    assert(g.Note(0, 300.0));    // the 4th within 2 s
+    assert(!g.Note(0, 400.0));   // once only
+    assert(!g.Note(1, 400.0));   // eye 1 counted separately
+    RecreateGuard slow;
+    for (int i = 0; i < 20; ++i) {
+        assert(!slow.Note(0, i * 1000.0)); // one per second: never more than 3 in 2 s
+    }
+    RecreateGuard every_frame; // a loop at 36 Hz per eye
+    bool warned = false;
+    for (int i = 0; i < 100; ++i) {
+        warned |= every_frame.Note(1, i * 27.8);
+    }
+    assert(warned);
+}
+
+void TestJitterPerEyeAndOff() {
+    // Alternate eyes: each eye walks its own Halton sequence 1,2,3... and they do not interleave.
+    Tracker t;
+    const Camera c = MakeCamera(0, 0, 0);
+    uint32_t n[2] = {0, 0};
+    for (uint64_t f = 1; f <= 12; ++f) {
+        const int eye = int((f - 1) & 1);
+        const auto j = t.ChooseJitter(true, 1.5f);
+        assert(t.PendingEye() == eye);
+        const auto want = JitterAt(++n[eye]);
+        assert(Near(j[0], want[0], 1e-6f) && Near(j[1], want[1], 1e-6f));
+        t.OnEyeFrame(eye, c, j, f, double(f) * 13.9);
+    }
+    assert(t.JitterSeq(0) == 6 && t.JitterSeq(1) == 6);
+    // dlss_jitter=0: zero for both eyes, and the sequences still stay per eye.
+    assert(ParseJitterOn("1") && ParseJitterOn("on") && !ParseJitterOn("0") &&
+           !ParseJitterOn("off") && !ParseJitterOn("false"));
+    Tracker z;
+    for (uint64_t f = 1; f <= 6; ++f) {
+        const auto j = z.ChooseJitter(true, 1.5f, false);
+        assert(j[0] == 0.0f && j[1] == 0.0f);
+        z.OnEyeFrame(int((f - 1) & 1), c, j, f, double(f));
+    }
+}
+
 } // namespace
 
 int main() {
+    TestFeatureRecreate();
+    TestJitterPerEyeAndOff();
     TestColorOrder();
     TestOptions();
     TestOutputSize();

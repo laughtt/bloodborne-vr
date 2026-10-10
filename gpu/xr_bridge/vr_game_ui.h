@@ -35,6 +35,7 @@
 #include "sandbox3d/ui.h"
 #include "vr_ui_filter.h"
 #include "vr_game_hitbox.h"
+#include "vr_held_items.h"
 
 namespace vrui {
 
@@ -101,6 +102,7 @@ public:
     void Draw(VkCommandBuffer cmd, const m3::Mat4& view_proj, VkFormat color);
 
     // Tests and logs.
+    const held::HeldItem& HeldItemState() const { return held_item; }
     const sb::SwingReadout& Readout() const { return readout; }
     sb::UiSystem& Menus() { return menus; }
     bool Active() const { return active; }
@@ -114,14 +116,22 @@ private:
     };
 
     void ApplyState(const BbXrGameState& s, std::string& log);
+    /// A weapon-contact pulse unless the hand had one in the last 80 ms; false when skipped.
+    bool PulseWeapon(int hand, int contact, int paid, double now, std::vector<Haptic>& haptics, std::string& log);
     void Swings(const FrameInput& in, const BbXrGameState& s, std::vector<Haptic>& haptics);
     void Events(std::vector<Haptic>& haptics, std::string& log);
     void Act(const sb::UiAction& a, std::string& log);
     /// Something the user asked for that the game will not get: said in the headset and logged.
     void Refuse(const std::string& what, const std::string& why, std::string& log);
     void DrawGunRay(const sb::UiGameLayout& g);
+    void DrawHeldItem(const sb::UiGameLayout& g);
+    /// Physical items (vr_held_items.h): a picked consumable goes into a hand instead of being used.
+    bool StartHeld(const sb::UiAction& a, int slot, uint32_t id, std::string& log);
+    void StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::string& log);
+    void FireHeld(const held::Result& r, const FrameInput& in, std::string& log);
     void AddTired(std::vector<Haptic>& haptics);
 
+    double last_contact_pulse[2] = {-1.0e9, -1.0e9}; // per hand, the last weapon-contact pulse
     std::filesystem::path assets;
     sb::UiSystem menus;
     bool loaded = false;
@@ -168,6 +178,10 @@ private:
     double last_pull = -1e9;         // the last left-trigger (L2) pull
     double last_pull_log = -1e9;
     bool ray_in_world = false;    void (*recenter)() = nullptr;
+    // The item in a hand (physical items).
+    held::HeldItem held_item;
+    double held_menu_ignore_until = -1.0; // the menu that took the pick is closing
+    double held_fired_at = -1e9;
     // The action the host is carrying out (shown until it is done, gave up, or 8 s passed).
     std::string pending;
     double pending_at = -1.0;

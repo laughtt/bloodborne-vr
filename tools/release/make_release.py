@@ -14,18 +14,26 @@ walking the PE import tables; no ldd needed). Scripts, patches and run.py come f
 Layout of BloodborneVR-<version>/ in the zip:
     BloodborneVR.exe (the native dashboard, built here: ImGui + SDL3 linked in, one file; `--web` = the web menu),
     BloodborneVR-console.bat (fallback), README.txt, VERSION.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
-    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli}.py (settings, web menu, the dashboard's helper), defaults/{fp,stereo}.txt,
+    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli,bbvr_update}.py (settings, web menu, the dashboard's helper,
+    update check), defaults/{fp,stereo}.txt + release.json (update-check address),
     python/ (embeddable Python, optional)
     run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/
-No game file, extracted asset or DLSS / FSR 4 runtime is included.
+bin/ also has NVIDIA's nvngx_dlss.dll and the bbport_dlss.dll bridge (licenses/NVIDIA-DLSS-*.txt; see --dlss-dir).
+No game file, extracted asset or FSR 4 runtime is included.
+
+After the zip, the one-click installer BloodborneVR-<version>-Setup.exe is built from the same folder with Inno Setup 6
+(packaging/windows/BloodborneVR.iss; ISCC.exe is searched in --iscc, $ISCC, PATH and the usual install folders;
+--no-installer skips it). Both files go into SHA256SUMS.txt. Crash reports are local only (no server setting).
 """
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import urllib.request
 import zipfile
@@ -40,6 +48,8 @@ PY_EMBED_URL = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-a
 SYSTEM_DIRS = [Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32']
 # DLLs left to the system / the GPU driver (never shipped even when the MSYS2 tree has a copy).
 SYSTEM_DLLS = {'vulkan-1.dll'}
+# NVIDIA DLSS runtime + our bridge (NVIDIA RTX SDKs LICENSE allows redistribution in an application).
+DLSS_DLLS = ('bbport_dlss.dll', 'nvngx_dlss.dll')
 # Licence file folders in <msys2>/share/licenses for the DLLs that may be shipped: dll prefix -> folder.
 LICENSE_DIRS = {
     'sdl3': 'SDL3', 'libopenxr_loader': 'openxr-sdk', 'libssl': 'openssl', 'libcrypto': 'openssl',
@@ -126,6 +136,105 @@ def license_for(dll, share):
     return None, None
 
 
+# Packages whose licence is the GPL (the MSYS2 FFmpeg is configured --enable-gpl --enable-version3 and links these).
+GPL_PACKAGES = {'ffmpeg': 'GPL-3.0-or-later (built with --enable-gpl --enable-version3)',
+                'libx264': 'GPL-2.0-or-later', 'x265': 'GPL-2.0-only', 'xvidcore': 'GPL-2.0-or-later'}
+OWN_FILES = {'bbport_xr.dll', 'bbport_dlss.dll', 'nvngx_dlss.dll', 'bb-probe.exe', 'bb-gpu-capabilities.exe'}
+
+
+def read_desc(path):
+    """{'%NAME%': [lines]} of a pacman desc file."""
+    out, key = {}, None
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        if line.startswith('%') and line.endswith('%'):
+            key = line
+            out[key] = []
+        elif line.strip() and key:
+            out[key].append(line.strip())
+    return out
+
+
+def msys2_dll_packages(bin_dir, msys2_root):
+    """({package: {name, version, base, url, licenses, dlls}}, [dlls with no MSYS2 package]) for the DLLs in bin_dir,
+    read from the pacman database of the MSYS2 install (var/lib/pacman/local/*/{desc,files})."""
+    db = msys2_root / 'var' / 'lib' / 'pacman' / 'local'
+    owner = {}  # lower-case dll file name -> db folder
+    for folder in sorted(db.glob('*')) if db.is_dir() else []:
+        files = folder / 'files'
+        if not files.is_file():
+            continue
+        for line in files.read_text(encoding='utf-8', errors='replace').splitlines():
+            low = line.lower()
+            if low.endswith('.dll') and '/bin/' in low and low.split('/')[0] in ('clang64', 'mingw64'):
+                owner.setdefault(low.rsplit('/', 1)[-1], folder)
+    packages, unknown = {}, []
+    for dll in sorted(bin_dir.glob('*.dll')):
+        if dll.name.lower() in OWN_FILES:
+            continue
+        folder = owner.get(dll.name.lower())
+        if folder is None:
+            unknown.append(dll.name)
+            continue
+        desc = read_desc(folder / 'desc')
+        name = desc['%NAME%'][0]
+        entry = packages.setdefault(name, {'name': name, 'version': desc['%VERSION%'][0],
+                                           'base': (desc.get('%BASE%') or [name])[0], 'url': (desc.get('%URL%') or [''])[0],
+                                           'licenses': desc.get('%LICENSE%') or ['see the package'], 'dlls': []})
+        entry['dlls'].append(dll.name)
+    return packages, unknown
+
+
+def short_name(package):
+    for prefix in ('mingw-w64-clang-x86_64-', 'mingw-w64-x86_64-', 'mingw-w64-'):
+        if package.startswith(prefix):
+            return package[len(prefix):]
+    return package
+
+
+def write_third_party_sources(stage, packages, unknown, repo_slug, version):
+    """SOURCES-THIRD-PARTY.txt: exact package versions of the bundled MSYS2 DLLs, source links, written offer."""
+    lines = [
+        f'Third-party binaries in bin/ of Bloodborne VR {version}: exact versions and where their source is',
+        '=' * 78, '',
+        'Every DLL in bin/ that is not ours was copied unmodified from the MSYS2 CLANG64 environment',
+        '(https://www.msys2.org). Its source is the MSYS2 source package of the same name and version:',
+        '  * recipes (PKGBUILD + patches): https://github.com/msys2/MINGW-packages/tree/master/<source package>',
+        '  * source archives:              https://repo.msys2.org/mingw/sources/<source package>-<version>.src.tar.zst',
+        '',
+        'The FFmpeg libraries (avcodec, avformat, avutil, swresample, swscale) of that build are configured with',
+        '--enable-gpl --enable-version3 and link GPL codec libraries (libx264, x265, xvidcore). They are therefore',
+        'used here under the GNU GPL version 3: the licence text is COPYING.GPL-3.0 (also licenses/GPL-3.0.txt).',
+        'LGPL libraries keep their LGPL (licenses/LGPL-3.0.txt, and the texts the packages ship in licenses/).',
+        '', 'WRITTEN OFFER OF SOURCE CODE',
+        '---------------------------',
+        'For three years from the date of this release, and for as long as we distribute this version, we will',
+        'give anyone who asks the complete corresponding source code of every GPL / LGPL component listed below',
+        "(the MSYS2 source archives named here, and this project's own source tagged v" + version + '), on a',
+        'medium customarily used for software interchange, for no more than the cost of doing so. Ask by opening an',
+        f'issue at https://github.com/{repo_slug}/issues (title "Source request") and we will answer with the files or links.',
+        'The same archives are always available from https://repo.msys2.org/mingw/sources/ (the MSYS2 project keeps them).',
+        '', 'PACKAGES', '--------']
+    for name in sorted(packages):
+        e = packages[name]
+        gpl = GPL_PACKAGES.get(short_name(name))
+        lic = f'  licence:         {gpl or ", ".join(e["licenses"])}' + (f'  [package metadata: {", ".join(e["licenses"])}]' if gpl else '')
+        lines += ['', f'{name} {e["version"]}',
+                  f'  provides:        {", ".join(e["dlls"])}', lic,
+                  f'  upstream:        {e["url"]}',
+                  f'  MSYS2 source:    {e["base"]} {e["version"]}',
+                  f'                   https://github.com/msys2/MINGW-packages/tree/master/{e["base"]}',
+                  f'                   https://repo.msys2.org/mingw/sources/{e["base"]}-{e["version"]}.src.tar.zst']
+    if unknown:
+        lines += ['', 'DLLs not found in the MSYS2 package database (built or supplied separately; ask via the issue tracker):',
+                  '  ' + ', '.join(unknown)]
+    lines += ['', 'Other components', '----------------',
+              '* bbport_xr.dll, bb-probe.exe, bb-gpu-capabilities.exe: this project (SOURCE.txt, THIRD_PARTY_NOTICES.md).',
+              '* bbport_dlss.dll: this project (MIT, gpu/dlss_bridge in the source repository).',
+              '* nvngx_dlss.dll: NVIDIA DLSS runtime, not open source; see licenses/NVIDIA-DLSS-LICENSE.txt.',
+              '* python/: the embeddable Python from python.org (PSF licence, python/LICENSE.txt).', '']
+    (stage / 'SOURCES-THIRD-PARTY.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+
 def fetch_python(source, cache):
     if source and Path(source).is_file():
         return Path(source)
@@ -148,6 +257,30 @@ def add_python(stage, embed_zip):
     pth.write_text(f'{stdlib}\n.\n..\n../scripts\n../scripts/vr_assets\n', encoding='ascii')
 
 
+def find_iscc(explicit=None):
+    """Path of Inno Setup's command-line compiler, or None."""
+    candidates = [explicit, os.environ.get('ISCC'), shutil.which('ISCC.exe') or shutil.which('iscc')]
+    for base in (os.environ.get('LOCALAPPDATA'), os.environ.get('ProgramFiles(x86)'), os.environ.get('ProgramFiles')):
+        if base:
+            candidates += [Path(base) / 'Programs' / 'Inno Setup 6' / 'ISCC.exe', Path(base) / 'Inno Setup 6' / 'ISCC.exe']
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate)
+    return None
+
+
+def build_installer(iscc, stage, version, out):
+    """Runs Inno Setup on the staged folder; returns the Setup.exe path. Raises RuntimeError on failure."""
+    script = REPO / 'packaging' / 'windows' / 'BloodborneVR.iss'
+    setup = out / f'BloodborneVR-{version}-Setup.exe'
+    setup.unlink(missing_ok=True)
+    result = subprocess.run([str(iscc), '/Q', f'/DMyVersion={version}', '/DMyNumVersion=' + '.'.join(map(str, build_stub.file_version(version)[0])), f'/DStageDir={stage}', f'/DOutDir={out}',
+                             f'/DRepoDir={REPO}', str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode or not setup.is_file():
+        raise RuntimeError(f'Inno Setup failed ({result.returncode}):\n{result.stdout[-2000:]}')
+    return setup
+
+
 def commit_id():
     import subprocess
     try:
@@ -161,6 +294,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--exe', type=Path, default=REPO / 'out' / 'gpu-public' / 'bb-probe.exe')
     ap.add_argument('--bridge', type=Path, default=REPO / 'out' / 'bbport_xr.dll')
+    ap.add_argument('--dlss-dir', type=Path, default=REPO / 'out', help='folder with bbport_dlss.dll and nvngx_dlss.dll '
+                    '(packaging/windows/build_dlss.sh); both are shipped (NVIDIA RTX SDKs LICENSE, licenses/NVIDIA-DLSS-*.txt)')
+    ap.add_argument('--no-dlss', action='store_true', help='build a package without the DLSS DLLs (not for releases)')
     ap.add_argument('--caps', type=Path, default=REPO / 'out' / 'bb-gpu-capabilities.exe')
     ap.add_argument('--openxr', type=Path, default=REPO / 'out' / 'libopenxr_loader.dll')
     ap.add_argument('--export', type=Path, default=REPO / 'out' / 'public_export')
@@ -170,14 +306,18 @@ def main():
                     'searched before the MSYS2 tree (whose FFmpeg is GPLv3 and drags in ~100 codec DLLs)')
     ap.add_argument('--no-python', action='store_true', help='do not bundle Python (testers need Python 3.10+)')
     ap.add_argument('--allow-online', action='store_true', help='skip the online-strings check of the host exe (never for a public build)')
-    ap.add_argument('--version', default='0.1.0-alpha1')
+    ap.add_argument('--version', default='0.1.0-alpha5')
+    ap.add_argument('--no-installer', action='store_true', help='do not build Setup.exe (Inno Setup)')
+    ap.add_argument('--iscc', type=Path, help='path of Inno Setup 6 ISCC.exe (default: $ISCC, PATH, standard folders)')
+    ap.add_argument('--update-repo', help='GitHub owner/repo the update check asks (default: laughtt/bloodborne-vr)')
     ap.add_argument('--out', type=Path, default=REPO / 'out' / 'release')
     ap.add_argument('--stub', type=Path, help='prebuilt BloodborneVR.exe (default: build the native dashboard, tools/release/dashboard, with clang; '
                     'falls back to the tiny console stub, tools/release/zip/exe)')
     ap.add_argument('--strip', default=None, help='llvm-strip to drop debug info (default: clang64/bin/llvm-strip.exe if present)')
     args = ap.parse_args()
 
-    for path in (args.exe, args.bridge, args.openxr, args.export / 'run.py'):
+    dlss_dlls = [args.dlss_dir / n for n in DLSS_DLLS]
+    for path in (args.exe, args.bridge, args.openxr, args.export / 'run.py') + (() if args.no_dlss else tuple(dlss_dlls)):
         if not path.is_file():
             sys.exit(f'missing input: {path}' + (' (run tools/release/export_public.py first)' if 'export' in str(path) else ''))
     name = f'BloodborneVR-{args.version}'
@@ -204,10 +344,12 @@ def main():
     strip = Path(args.strip) if args.strip else args.msys2 / 'bin' / 'llvm-strip.exe'
     shutil.copyfile(args.exe, bin_dir / 'bb-probe.exe')
     if strip.is_file():
-        import subprocess
         subprocess.run([str(strip), '--strip-debug', str(bin_dir / 'bb-probe.exe')], check=False)
     shutil.copyfile(args.bridge, bin_dir / 'bbport_xr.dll')
     shutil.copyfile(args.openxr, bin_dir / 'libopenxr_loader.dll')
+    if not args.no_dlss:  # the exe loads both from its own folder (vk_dlss.cpp ExecutableDirectory)
+        for dll in dlss_dlls:
+            shutil.copyfile(dll, bin_dir / dll.name)
     if args.caps.is_file():
         shutil.copyfile(args.caps, bin_dir / 'bb-gpu-capabilities.exe')
 
@@ -227,9 +369,26 @@ def main():
 
     # Sources of the package from the export tree.
     ex = args.export
-    for item in ('run.py', 'LICENSE', 'COPYING.GPL-3.0', 'THIRD_PARTY_NOTICES.md'):
+    for item in ('run.py', 'LICENSE', 'COPYING.GPL-3.0', 'COPYING.LGPL-3.0', 'THIRD_PARTY_NOTICES.md'):
         if (ex / item).is_file():
             shutil.copyfile(ex / item, stage / item)
+    # The GPLv3 (the binaries are GPLv3) and LGPLv3 texts, then the licence texts the MSYS2 packages ship.
+    for item, target in (('COPYING.GPL-3.0', 'GPL-3.0.txt'), ('COPYING.LGPL-3.0', 'LGPL-3.0.txt')):
+        if not (stage / item).is_file():
+            shutil.rmtree(stage)
+            sys.exit(f'missing {item} in the export tree (tools/release/public): the GPL / LGPL texts must ship with the binaries')
+        shutil.copyfile(stage / item, stage / 'licenses' / target)
+    packages, unknown_dlls = msys2_dll_packages(bin_dir, args.msys2.parent)
+    if not packages:
+        print(f'NOTE: no MSYS2 package database under {args.msys2.parent}: SOURCES-THIRD-PARTY.txt lists no package versions')
+    for package in sorted(packages):
+        folder = share / short_name(package)
+        if folder.is_dir():
+            for lic in sorted(p for p in folder.rglob('*') if p.is_file()):
+                target = stage / 'licenses' / f'{short_name(package)}-{lic.relative_to(folder).as_posix().replace("/", "_")}'
+                if not target.exists():
+                    shutil.copyfile(lic, target)
+    write_third_party_sources(stage, packages, unknown_dlls, args.update_repo or 'laughtt/bloodborne-vr', args.version)
     shutil.copytree(ex / 'patches', stage / 'patches')
     shutil.copytree(ex / 'scripts', stage / 'scripts',
                     ignore=shutil.ignore_patterns('*.sh', '__pycache__', 'test_*.py', 'vr_frames.py'))
@@ -255,18 +414,32 @@ def main():
     if controls.is_file():  # the labelled controller map README.txt points to
         shutil.copyfile(controls, stage / 'controls.png')
     (stage / 'launcher').mkdir()
-    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py', 'bbvr_cli.py'):  # the start-up menu is standard library only
+    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py', 'bbvr_cli.py', 'bbvr_update.py'):  # the start-up menu is standard library only
         shutil.copyfile(ZIPSRC / module, stage / 'launcher' / module)
     shutil.copytree(ZIPSRC / 'defaults', stage / 'defaults')
+    if args.update_repo:
+        release_json = stage / 'defaults' / 'release.json'
+        data = json.loads(release_json.read_text(encoding='utf-8'))
+        data['update_repo'] = args.update_repo
+        release_json.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
     for lic in (ex / 'gpu' / 'xr_bridge' / 'LICENSE.txt',):
         if lic.is_file():
             shutil.copyfile(lic, stage / 'licenses' / 'bbport_xr-LICENSE.txt')
     for lic in sorted((ex / 'packaging' / 'windows' / 'licenses').glob('*.txt')):
         shutil.copyfile(lic, stage / 'licenses' / lic.name)
+    if not args.no_dlss:  # the bridge source (MIT) is in the public export
+        shutil.copyfile(ex / 'gpu' / 'dlss_bridge' / 'LICENSE.txt', stage / 'licenses' / 'bbport_dlss-LICENSE.txt')
+        for need in ('NVIDIA-DLSS-LICENSE.txt', 'NVIDIA-DLSS-NOTICE.txt'):
+            if not (stage / 'licenses' / need).is_file():
+                shutil.rmtree(stage)
+                sys.exit(f'missing licenses/{need} in the export tree: required to ship nvngx_dlss.dll')
     (stage / 'SOURCE.txt').write_text(
-        'Source code (GPL-2.0-or-later) for this build is the public repository this release was made\n'
-        f'from, tag v{args.version}; the commit is in COMMIT.txt. Build instructions: README.md, build.sh.\n'
-        'Sources of the bundled third-party DLLs: see THIRD_PARTY_NOTICES.md.\n', encoding='utf-8')
+        'Source code (GPL-2.0-or-later; this binary release is distributed under GPLv3, COPYING.GPL-3.0) for this\n'
+        f'build is the public repository this release was made from, tag v{args.version}; the commit is in COMMIT.txt.\n'
+        'Build instructions: README.md, build.sh. The DLSS bridge (bbport_dlss.dll, MIT) is in gpu/dlss_bridge; it is\n'
+        "built against NVIDIA's DLSS SDK, which is not part of the repository (see THIRD_PARTY_NOTICES.md); nvngx_dlss.dll\n"
+        "is NVIDIA's own binary. Exact versions, source links and a written offer of source for the bundled MSYS2\n"
+        'libraries (FFmpeg, x264, x265, xvidcore and the rest of bin/): SOURCES-THIRD-PARTY.txt.\n', encoding='utf-8')
     (stage / 'COMMIT.txt').write_text(commit_id() + '\n', encoding='utf-8')
     (stage / 'VERSION.txt').write_text(args.version + '\n', encoding='utf-8')
 
@@ -280,8 +453,21 @@ def main():
         for path in sorted(stage.rglob('*')):
             if path.is_file():
                 z.write(path, f'{name}/{path.relative_to(stage).as_posix()}')
-    sums = [(hashlib.sha256(path.read_bytes()).hexdigest(), n) for path, n in
-            ((archive, archive.name), (stage / 'BloodborneVR.exe', 'BloodborneVR.exe'), (bin_dir / 'bb-probe.exe', 'bin/bb-probe.exe'))]
+    setup = None
+    if not args.no_installer:
+        iscc = find_iscc(args.iscc)
+        if not iscc:
+            print('NOTE: Inno Setup 6 (ISCC.exe) not found: no Setup.exe (install it from https://jrsoftware.org, or pass --no-installer)')
+        else:
+            try:
+                setup = build_installer(iscc, stage, args.version, args.out)
+                print(f'installer: {setup}  ({setup.stat().st_size / 1e6:.1f} MB, {iscc})')
+            except RuntimeError as error:
+                print(f'ERROR: {error}')
+                return 1
+    files = [(archive, archive.name)] + ([(setup, setup.name)] if setup else []) + [
+        (stage / 'BloodborneVR.exe', 'BloodborneVR.exe'), (bin_dir / 'bb-probe.exe', 'bin/bb-probe.exe')]
+    sums = [(hashlib.sha256(path.read_bytes()).hexdigest(), n) for path, n in files]
     (args.out / 'SHA256SUMS.txt').write_text(''.join(f'{h} *{n}\n' for h, n in sums), encoding='ascii')
     print(f'BloodborneVR.exe: {(stage / "BloodborneVR.exe").stat().st_size / 1024:.0f} KB; sums: {args.out / "SHA256SUMS.txt"}')
     total = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file())
@@ -295,7 +481,8 @@ def main():
     print('largest: ' + ', '.join(f'{n} {s / 1e6:.1f} MB' for s, n in big))
     gpl3 = [n for n in dlls if n.lower().startswith(('avcodec', 'avformat', 'avutil', 'swscale', 'swresample'))]
     if gpl3 and not args.ffmpeg_dir:
-        print('NOTE: FFmpeg DLLs are from the MSYS2 build configured --enable-gpl --enable-version3 (GPLv3).')
+        print('NOTE: FFmpeg DLLs are from the MSYS2 build configured --enable-gpl --enable-version3 (GPLv3): '
+              'licenses/GPL-3.0.txt and SOURCES-THIRD-PARTY.txt (source offer) are in the package.')
     return 0
 
 

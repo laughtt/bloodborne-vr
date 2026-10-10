@@ -146,6 +146,39 @@ struct UiDebugHitboxes {
     float idle_alpha = 0.6f; // the weapon's shapes outside an attack
 };
 
+/// Items in the hand (the "game" object's "held_items" / "held", vr_held_items.h): a consumable
+/// picked on the wheel is held in a hand and used by a gesture instead of at once.
+struct UiHeldItems {
+    float grab_squeeze = 0.60f, release_squeeze = 0.35f; // the grip that holds / lets go
+    float pickup_grace_s = 5.0f;      // the grip must close this soon after the pick
+    m3::Vec3 hold{0.0f, 0.0f, -0.05f}; // the item's point relative to the grip pose
+    // Heals, cures, body buffs: the item within mouth_radius_m of the mouth (head local) and below
+    // the eyes for mouth_hold_s (the sandbox's consumables: mouth, mouth_radius_m, below_eyes_m).
+    m3::Vec3 mouth{0.0f, -0.10f, -0.07f};
+    float mouth_radius_m = 0.12f, below_eyes_m = 0.03f, mouth_hold_s = 0.3f;
+    // Weapon buffs: the item within blade_radius_m of the blade (blade_start: the share of the weapon's
+    // length that is handle) for blade_hold_s: a touch, not a rub.
+    float blade_radius_m = 0.10f, blade_start = 0.25f, blade_hold_s = 0.12f;
+    float blade_fallback_m = 0.18f;   // no hitbox data for the weapon: this far around its bone
+    // Throwables: letting go of the grip faster than this throws (m/s); slower puts the item back.
+    float throw_min_speed = 1.5f;
+    float throw_window_s = 0.08f, throw_peak_weight = 0.5f; // the release velocity estimate
+    float lockout_s = 0.8f;           // swings and the swap tap stay off this long after the item left the hand
+    float use_timeout_s = 4.0f;       // a gesture's action the game never answered
+    UiPulse pick{0.3f, 0.03f}, use{0.5f, 0.05f}, touch{0.2f, 0.03f}, cancel{0.25f, 0.04f};
+};
+
+/// The weapon hand's haptics when the game's weapon collides ("game" object, "collision_haptics").
+struct UiCollisionHaptics {
+    bool on = true;
+    UiPulse hit{0.55f, 0.07f};        // a hit on a character, weak
+    UiPulse hit_strong{1.0f, 0.16f};  // ... at strength_ref stamina paid or more
+    UiPulse wall{0.9f, 0.18f};        // the attack bounced off a wall
+    UiPulse object{0.7f, 0.12f};      // ... or an object
+    float strength_ref = 40.0f;       // the stamina an attack pays at full strength
+    bool scale_by_strength = true;    // hit / wall / object blend towards hit_strong by strength
+};
+
 struct UiGameLayout {
     int version = 0;                 // the "game" object's version (older ones are replaced)
     std::vector<std::string> active; // the game menus in use (names in `menus`)
@@ -163,6 +196,11 @@ struct UiGameLayout {
     // when it hits, two short buzzes when a swing finds no stamina.
     UiPulse tick_light{0.2f, 0.025f}, tick_heavy{0.4f, 0.035f};
     UiPulse hit_light{0.6f, 0.06f}, hit_heavy{1.0f, 0.12f}, tired{0.5f, 0.05f};
+    // Physical items: a consumable picked on the wheel is held, then used by a gesture (mouth,
+    // blade, throw); false: picking it uses it at once, as before.
+    bool held_items = true;
+    UiHeldItems held;
+    UiCollisionHaptics collision_haptics;
     // Item use through the game's own buttons (src/runtime_vr_ui.c).
     float press_s = 0.06f;           // how long each d-pad / square press is held
     // DEBUG: the left controller's aim ray (where the gun is pointed), brighter 0.3 s after a pull.

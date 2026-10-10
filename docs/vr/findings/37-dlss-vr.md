@@ -301,3 +301,28 @@ the ABI 3 one.
 Not tested in the headset yet: the 0.9 m default is a guess for the arm and weapon reach in
 first person. `dlss-bridge-smoke` checks that the bridge accepts the mask (right eye) and that the
 output still matches its input.
+
+## 13. Per-eye audit, feature logging, jitter off switch (branch dlss-eye-audit)
+
+Audit result (a study of a Cyberpunk VR port suggested a shared per-eye cache as a typical bug): no
+shared state found. Every per-evaluate field is per eye: the feature (bridge slot 1/2, own history,
+`InRenderSubrectDimensions` from that slot's own create description), output image and views
+(`XrDlss::Impl::eyes[]`), jitter sequence (`Tracker::EyeState::jitter_seq`), previous camera, reset
+flag, frame time. The change detect is `Dlss::HasFeature(desc, slot)`, per slot, so eye 2 never sees
+the other eye's description. MV scale, exposure and pre-exposure are constants 1 in the bridge;
+sharpness comes from the settings. The motion vector image and the mask image are shared between
+the eyes on purpose: they are rewritten and consumed within each eye's own evaluate, in command
+order, with barriers. ABI unchanged (3).
+
+Added:
+- Every feature create/release is logged per eye with the reason (`first use`, `resize`,
+  `quality change`, `preset change`, `reset` = released by a settings change or DLSS toggle):
+  `VR DLSS: eye L feature created (resize): render WxH -> output WxH, quality, preset X`.
+  `XrDlssLogic::CreateReasonFor` decides the reason (unit tested), `RecreateGuard` warns once
+  (`VR DLSS: WARNING: eye R feature created N times within 2 s ...`) when one eye is created more
+  than 3 times in 2 s.
+- `dlss_jitter=0|1` in iq.txt (env `BB_XR_DLSS_JITTER`, default 1). 0 zeroes the per-eye jitter in
+  the projection offset (`XrDlss::SceneJitter`), in the value passed to DLSS and in the motion
+  vector / mask passes, and restarts the histories. Logged as `VR IQ (control file): ... jitter
+  OFF (diagnostic)` and `VR DLSS: jitter OFF/on`. Use it to see whether a shimmer or blur comes from
+  the jitter. Tests: `xr-dlss-test` (recreate reasons, guard, per-eye Halton, jitter off).

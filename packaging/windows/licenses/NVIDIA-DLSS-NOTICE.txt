@@ -1,0 +1,27 @@
+NVIDIA DLSS (nvngx_dlss.dll) and the bbport_dlss.dll bridge
+============================================================
+
+This program uses NVIDIA DLSS. "nvngx_dlss.dll" is NVIDIA's DLSS runtime, taken unmodified from
+the NVIDIA DLSS SDK 310.9.1 (https://github.com/NVIDIA/DLSS) and redistributed in object code
+format, in this application, under the NVIDIA RTX SDKs LICENSE (v. March 14, 2024) and its RTX
+Supplement; the full text is in NVIDIA-DLSS-LICENSE.txt next to this file. "bbport_dlss.dll" is
+this project's own bridge (MIT, see bbport_dlss-LICENSE.txt) built against the DLSS SDK.
+DLSS is only for systems with an NVIDIA GPU. Without an NVIDIA RTX GPU the game uses FSR instead.
+This application is not sponsored or endorsed by NVIDIA.
+
+Terms for the end user of the NVIDIA DLSS files (required by section 2.c of the NVIDIA license;
+they are at least as protective of NVIDIA as that license):
+
+1. NVIDIA and its suppliers keep all rights, title and interest in nvngx_dlss.dll. You get the
+   right to use it only together with this application, only on systems with NVIDIA GPUs.
+2. You may not reverse engineer, decompile or disassemble it, remove copyright or other
+   proprietary notices from it, copy, sell, rent, sublicense, transfer, distribute or modify it,
+   or distribute it as a stand-alone product, nor bypass, disable or circumvent any technical
+   limitation, security or authentication mechanism in it. You may not use it in a way that
+   subjects it to an open source license, nor in life-critical systems (avionics, navigation,
+   military, medical, life support).
+3. nvngx_dlss.dll is provided AS-IS. To the maximum extent permitted by law NVIDIA and its
+   affiliates disclaim all warranties and are not liable for special, incidental, punitive or
+   consequential damages; their total liability is limited to US$10.00.
+4. NVIDIA may update the DLSS runtime over the air on systems where it is installed.
+5. The license is governed by the laws of the United States and the State of Delaware.

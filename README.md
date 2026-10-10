@@ -14,9 +14,12 @@ menus.
 
 ## Play (testers)
 
-Download the latest `BloodborneVR-<version>.zip` from Releases, unzip it, double-click
-`BloodborneVR.exe` and follow the first-run questions. The zip's `README.txt` has the install
-steps, controls, known issues and how to report bugs. The controls are summarised below.
+**Download `BloodborneVR-<version>-Setup.exe` from Releases, run it** (SmartScreen: the alpha is not
+code-signed, so click **More info, then Run anyway**), then **Start menu, Bloodborne VR, choose your
+game folder, START VR**. It installs for your user only (no admin rights); uninstalling keeps your
+saves and settings. The same release has `BloodborneVR-<version>.zip`, the portable option: unzip it
+anywhere with write access and double-click `BloodborneVR.exe`. The zip's `README.txt` has the install
+steps, known issues and how to report bugs. The controls are summarised below.
 
 ## Controls
 
@@ -33,12 +36,12 @@ steps, controls, known issues and how to report bugs. The controls are summarise
 | Left trigger (hold) | Hold the gun (L2) |
 | Left-hand thrust forward (gun held) | Shoot |
 | Left grip (squeeze) | L1 (transform) |
-| A / B / X / Y | Circle (dodge, sprint) / Cross (interact) / Square (use quick item) / Triangle (blood vial) |
+| A / B / X / Y | Circle (dodge, sprint) / Cross (interact) / Square (use quick item) / Triangle (blood vial; also left hand at your mouth with the left grip held) |
 | Right stick click (tap) | Open the item wheel: pick with your right hand (touch or point) or the stick |
 | Left stick click while standing | Open the VR dashboard (equipment, items, options) |
 | Left stick click while moving | Jump |
 | Left stick click, held 1 s | Recenter |
-| Left menu button | Options (pause) |
+| Left menu button | Options (pause); held 1 s: recenter |
 | Swing at a staggered enemy | Visceral attack (stagger one with a gun parry, or a charged heavy from behind) |
 
 Lock-on is off by default: a right stick click opens the item wheel instead.
@@ -46,7 +49,20 @@ Lock-on is off by default: a right stick click opens the item wheel instead.
 **In the game's own menus** (Options, pause): either stick moves the cursor (hold to repeat), **A or either
 trigger** confirms, **B** goes back, and the menu button closes the menu.
 
-TODO: verify every row on the current build in the headset before release.
+## Physical items
+
+* Pick an item on the item wheel: it appears in your hand as a simple marker. Squeeze that hand's grip within 5 s to hold it; letting go without using it puts it back.
+* **Vials, pills and other drinkables:** bring it to your mouth to use it.
+* **Weapon buffs (paper, oil):** rub it along the blade with the other hand (the one without a weapon).
+* **Molotovs, throwing knives and the like:** swing and let go of the grip to throw; the throw is aimed from your hand.
+* Hits with your weapon and bounces off walls give a haptic pulse in the controller.
+* The grey hand markers and the gun laser are off by default.
+
+## Updating (keep your saves)
+
+* **Setup.exe:** run the new `BloodborneVR-<version>-Setup.exe`; it installs over the old version. Your saves and settings (`%LOCALAPPDATA%\BloodborneVR\user`) are kept, and uninstalling keeps them too.
+* **Zip:** extract the new zip into a new folder, then copy the old folder's `user\` folder (and `bbvr_config.json` if it exists) into it. You can also extract the new zip over the old folder (your `user\` folder is not part of the zip, so it stays). Optional: copy `out\` too to skip the first-start data build.
+* **From the zip to Setup.exe:** copy the zip folder's `user\savedata` to `%LOCALAPPDATA%\BloodborneVR\user\` (create the folder if needed) before the first start of the installed version.
 
 ## What works (see `docs/vr/`)
 
@@ -55,26 +71,29 @@ and weapons that follow the controllers, comfort dash and turning, stamina and s
 hit-shape scaling, VR menus (quick wheel, inventory, weapon wheel), hand-thrown goods in the
 sandbox. Research notes and design documents are in `docs/vr/findings/`.
 
+Setting: **Hitboxes** (dashboard, Combat): *Big* (default) enlarges your weapon's hit shapes, *Original* keeps the game's own; enemies are never changed.
+
 ## Build from source (Windows)
 
 1. Install MSYS2 and open the **CLANG64** shell. Packages: `packaging/windows/README.md`.
 2. `git clone --recursive <this repo>`, then `bash build.sh`
    (outputs in `out/`: `bb-probe.exe`, `bb-gpu-capabilities.exe`, `bbport_xr.dll`).
    `build.sh` also applies the patch series in `gpu/patches/fsr-vulkan/` to the `gpu/third_party/fsr-vulkan`
-   submodule (needed; the submodules are pinned in this repository). The optional DLSS bridge (`bbport_dlss.dll`,
-   needs NVIDIA's DLSS SDK; you supply it and `nvngx_dlss.dll` yourself) is not part of this repository yet.
+   submodule (needed; the submodules are pinned in this repository). The DLSS bridge source is in `gpu/dlss_bridge/` (MIT); it is built separately
+   against NVIDIA's DLSS SDK (not included). The binary release ships the built `bbport_dlss.dll` and NVIDIA's
+   `nvngx_dlss.dll` (see `THIRD_PARTY_NOTICES.md`).
 3. Run with your own dump:
    `BB_GAME_DIR=/c/games/CUSA03173 python run.py` (flat) or see `tools/release/zip/bbvr_launcher.py`
    for the VR environment variables.
-4. Package: `python tools/release/make_release.py` (needs the build output; see
-   `docs/RELEASE_CHECKLIST.md` if you are publishing).
+4. Package: `python tools/release/make_release.py` (needs the build output; run
+   `python tools/release/export_public.py` first, the packager reads its output).
 
 Unit tests are `EXCLUDE_FROM_ALL` targets in `gpu/CMakeLists.txt` and `gpu/xr_bridge/`.
 
 ## Help and bugs
 
 Use the issue templates. Attach `logs/bbvr-latest.log` and never post saves or game files.
-Crash reports are opt-in: `docs/CRASH_REPORTS.md`. Contributing: `CONTRIBUTING.md`.
+If the game crashes a report is saved on your PC and never sent automatically (`docs/CRASH_REPORTS.md`). Contributing: `CONTRIBUTING.md`.
 
 ## Licence
 

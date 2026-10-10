@@ -117,6 +117,46 @@ const sb::Hitboxes* GameHitboxes::WeaponBoxes(uint32_t game_id, std::string& log
     return w.boxes.attacks.empty() ? nullptr : &w.boxes;
 }
 
+bool GameHitboxes::BladeSegment(const BbXrGameState& s, int side, Vec3* base, Vec3* tip, bool* approx,
+                                std::string& log) {
+    const BbXrGameDebug& d = s.debug;
+    if (side < 0 || side > 1 || !(d.flags & BBXR_DEBUG_POSE) || !(d.weapon_valid & (1u << side)) ||
+        !(s.flags & BBXR_GAME_WEAPONS)) {
+        return false;
+    }
+    const uint32_t slot = side == 1 ? std::min<uint32_t>(s.weapon_active[0], 1)
+                                    : 2 + std::min<uint32_t>(s.weapon_active[1], 1);
+    const float* m = d.weapon[side];
+    *base = Apply(m, {0, 0, 0});
+    *tip = *base;
+    *approx = true;
+    const sb::Hitboxes* hb = WeaponBoxes(s.weapons[slot], log);
+    if (!hb) {
+        return true;
+    }
+    Weapon& w = weapons[IndexIdFor(s.weapons[slot])];
+    if (!w.tip_tried) {
+        w.tip_tried = true;
+        float best = 0.0f;
+        for (const sb::Attack& a : hb->attacks) {
+            for (const sb::HitShape& hit : a.hits) {
+                for (const sb::ShapePoint& p : hit.p) {
+                    if (!p.on_body && Length(p.pos) > best) {
+                        best = Length(p.pos);
+                        w.tip = p.pos;
+                        w.tip_ok = true;
+                    }
+                }
+            }
+        }
+    }
+    if (w.tip_ok) {
+        *tip = Apply(m, w.tip);
+        *approx = false;
+    }
+    return true;
+}
+
 void GameHitboxes::OnEvent(const BbXrGameEvent& e, double now) {
     if (e.kind == BBXR_EV_SWING_OPEN) {
         attack_atk = e.b;

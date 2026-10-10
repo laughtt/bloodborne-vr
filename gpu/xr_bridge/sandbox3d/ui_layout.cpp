@@ -163,6 +163,16 @@ const char* const kDefaultLayout = R"JSON({
             "label_s": 1.6},
     "haptics": {"tick_light": [0.2, 0.025], "tick_heavy": [0.4, 0.035], "hit_light": [0.6, 0.06],
                 "hit_heavy": [1.0, 0.12], "tired": [0.5, 0.05]},
+    "held_items": true,
+    "held": {"grab_squeeze": 0.6, "release_squeeze": 0.35, "pickup_grace_s": 5.0,
+             "mouth": [0.0, -0.10, -0.07], "mouth_radius_m": 0.12, "below_eyes_m": 0.03, "mouth_hold_s": 0.3,
+             "blade_radius_m": 0.10, "blade_start": 0.25, "blade_hold_s": 0.12, "blade_fallback_m": 0.18,
+             "throw_min_speed": 1.5, "throw_window_s": 0.08, "throw_peak_weight": 0.5,
+             "lockout_s": 0.8, "use_timeout_s": 4.0,
+             "pick_haptic": [0.3, 0.03], "use_haptic": [0.5, 0.05], "touch_haptic": [0.2, 0.03],
+             "cancel_haptic": [0.25, 0.04]},
+    "collision_haptics": {"on": true, "hit": [0.55, 0.07], "hit_strong": [1.0, 0.16], "wall": [0.9, 0.18],
+                          "object": [0.7, 0.12], "strength_ref": 40, "scale_by_strength": true},
     "menus": [
       {"name": "dashboard", "type": "dashboard", "label": "Dashboard", "open": "l3",
        "mode": "toggle", "columns": 10, "rows": 2, "cell": 0.055, "distance": 0.75,
@@ -557,6 +567,57 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
         Read(p["hit_light"], game.hit_light);
         Read(p["hit_heavy"], game.hit_heavy);
         Read(p["tired"], game.tired);
+        Read(g["held_items"], game.held_items);
+        {
+            const json::Value& hv = g["held"];
+            UiHeldItems& hi = game.held;
+            Read(hv["grab_squeeze"], hi.grab_squeeze);
+            Read(hv["release_squeeze"], hi.release_squeeze);
+            Read(hv["pickup_grace_s"], hi.pickup_grace_s);
+            Read(hv["hold"], hi.hold);
+            Read(hv["mouth"], hi.mouth);
+            Read(hv["mouth_radius_m"], hi.mouth_radius_m);
+            Read(hv["below_eyes_m"], hi.below_eyes_m);
+            Read(hv["mouth_hold_s"], hi.mouth_hold_s);
+            Read(hv["blade_radius_m"], hi.blade_radius_m);
+            Read(hv["blade_start"], hi.blade_start);
+            Read(hv["blade_hold_s"], hi.blade_hold_s);
+            Read(hv["blade_fallback_m"], hi.blade_fallback_m);
+            Read(hv["throw_min_speed"], hi.throw_min_speed);
+            Read(hv["throw_window_s"], hi.throw_window_s);
+            Read(hv["throw_peak_weight"], hi.throw_peak_weight);
+            Read(hv["lockout_s"], hi.lockout_s);
+            Read(hv["use_timeout_s"], hi.use_timeout_s);
+            Read(hv["pick_haptic"], hi.pick);
+            Read(hv["use_haptic"], hi.use);
+            Read(hv["touch_haptic"], hi.touch);
+            Read(hv["cancel_haptic"], hi.cancel);
+            hi.grab_squeeze = std::clamp(hi.grab_squeeze, 0.1f, 1.0f);
+            hi.release_squeeze = std::clamp(hi.release_squeeze, 0.0f, hi.grab_squeeze);
+            hi.pickup_grace_s = std::clamp(hi.pickup_grace_s, 0.5f, 30.0f);
+            hi.mouth_radius_m = std::clamp(hi.mouth_radius_m, 0.03f, 0.5f);
+            hi.mouth_hold_s = std::clamp(hi.mouth_hold_s, 0.0f, 3.0f);
+            hi.blade_radius_m = std::clamp(hi.blade_radius_m, 0.02f, 0.5f);
+            hi.blade_start = std::clamp(hi.blade_start, 0.0f, 0.9f);
+            hi.blade_hold_s = std::clamp(hi.blade_hold_s, 0.0f, 3.0f);
+            hi.throw_min_speed = std::clamp(hi.throw_min_speed, 0.3f, 15.0f);
+            hi.throw_window_s = std::clamp(hi.throw_window_s, 0.02f, 0.3f);
+            hi.throw_peak_weight = std::clamp(hi.throw_peak_weight, 0.0f, 1.0f);
+            hi.lockout_s = std::clamp(hi.lockout_s, 0.0f, 5.0f);
+            hi.use_timeout_s = std::clamp(hi.use_timeout_s, 1.0f, 20.0f);
+        }
+        {
+            const json::Value& cv = g["collision_haptics"];
+            UiCollisionHaptics& ch = game.collision_haptics;
+            Read(cv["on"], ch.on);
+            Read(cv["hit"], ch.hit);
+            Read(cv["hit_strong"], ch.hit_strong);
+            Read(cv["wall"], ch.wall);
+            Read(cv["object"], ch.object);
+            Read(cv["strength_ref"], ch.strength_ref);
+            Read(cv["scale_by_strength"], ch.scale_by_strength);
+            ch.strength_ref = std::clamp(ch.strength_ref, 1.0f, 500.0f);
+        }
     }
 }
 

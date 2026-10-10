@@ -1,0 +1,9 @@
+Bloodborne VR (alpha, single-player)
+
+* You must own Bloodborne. This program contains NO game files and never uploads any: it runs YOUR own legally obtained, decrypted dump of Bloodborne (PS4, CUSA03173, version 1.09). Do not ask for, post or link to dumps.
+* This program uses NVIDIA DLSS (NVIDIA RTX GPUs only; other GPUs use FSR). NVIDIA's nvngx_dlss.dll is included unmodified under the NVIDIA RTX SDKs LICENSE; by installing you accept that the DLSS files stay NVIDIA's property, may not be reverse engineered, modified or redistributed on their own, and are provided AS-IS without warranty (licenses/NVIDIA-DLSS-NOTICE.txt and NVIDIA-DLSS-LICENSE.txt in the install folder). Not sponsored or endorsed by NVIDIA.
+* This is an alpha release for the single-player game only: expect bugs and comfort problems.
+* Unofficial fan project, not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne are trademarks of their owners.
+* Your saves, settings, logs and crash reports are kept in %LOCALAPPDATA%\BloodborneVR and survive upgrades and uninstalling. Nothing is sent automatically, crash reports included.
+
+Next you will see the licence (GPL).

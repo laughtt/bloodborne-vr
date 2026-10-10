@@ -30,6 +30,20 @@ static inline VrVec3 vg_aim_in_world(VrQuat head_xr, VrQuat pose_xr, const float
     return vam_norm(w, vr_v3(0, 0, 0));
 }
 
+/* A vector given in the head's frame (OpenXR axes: +X right, +Y up, -Z forward; the bridge's
+ * conj(head) * v) in the game world, through the same first-person camera rows as vg_aim_in_world.
+ * A direction needs no more; a position adds the camera's position (vg_rel_pos_to_world). */
+static inline VrVec3 vg_rel_dir_to_world(VrVec3 rel_xr, const float rows[3][4]) {
+    const VrVec3 rel = vr_xr_to_game_vec(rel_xr);
+    const VrVec3 r = vr_v3(rows[0][0], rows[0][1], rows[0][2]);
+    const VrVec3 u = vr_v3(rows[1][0], rows[1][1], rows[1][2]);
+    const VrVec3 f = vr_v3(rows[2][0], rows[2][1], rows[2][2]);
+    return vr_add(vr_add(vr_scale(r, rel.x), vr_scale(u, rel.y)), vr_scale(f, rel.z));
+}
+static inline VrVec3 vg_rel_pos_to_world(VrVec3 rel_xr, const float rows[3][4], VrVec3 cam_pos) {
+    return vr_add(cam_pos, vg_rel_dir_to_world(rel_xr, rows));
+}
+
 /* An XR pose turned by `pitch_deg` about its own +X (positive: the ray up), for a grip used as the
  * pointer when the runtime gives no aim pose. */
 static inline VrQuat vg_pitched(VrQuat pose_xr, float pitch_deg) {
@@ -116,6 +130,38 @@ static inline float vg_redirect(float m[3][4], float *target, VrVec3 aim, int mo
     }
     if (new_dir) *new_dir = vam_norm(vg_launch_axis(cm, 2), vr_v3(0, 0, 1));
     return vg_angle_deg(game, aim);
+}
+
+/* The throw mode of the launch hook (findings/39): a thrown item leaves the hand, not the character's
+ * muzzle, along the release direction. Turns the launch matrix so its Z axis is `dir` (unit, world)
+ * with no roll (vg_redirect's pitch-then-yaw) and moves its position to `origin`, unless that is
+ * more than `max_shift` meters from the game's own muzzle (a wrong camera/world assumption then
+ * keeps the game's origin: *moved = 0). The aim point (`target`, 3 floats, may be NULL: a lock-on
+ * has none) goes `dir` x its old distance from the muzzle (10 m when it had none) ahead of the new
+ * origin. Returns the turn's angle in degrees; *old_dir / *new_dir (may be NULL) the launch's own
+ * direction before and after. */
+static inline float vg_throw_launch(float m[3][4], float *target, VrVec3 origin, VrVec3 dir, float max_shift, int *moved,
+                                    VrVec3 *old_dir, VrVec3 *new_dir) {
+    const VrVec3 old_o = vg_launch_origin((const float (*)[4])m);
+    float dist = 10.0f;
+    if (target) {
+        const float d = vam_len(vr_sub(vr_v3(target[0], target[1], target[2]), old_o));
+        if (d >= 0.05f && d <= 100.0f) dist = d;
+    }
+    const float turn = vg_redirect(m, NULL, dir, VG_REF_FORWARD, 0.0f, NULL, old_dir, new_dir);
+    const int ok = vam_len(vr_sub(origin, old_o)) <= max_shift;
+    if (moved) *moved = ok;
+    const VrVec3 o = ok ? origin : old_o;
+    m[0][3] = o.x;
+    m[1][3] = o.y;
+    m[2][3] = o.z;
+    if (target) {
+        const VrVec3 p = vr_add(o, vr_scale(dir, dist));
+        target[0] = p.x;
+        target[1] = p.y;
+        target[2] = p.z;
+    }
+    return turn;
 }
 
 /* Bullet id filter: "all", or comma separated ids and ranges ("500-999,1100"). Returns 1 when `id`

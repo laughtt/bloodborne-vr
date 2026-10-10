@@ -53,6 +53,12 @@ public:
     void Draw(sb::UiCanvas& canvas, const sb::UiDebugHitboxes& cfg, const BbXrGameState& s,
               double now, m3::Vec3 eye, std::string& log);
 
+    /// The blade of the weapon held in `side` (0 left, 1 right) as a segment in the headset's space:
+    /// the weapon bone's origin to the farthest hit-shape point of the weapon's hitboxes. `approx`
+    /// is set (base == tip == the bone) when the weapon has no hitbox data. False without a pose.
+    bool BladeSegment(const BbXrGameState& s, int side, m3::Vec3* base, m3::Vec3* tip, bool* approx,
+                      std::string& log);
+
     /// The index entry for a game weapon id (upgrades and variants fall back to the base row);
     /// -1 when the data has none.
     int IndexIdFor(uint32_t game_id) const;
@@ -62,6 +68,8 @@ private:
     struct Weapon {
         bool tried = false;
         sb::Hitboxes boxes;
+        bool tip_tried = false, tip_ok = false;
+        m3::Vec3 tip; // the farthest weapon-space point of any hit shape (the blade's end)
     };
     const sb::Hitboxes* WeaponBoxes(uint32_t game_id, std::string& log);
 

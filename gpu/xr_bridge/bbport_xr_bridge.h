@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define BBPORT_XR_BRIDGE_ABI 8u
+#define BBPORT_XR_BRIDGE_ABI 9u
 
 /* Pad buttons, the PS4 pad bit layout (sceePadReadState). */
 #define BBXR_BTN_L3 0x2u
@@ -221,6 +221,7 @@ typedef struct BbXrEyeView {
 #define BBXR_GAME_BUSY 0x20u      /* the host is pressing buttons for an action (TakeUiActions) */
 #define BBXR_GAME_CAN_EQUIP 0x40u /* the equip hook runs: EQUIP_ITEM and ASSIGN_QUICK are possible */
 #define BBXR_GAME_MENU_OPEN 0x80u /* the game's own menu (pause / Options, inventory...) is open: the filter turns the sticks into d-pad navigation */
+#define BBXR_GAME_PRE_WORLD 0x100u /* no player character (title, character creation, loading, system dialogs): the sticks are the d-pad there; the world UI stays off */
 #define BBXR_GAME_MAX_QUICK 8u
 #define BBXR_GAME_MAX_ITEMS 320u
 #define BBXR_ITEM_GOODS 0x40000000u
@@ -300,6 +301,11 @@ typedef struct BbXrGameState {
                                    gave up (c the reason: 1 not found, 2 timeout, 3 not allowed,
                                    4 the equip hook is not installed, 5 the game did not take it,
                                    6 a game menu is open) */
+#define BBXR_EV_WEAPON_CONTACT 5u /* the player's weapon touched something the stamina ticket path did
+                                   not announce (no open ticket, a repeat): a the cost of the attack
+                                   when known (0 unknown), b contact (0 character, 1 wall, 2 object),
+                                   c hand (0 left, 1 right). Haptics only: the stamina readout ignores
+                                   it. An older bridge ignores unknown events. */
 
 typedef struct BbXrGameEvent {
     uint32_t kind;
@@ -322,10 +328,37 @@ typedef struct BbXrGameEvent {
 #define BBXR_UI_CLEAR_QUICK 8u  /* empty quick slot a (0..5; item b is what the dashboard saw there): the
                                    slot's inventory index is set to -1 on the game thread */
 
+/* Physical items (docs/vr/findings/39-physical-items-plan.md): before the USE_QUICK of a thrown item
+ * the bridge sends where and along what the hand let go, in the head's frame (OpenXR axes: +X right,
+ * +Y up, -Z forward; the head's pose at that frame), so the host can aim the game's bullet once the
+ * throw animation launches it (src/runtime_vr_gun.c throw mode). USE_QUICK's c then carries the
+ * release speed in cm/s (0 otherwise). */
+#define BBXR_UI_THROW_ORIGIN 9u /* the hand's position relative to the head: a, b, c = x, y, z in mm */
+#define BBXR_UI_THROW_DIR 10u   /* the release direction, unit: a, b, c = x, y, z times 10000 */
+/* The BulletParam rows the throw mode may redirect (flying thrown goods only: never the cures
+ * Antidote 200, Sedative 230, Lead Elixir 320 or the rope molotovs 110/114, which spawn at the
+ * player). From the dump's throwables with a range and a launch speed; override: BB_VR_THROW_IDS. */
+#define BBXR_THROW_BULLET_IDS "100,105,120,121,150,170,180,410,460,470"
+
 typedef struct BbXrUiAction {
     uint32_t kind;
     int32_t a, b, c;
 } BbXrUiAction;
+
+/* ABI 9: the VR UI in the desktop window (BB_XR_MIRROR_UI, docs/vr/findings/26-game-ui.md). The
+ * bridge draws the game's VR UI once more, from the view the latest flat (mono) image was rendered
+ * with (ReleaseFlatView), into images of its own: premultiplied alpha, transparent where there is
+ * no UI, left in SHADER_READ_ONLY_OPTIMAL. GetMirrorUi hands the host the latest finished one; the
+ * host blends it over the game image in the window. Only the used part uv_w x uv_h (0..1 of
+ * width x height, from the top left) is the picture; it has the aspect of the frame's frustum.
+ * The image stays valid for ~2 UI frames after the call (the bridge cycles 3 images). */
+typedef struct BbXrMirrorUi {
+    VkImage image;
+    VkFormat view_format; /* a UNORM view of the image shows the stored (sRGB-encoded) values */
+    uint32_t width, height;
+    float uv_w, uv_h;
+    uint64_t seq;
+} BbXrMirrorUi;
 
 /// level: 0 info, 1 warning, 2 error.
 typedef void (*BbXrLogFn)(int level, const char* message);
@@ -412,6 +445,9 @@ typedef struct BbXrApi {
     void (*GameEvent)(const BbXrGameEvent* event);
     /// The user's choices since the last call, oldest first; returns how many were written.
     uint32_t (*TakeUiActions)(BbXrUiAction* out, uint32_t capacity);
+    /* ABI 9: the VR UI for the desktop window. Any thread. Returns 1 with `out` filled when a
+     * fresh mirror image exists, 0 otherwise (off, no menu drawn, no flat view). */
+    int (*GetMirrorUi)(BbXrMirrorUi* out);
 } BbXrApi;
 
 typedef const BbXrApi* (*BbXrGetApiFn)(void);

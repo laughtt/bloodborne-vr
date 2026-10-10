@@ -4,7 +4,7 @@
 gpu/third_party/imgui) with the MSYS2 CLANG64 toolchain. SDL3 and the C++ runtime are linked
 statically: one self-contained exe (--copy-dlls also copies SDL3.dll, only needed for a dynamic build).
 
-    python tools/release/build_dashboard.py [--version 0.1.0-alpha3] [--out out/launcher/BloodborneVR.exe] [--copy-dlls]
+    python tools/release/build_dashboard.py [--version 0.1.0-alpha5] [--out out/launcher/BloodborneVR.exe] [--copy-dlls]
 Object files are cached in out/launcher/obj (only changed sources are rebuilt). C++ runtime is linked statically.
 """
 import argparse

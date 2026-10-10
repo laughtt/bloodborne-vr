@@ -75,20 +75,16 @@ def find_executable(name):
 
 
 def run_game(command, user_dir, env):
-    """Starts the game. Crash reports (scripts/crash_report.py, docs/CRASH_REPORTS.md): unless they
-    are off, the output is copied to the console and its last lines are kept; after an abnormal end
-    (nonzero exit or a new <user>/crashes folder) the report is built, scrubbed and, with the
-    player's consent, uploaded. BB_CRASH_REPORTS=off (or crash_config.json) restores the plain launch."""
+    """Starts the game. Crash reports (scripts/crash_report.py, docs/CRASH_REPORTS.md): the output is copied
+    to the console and its last lines are kept; after an abnormal end (nonzero exit or a new <user>/crashes
+    folder) a scrubbed report is saved in %LOCALAPPDATA%/BloodborneVR/crashes. Nothing is ever sent."""
     sys.path.insert(0, str(PORT / 'scripts'))
     try:
         import crash_report
-        mode = crash_report.load_config(user_dir)['crash_reports']
     except Exception:
-        crash_report, mode = None, 'off'
+        crash_report = None
     # No stdin: an inherited pipe (shells such as Git Bash) cost the game its console output.
-    if mode == 'off' or env.get('BB_LOG_TEE') == '0':
-        if mode == 'off':
-            env['BB_CRASH_CAPTURE'] = '0'
+    if crash_report is None or env.get('BB_LOG_TEE') == '0':
         return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
     import collections
     import threading

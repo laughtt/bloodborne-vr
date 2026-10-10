@@ -610,3 +610,7 @@ wheel open, pick, put back, use, throw, buff and expiry prints a line and append
   - No textures (`*.tpf`): flat colors per part.
   - No MSAA.
 - **Hot reload.** Code changes still need a restart; only the config reloads live (12 §2 has the plan for logic hot reload).
+
+## VR UI in the desktop window (bridge only)
+
+The bridge (not this sandbox) can draw the game's VR UI into the desktop mirror window for screen recordings: `BB_XR_MIRROR_UI=1` (default with `BB_XR_MODE=mono`; live file `bb_xr_mirror_ui.txt`). The UI code here (`ui_render`, `Draw(cmd, view_proj, format)`) is drawn a third time from the mono camera into an image the host blends over the window. Math and its tests: `../vr_mirror_ui.h`, `../vr_game_ui_test.cpp` (`TestMirrorProjection`). See `docs/vr/findings/26-game-ui.md`.

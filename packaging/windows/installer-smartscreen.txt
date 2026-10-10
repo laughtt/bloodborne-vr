@@ -1,0 +1,7 @@
+Installed. Two things to know:
+
+1. Windows SmartScreen. The alpha is not code-signed (no certificate yet), so Windows may say "Windows protected your PC" the first time you start BloodborneVR.exe. Click "More info", then "Run anyway". If Windows 11 "Smart App Control" blocks the program outright, turn that off. The SHA-256 sums of the downloads are in SHA256SUMS.txt on the release page.
+
+2. First start. Open "Bloodborne VR" from the Start menu, accept the note, choose the folder of YOUR game dump (the one that contains eboot.bin) and press START VR. Make your headset software the active OpenXR runtime first.
+
+If the game crashes, a report is saved in %LOCALAPPDATA%\BloodborneVR\crashes. Nothing is sent automatically; send the file to the developer if you want to help.

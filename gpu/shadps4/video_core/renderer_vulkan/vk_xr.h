@@ -87,6 +87,14 @@ public:
     void SetGameState(const void* state, u32 size);
     void GameEvent(u32 kind, s32 a, s32 b, s32 c);
     u32 TakeUiActions(void* out, u32 capacity);
+    /// The VR UI for the desktop window (bridge ABI 9, BB_XR_MIRROR_UI): the latest finished
+    /// image (premultiplied alpha, SHADER_READ_ONLY_OPTIMAL) or nothing. Present thread.
+    struct MirrorUi {
+        vk::Image image;
+        vk::Format view_format; // a UNORM view of the image
+        float uv_w, uv_h;       // the used top-left part of the image
+    };
+    std::optional<MirrorUi> LatestMirrorUi();
 
     /// Head tracking (Phase 2 groundwork): the head and eyes for the headset's latest predicted
     /// display time, in the world space of the headset screen (meters; orientation x, y, z, w).

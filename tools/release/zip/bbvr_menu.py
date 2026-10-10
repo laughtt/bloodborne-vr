@@ -47,25 +47,21 @@ class Menu:
         self.httpd = None
         self.thread = None
         self.status = ''
-        self.user_dir = self.settings_path.parent  # where crash_config.json lives (same as run.py's user dir)
         self.crash = crash_module(paths['port'])
 
-    # -- crash-report consent (first launch asks in the page; run.py then never needs the console)
+    # -- crash reports: always saved on this PC, never sent (docs/CRASH_REPORTS.md)
     def crash_state(self):
         if not self.crash:
-            return {'available': False, 'asked': True, 'mode': 'off'}
-        mode = self.crash.load_config(self.user_dir)['crash_reports']
-        return {'available': True, 'asked': self.crash.consent_stored(self.user_dir), 'mode': mode}
-
-    def set_crash_mode(self, mode):
-        if self.crash and mode in ('on', 'off'):
-            self.crash.save_mode(self.user_dir, mode)
+            return {'available': False, 'dir': '', 'count': 0, 'latest': ''}
+        reports = self.crash.list_reports()
+        return {'available': True, 'dir': str(self.crash.store_dir()), 'count': len(reports),
+                'latest': str(reports[-1]) if reports else ''}
 
     # -- state shared with the page
     def state(self):
         with self.lock:
             st = S.page_state(self.settings, self.caps)
-            values = S.effective_values(self.settings)
+            values = S.effective_values(self.settings, self.caps)
             plan = S.build_launch(values, self.paths, self.caps)
             st['warnings'] = list(plan['warnings'])
             chosen = values.get('runtime') or ''
@@ -86,14 +82,14 @@ class Menu:
                 self.settings['profile'] = profile if profile in S.PROFILE_ORDER else self.settings['profile']
                 if self.settings['profile'] == 'Custom' and not self.settings.get('custom'):
                     self.settings['custom'] = {k: v for k, v in S.effective_values(
-                        dict(self.settings, profile='Default')).items()}
+                        dict(self.settings, profile='Default'), self.caps).items()}
             elif 'values' in body:
-                self.settings = S.apply_edit(self.settings, body['values'], profile if profile else None)
+                self.settings = S.apply_edit(self.settings, body['values'], profile if profile else None, self.caps)
             if 'show_menu' in body:
                 self.settings['show_menu'] = bool(body['show_menu'])
             S.save_settings(self.settings_path, self.settings)
             if self.game_running:
-                plan = S.build_launch(S.effective_values(self.settings), self.paths, self.caps)
+                plan = S.build_launch(S.effective_values(self.settings, self.caps), self.paths, self.caps)
                 changed = S.apply_files(plan, self.paths)
                 self.status = 'Applied live: ' + ', '.join(Path(c).name for c in changed) if changed else 'Saved'
             else:
@@ -164,9 +160,6 @@ class Menu:
                 path = urlparse(self.path).path
                 if path == '/api/save':
                     menu.update(body)
-                    self._json(menu.state())
-                elif path == '/api/crash':
-                    menu.set_crash_mode(body.get('mode'))
                     self._json(menu.state())
                 elif path == '/api/launch':
                     menu.update(body)
@@ -304,13 +297,10 @@ button.quit{background:var(--high)}
 <div class="hero"><div class="logo">BB</div><div class="brand"><h1>Bloodborne <span class="tag">VR</span></h1>
 <div class="sub">Settings and start-up for Bloodborne in VR</div></div>
 <div class="herop"><span class="pill" id="runpill"><i></i><span id="runtxt">Ready</span></span><button class="start sm" id="start">Start VR</button><button class="quit" id="quit">Quit</button></div></div>
-<div id="consent" class="consent" hidden><div class="consentbox"><b>Help fix crashes?</b>
-<p>If the game crashes, it can send an anonymous crash report to the developer: a small crash dump, the fault address, the build id and the last lines of the log, with your user name, folders, IP addresses and PSN ids removed. No game files, saves or settings. You can look at the report on your PC first, and change this later with the "send crash reports" switch under the tabs.</p>
-<p><button class="start" id="crashyes">Yes, send crash reports</button> <button id="crashno">No, keep them on my PC</button></p></div></div>
 <nav id="tabs"></nav>
 <div class="bar"><label class="chk"><input type="checkbox" id="adv"> advanced options</label>
 <label class="chk"><input type="checkbox" id="showmenu" checked> show this menu next time</label>
-<label class="chk" id="crashwrap" hidden><input type="checkbox" id="crashbox"> send crash reports</label>
+<span class="status" id="crashnote" hidden></span>
 <span class="status" id="status"></span></div>
 <main><div id="banners"></div><div id="card"></div></main>
 <script>
@@ -319,8 +309,7 @@ const $=id=>document.getElementById(id);
 const el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!==undefined)e.textContent=txt;return e};
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-BB-Token':TOKEN,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw new Error(r.status);return r.json()}
 function applyState(s){S=s;values=Object.assign({},s.values);render()}
-function renderCrash(){const c=S.crash||{available:false,asked:true};$('consent').hidden=!(c.available&&!c.asked);$('crashwrap').hidden=!(c.available&&c.asked);$('crashbox').checked=c.mode==='on'}
-async function crashMode(m){try{applyState(await api('/api/crash',{mode:m}))}catch(e){$('status').textContent='save failed'}}
+function renderCrash(){const c=S.crash||{available:false};const n=$('crashnote');n.hidden=!c.available;n.textContent=c.available?'crash reports: '+c.count+' saved in '+c.dir+' (never sent automatically)':''}
 function chk(parent,state,title,detail){const r=el('div','row');const l=el('div','lab chk-row');l.appendChild(el('span','dot '+state,state==='ok'?'✓':'!'));const t=el('div');t.appendChild(el('b',null,title));t.appendChild(el('div','hint',detail));l.appendChild(t);r.appendChild(l);parent.appendChild(r);return r}
 function renderPlay(card){
  const pc=el('div','card');pc.appendChild(el('h2','cap','This PC'));
@@ -381,8 +370,6 @@ function render(){
  if(!box.querySelector('.row'))box.appendChild(el('div','hint','Nothing here (switch on "advanced options" for more).'));
 }
 $('adv').onchange=render;
-$('crashyes').onclick=()=>crashMode('on');$('crashno').onclick=()=>crashMode('off');
-$('crashbox').onchange=()=>crashMode($('crashbox').checked?'on':'off');
 $('showmenu').onchange=async()=>{applyState(await api('/api/save',{show_menu:$('showmenu').checked}))};
 let startBusy=false;
 function setBusy(b){startBusy=b;document.querySelectorAll('.start.go,#start').forEach(x=>x.disabled=b)}

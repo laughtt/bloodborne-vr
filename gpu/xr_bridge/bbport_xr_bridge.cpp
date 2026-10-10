@@ -46,6 +46,7 @@
 #include <openxr/openxr_platform.h>
 
 #include "vr_game_ui.h"
+#include "vr_mirror_ui.h"
 #include "vr_ui_layer.h"
 #include "xr_hud.h"
 #include "xr_input.h"
@@ -208,6 +209,17 @@ struct Bridge {
     bool ui_layer = true;           // the runtime has not refused the layer
     bool ui_logged = false;
     std::chrono::steady_clock::time_point ui_released_at{};
+    // The VR UI in the desktop window (ABI 9, BB_XR_MIRROR_UI, vr_mirror_ui.h): the UI thread
+    // draws it once more from the view the flat image was rendered with into a ring of 3 images.
+    // pending: submitted, not known finished; ready: finished (guarded by state_mutex).
+    bool mirror_on = false;         // BB_XR_MIRROR_UI / bb_xr_mirror_ui.txt (UI thread only)
+    bool mirror_logged = false;
+    int mirror_next = 0;
+    int mirror_pending = -1, mirror_ready = -1;
+    BbXrMirrorUi mirror_pending_info{}, mirror_ready_info{};
+    std::chrono::steady_clock::time_point mirror_ready_at{}, mirror_file_polled{};
+    uint64_t mirror_seq = 0;
+    std::chrono::steady_clock::time_point flat_view_at{}; // when flat_view was set
 
     // Filled once at StartSession: the compositor keeps showing a chain's last released image.
     Chain background_eyes[2];
@@ -1789,6 +1801,18 @@ bool PrepareUiChains(uint32_t width, uint32_t height) {
     return true;
 }
 
+/// The UNORM format of an sRGB one (the desktop mirror is sampled as stored).
+VkFormat UnormOf(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    default:
+        return format;
+    }
+}
+
 /// The UI thread: one update per headset frame, rendered for the views one display period ahead
 /// (as AcquireStereo), so the runtime shows it with the head and hands it was drawn for.
 void UiLoop() {
@@ -1860,10 +1884,39 @@ void UiLoop() {
         if (!g->ui_gpu.Wait(30'000'000)) {
             continue;
         }
+        {
+            // The previous mirror image is finished now.
+            std::scoped_lock lock{g->state_mutex};
+            if (g->mirror_pending >= 0) {
+                g->mirror_ready = g->mirror_pending;
+                g->mirror_ready_info = g->mirror_pending_info;
+                g->mirror_ready_at = std::chrono::steady_clock::now();
+                g->mirror_pending = -1;
+            }
+        }
+        // Live knob: bb_xr_mirror_ui.txt (0|1|on|off), polled once a second.
+        if (const auto polled = std::chrono::steady_clock::now();
+            polled - g->mirror_file_polled > std::chrono::seconds(1)) {
+            g->mirror_file_polled = polled;
+            if (std::FILE* f = std::fopen("bb_xr_mirror_ui.txt", "rb")) {
+                char word[16] = {};
+                std::fread(word, 1, sizeof(word) - 1, f);
+                std::fclose(f);
+                const bool on = word[0] == '1' || word[0] == 'o' && word[1] == 'n' ||
+                                word[0] == 't' || word[0] == 'y';
+                const bool off = word[0] == '0' || word[0] == 'o' && word[1] == 'f' ||
+                                 word[0] == 'f' || word[0] == 'n';
+                if ((on || off) && on != g->mirror_on) {
+                    g->mirror_on = on;
+                    Log(0, "VR UI mirror: %s (bb_xr_mirror_ui.txt)", on ? "on" : "off");
+                }
+            }
+        }
         const bool draw = g->game_ui->Build();
         if (!draw || !g->visible || !views.next_valid || !g->ui_layer) {
             std::scoped_lock lock{g->state_mutex};
             g->ui_shown = false;
+            g->mirror_ready = -1;
             continue;
         }
         const uint32_t width =
@@ -1904,8 +1957,55 @@ void UiLoop() {
                                          {v.pose.position.x, v.pose.position.y,
                                           v.pose.position.z}));
         }
+        // The desktop mirror: the same UI from the view the latest flat image was rendered with
+        // (mono only: alternate-eye frames have no single view).
+        vrui::MirrorTarget mirror_target{};
+        int mirror_slot = -1;
+        BbXrMirrorUi mirror_info{};
+        {
+            BbXrFlatView fv{};
+            bool fv_ok = false;
+            {
+                std::scoped_lock lock{g->state_mutex};
+                fv_ok = g->mirror_on && g->mono && g->flat_view_valid && g->flat.released &&
+                        std::chrono::steady_clock::now() - g->flat_view_at <
+                            std::chrono::milliseconds(500);
+                fv = g->flat_view;
+            }
+            if (fv_ok) {
+                const vrmirror::Fov fov{fv.fov.left, fv.fov.right, fv.fov.up, fv.fov.down};
+                constexpr uint32_t kMirrorMaxW = 1920, kMirrorMaxH = 1080;
+                uint32_t mw = 0, mh = 0;
+                vrmirror::ImageSize(fov, kMirrorMaxW, kMirrorMaxH, &mw, &mh);
+                if (g->ui_gpu.EnsureMirror(format, kMirrorMaxW, kMirrorMaxH)) {
+                    mirror_slot = g->mirror_next;
+                    g->mirror_next = (g->mirror_next + 1) % 3;
+                    mirror_target.image = g->ui_gpu.MirrorImage(mirror_slot);
+                    mirror_target.width = mw;
+                    mirror_target.height = mh;
+                    mirror_target.view_proj = vrmirror::ViewProj(
+                        {fv.head.orientation[0], fv.head.orientation[1], fv.head.orientation[2],
+                         fv.head.orientation[3]},
+                        {fv.head.position[0], fv.head.position[1], fv.head.position[2]}, fov);
+                    mirror_info.image = mirror_target.image;
+                    mirror_info.view_format = UnormOf(format);
+                    mirror_info.width = kMirrorMaxW;
+                    mirror_info.height = kMirrorMaxH;
+                    mirror_info.uv_w = float(mw) / float(kMirrorMaxW);
+                    mirror_info.uv_h = float(mh) / float(kMirrorMaxH);
+                } else {
+                    Log(1, "VR UI mirror: %s: off", g->ui_gpu.LastError().c_str());
+                    g->mirror_on = false;
+                }
+            }
+            if (mirror_slot < 0) {
+                std::scoped_lock lock{g->state_mutex};
+                g->mirror_ready = -1;
+            }
+        }
         const bool rendered =
-            g->ui_gpu.Render(*g->game_ui, images, format, width, height, view_proj);
+            g->ui_gpu.Render(*g->game_ui, images, format, width, height, view_proj,
+                             mirror_slot >= 0 ? &mirror_target : nullptr);
         if (!rendered && (++failures <= 5 || failures % 1000 == 0)) {
             Log(2, "VR UI: %s (%u times)", g->ui_gpu.LastError().c_str(), failures);
         }
@@ -1914,6 +2014,17 @@ void UiLoop() {
         for (Chain& chain : g->ui_chain) {
             EndWrite(chain); // released even when nothing was drawn (the spec wants it)
             released = released && chain.released;
+        }
+        if (rendered && mirror_slot >= 0) {
+            mirror_info.seq = ++g->mirror_seq;
+            g->mirror_pending = mirror_slot;
+            g->mirror_pending_info = mirror_info;
+            if (!g->mirror_logged) {
+                g->mirror_logged = true;
+                Log(0, "VR UI mirror: first image for the desktop window (%.0f x %.0f px)",
+                    mirror_info.uv_w * float(mirror_info.width),
+                    mirror_info.uv_h * float(mirror_info.height));
+            }
         }
         if (rendered && released) {
             g->ui_views[0] = views.next_views[0];
@@ -1934,6 +2045,8 @@ void StartGameUi() {
         return;
     }
     g->ui_scale = std::clamp(EnvFloat("BB_VR_UI_SCALE", 0.5f), 0.2f, 1.0f);
+    // The menus in the desktop window, for recordings: on by default in mono mode.
+    g->mirror_on = EnvFlag("BB_XR_MIRROR_UI", g->mono);
     sb::Renderer::Device device;
     device.instance = g->vk.instance;
     device.physical = g->vk.physical_device;
@@ -2157,6 +2270,7 @@ void ReleaseFlatWith(const BbXrFlatView* view) {
     g->flat_view_valid = rendered_view;
     if (rendered_view) {
         g->flat_view = *view;
+        g->flat_view_at = std::chrono::steady_clock::now();
     }
     std::scoped_lock views_lock{g_views_mutex};
     g->flat_views[0] = g_published.views[0];
@@ -2620,6 +2734,19 @@ uint32_t TakeUiActions(BbXrUiAction* out, uint32_t capacity) {
     return g && g->game_ui && out ? g->game_ui->TakeActions(out, capacity) : 0;
 }
 
+int GetMirrorUi(BbXrMirrorUi* out) {
+    if (!g || !out) {
+        return 0;
+    }
+    std::scoped_lock lock{g->state_mutex};
+    if (g->mirror_ready < 0 || !g->mirror_ready_info.image ||
+        std::chrono::steady_clock::now() - g->mirror_ready_at > std::chrono::milliseconds(250)) {
+        return 0;
+    }
+    *out = g->mirror_ready_info;
+    return 1;
+}
+
 int GetViews(BbXrViews* out) {
     std::scoped_lock lock{g_views_mutex};
     *out = g_published.api;
@@ -2631,7 +2758,7 @@ const BbXrApi kApi = {
     StartSession,         AcquireFlat,   ReleaseFlat,        Shutdown,       GetInput,
     XrInput::Haptic,      GetViews,      AcquireStereo,      ReleaseStereo,
     ReleaseFlatView,      AcquireEye,    ReleaseEye,         AcquireHud,     ReleaseHud,
-    HideHud,              SetGameState,  GameEvent,          TakeUiActions,
+    HideHud,              SetGameState,  GameEvent,          TakeUiActions, GetMirrorUi,
 };
 
 } // namespace

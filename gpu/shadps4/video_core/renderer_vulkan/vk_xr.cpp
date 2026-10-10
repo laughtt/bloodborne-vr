@@ -428,6 +428,17 @@ u32 Xr::TakeUiActions(void* out, u32 capacity) {
     return impl->api->TakeUiActions(static_cast<BbXrUiAction*>(out), capacity);
 }
 
+std::optional<Xr::MirrorUi> Xr::LatestMirrorUi() {
+    if (!impl->session || impl->api->abi < 9 || !impl->api->GetMirrorUi) {
+        return std::nullopt;
+    }
+    BbXrMirrorUi in{};
+    if (!impl->api->GetMirrorUi(&in) || !in.image) {
+        return std::nullopt;
+    }
+    return MirrorUi{vk::Image(in.image), vk::Format(in.view_format), in.uv_w, in.uv_h};
+}
+
 std::optional<Xr::Views> Xr::LatestViews() {
     BbXrViews in{};
     if (!impl->session || !impl->api->GetViews(&in)) {
@@ -489,6 +500,9 @@ void Xr::SetGameState(const void*, u32) {}
 void Xr::GameEvent(u32, s32, s32, s32) {}
 u32 Xr::TakeUiActions(void*, u32) {
     return 0;
+}
+std::optional<Xr::MirrorUi> Xr::LatestMirrorUi() {
+    return std::nullopt;
 }
 void Xr::Shutdown() {}
 void Xr::ShutdownForExit(int) {}

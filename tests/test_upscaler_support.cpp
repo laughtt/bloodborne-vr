@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <unistd.h>
+#ifdef _WIN32
+static int setenv(const char* k, const char* v, int) { return _putenv_s(k, v); }
+static int unsetenv(const char* k) { return _putenv_s(k, ""); }
+#endif
 #include "bbport_settings.h"
 
 int main() {
