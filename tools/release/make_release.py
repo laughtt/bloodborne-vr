@@ -316,12 +316,16 @@ def main():
     ap.add_argument('--version', default='0.1.0-alpha5')
     ap.add_argument('--no-installer', action='store_true', help='do not build Setup.exe (Inno Setup)')
     ap.add_argument('--iscc', type=Path, help='path of Inno Setup 6 ISCC.exe (default: $ISCC, PATH, standard folders)')
+    ap.add_argument('--default-lobby', help='lobby address (http(s)://host:port) written to defaults/release.json as default_lobby; '
+                    'players need not type one. Injected at package time only, never kept in the repository')
     ap.add_argument('--update-repo', help='GitHub owner/repo the update check asks (default: laughtt/bloodborne-vr)')
     ap.add_argument('--out', type=Path, default=REPO / 'out' / 'release')
     ap.add_argument('--stub', type=Path, help='prebuilt BloodborneVR.exe (default: build the native dashboard, tools/release/dashboard, with clang; '
                     'falls back to the tiny console stub, tools/release/zip/exe)')
     ap.add_argument('--strip', default=None, help='llvm-strip to drop debug info (default: clang64/bin/llvm-strip.exe if present)')
     args = ap.parse_args()
+    if args.default_lobby and not online_checks.valid_lobby(args.default_lobby):
+        sys.exit('--default-lobby must look like http://host:port (http or https, a port, no path, no user name or password)')
 
     if args.allow_online:
         sys.exit('--allow-online is gone: the checks (online_checks.py) are never skipped; build the public online exe instead')
@@ -438,10 +442,13 @@ def main():
         sys.exit('bbvr_settings.py: PUBLIC_BUILD = False line not found (the public rewrite)')
     settings_file.write_bytes(public_text.encode('utf-8'))
     shutil.copytree(ZIPSRC / 'defaults', stage / 'defaults')
-    if args.update_repo:
+    if args.update_repo or args.default_lobby:
         release_json = stage / 'defaults' / 'release.json'
         data = json.loads(release_json.read_text(encoding='utf-8'))
-        data['update_repo'] = args.update_repo
+        if args.update_repo:
+            data['update_repo'] = args.update_repo
+        if args.default_lobby:
+            data['default_lobby'] = args.default_lobby
         release_json.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
     for lic in (ex / 'gpu' / 'xr_bridge' / 'LICENSE.txt',):
         if lic.is_file():
@@ -462,7 +469,7 @@ def main():
         "is NVIDIA's own binary. Exact versions, source links and a written offer of source for the bundled MSYS2\n"
         'libraries (FFmpeg, x264, x265, xvidcore and the rest of bin/): SOURCES-THIRD-PARTY.txt.\n', encoding='utf-8')
     (stage / 'COMMIT.txt').write_text(commit_id() + '\n', encoding='utf-8')
-    errors, warnings, passes = online_checks.check_tree(stage, args.variant)  # the package as a whole (python/ and licenses/ excluded)
+    errors, warnings, passes = online_checks.check_tree(stage, args.variant, default_lobby=args.default_lobby or '')  # the package as a whole (python/ and licenses/ excluded)
     if not online_checks.report('package', errors, warnings, passes):
         shutil.rmtree(stage)
         sys.exit('the package failed the checks above; nothing was zipped')

@@ -30,6 +30,7 @@ import time
 import zipfile
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_LOBBY = ''   # --default-lobby: the one address allowed in defaults/release.json
 sys.path.insert(0, str(HERE))
 REPO = HERE.parents[1]
 SYSTEM32 = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32'
@@ -162,7 +163,7 @@ def check_online_client(app, rep, state):
     rep.add(not rest, 'host exe holds no server code, server address, test account or hard-coded IP / port', '; '.join(rest))
     for text in warnings:
         rep.note(f'      (note: {text})')
-    errors, warnings, passes = online_checks.check_tree(app, 'online', True)
+    errors, warnings, passes = online_checks.check_tree(app, 'online', True, DEFAULT_LOBBY)
     rep.add(not errors, 'package files: no server files, addresses or test accounts', '; '.join(errors[:4]))
     if state is not None:
         rep.add(state.get('public') is True, 'dev options hidden in the settings (public build)')
@@ -292,7 +293,10 @@ def main():
     ap.add_argument('--work', type=Path, help='temp folder to use (default: a new one)')
     ap.add_argument('--report', type=Path)
     ap.add_argument('--keep', action='store_true', help='keep the work folder')
+    ap.add_argument('--default-lobby', default='', help='the lobby address make_release.py injected (allowed in defaults/release.json only)')
     args = ap.parse_args()
+    global DEFAULT_LOBBY
+    DEFAULT_LOBBY = args.default_lobby
     if bool(args.installer) == bool(args.zip):
         ap.error('give exactly one of --installer / --zip')
     source = (args.installer or args.zip).resolve()

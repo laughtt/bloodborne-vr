@@ -12,7 +12,7 @@ built for the game. Every command prints one JSON document on stdout. Standard l
     bbvr_cli.py update-check                ask GitHub for a newer release (quiet when unavailable) -> state
     bbvr_cli.py update-opt on|off           switch the start-up update check on / off -> state
     bbvr_cli.py print-env [PROFILE]         the game environment of a profile (no files written)
-    bbvr_cli.py online server [URL]         show / set the lobby address (or env BBVR_LOBBY_URL)
+    bbvr_cli.py online server [URL|default] show / set the lobby address (or env BBVR_LOBBY_URL); default = the release's own lobby
     bbvr_cli.py online create [NAME]        open a room, prints its join code
     bbvr_cli.py online join CODE [NAME]     join a room by code
     bbvr_cli.py online leave                leave the room (a host leaving closes it)
@@ -73,7 +73,7 @@ def full_state(menu, config):
         'alpha_notice': L.alpha_notice_due(config, version()), 'alpha_text': L.ALPHA_NOTICE,
         'dlss_files': dlss_files(L.PORT), 'public': S.is_public(),
         'online_play': S.ONLINE_PLAY, 'play_mode': play_mode(config), 'online_step': config.get('online_step', 'host'),
-        'data_dir': str(L.DATA), 'installed': (L.PORT / S.INSTALLED_FLAG).is_file(),
+        'lobby': lobby_info(config), 'data_dir': str(L.DATA), 'installed': (L.PORT / S.INSTALLED_FLAG).is_file(),
     }
     defaults = S.release_defaults(L.PORT)
     st['update'] = bbvr_update.summary(config.get('update_check', True), version(), defaults, L.DATA)
@@ -109,7 +109,13 @@ _lobby_call = bbvr_online.lobby_call
 
 def lobby_url(config=None):
     url = os.environ.get('BBVR_LOBBY_URL') or (config if config is not None else L.load_config()).get('online_server', '')
-    return str(url).strip().rstrip('/')
+    return str(url or S.default_lobby(L.PORT) or '').strip().rstrip('/')
+
+
+def lobby_info(config=None):
+    """{'server', 'is_default'}: the lobby in use and whether it is the one that comes with the release."""
+    url = lobby_url(config)
+    return {'server': url, 'is_default': bool(url) and url == S.default_lobby(L.PORT)}
 
 
 def online_identity(name=None):
@@ -153,7 +159,7 @@ def online_view(base, saved, fresh_s=12):
         bell = {}                                   # a leftover of an earlier game
     ident = _read_json(_user_dir() / 'online_identity.json')
     in_room = bool(saved.get('code') and saved.get('role') and not saved.get('closed'))
-    out = {'ok': True, 'server': base, 'npid': ident.get('npid', ''), 'in_room': in_room,
+    out = {'ok': True, 'server': base, 'is_default': base == S.default_lobby(L.PORT), 'npid': ident.get('npid', ''), 'in_room': in_room,
            'code': saved.get('code', ''), 'role': saved.get('role', ''), 'closed': bool(saved.get('closed')),
            'reason': saved.get('reason', ''), 'members': saved.get('members') or [], 'max': saved.get('max', 3),
            'age_s': int(time.time() - float(saved.get('ts') or 0)) if saved.get('ts') else -1, 'bell': bell}
@@ -177,9 +183,12 @@ def online(argv):
     config = L.load_config()
     if sub == 'server':
         if len(argv) > 1:
-            config['online_server'] = argv[1].strip().rstrip('/')
+            if argv[1].strip().lower() == 'default':   # back to the lobby that comes with the release
+                config.pop('online_server', None)
+            else:
+                config['online_server'] = argv[1].strip().rstrip('/')
             L.save_config(config)
-        return {'ok': True, 'server': lobby_url(config)}
+        return dict(ok=True, **lobby_info(config))
     if sub == 'mode':  # remember the start choice: mode solo | host | join
         what = argv[1] if len(argv) > 1 else ''
         if what in ('solo', 'host', 'join'):
@@ -190,7 +199,7 @@ def online(argv):
         return {'ok': True, 'play_mode': play_mode(config), 'online_step': config.get('online_step', 'host')}
     base = lobby_url(config)
     if not base:
-        return {'ok': False, 'error': 'no_server', 'message': 'No lobby address set. Run: online server URL'}
+        return {'ok': False, 'error': 'no_server', 'message': 'No lobby set. Run: online server URL'}
     room_file = _user_dir() / 'online_room.json'
     saved = _read_json(room_file)
     if sub in ('create', 'join'):

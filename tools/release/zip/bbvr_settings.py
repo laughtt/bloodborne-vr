@@ -890,13 +890,21 @@ def _read_json(path):
         return {}
 
 
-def lobby_address(values, config, user_dir):
-    """The lobby the player entered: the online_server setting, else the saved room's server, else the config's."""
+def default_lobby(port):
+    """The lobby that comes with a release (defaults/release.json "default_lobby", injected by make_release.py
+    --default-lobby; never in the source tree). '' when the package has none."""
+    return str(release_defaults(port).get('default_lobby') or '').strip().rstrip('/') if port else ''
+
+
+def lobby_address(values, config, user_dir, port=None):
+    """The lobby to use: env BBVR_LOBBY_URL, the player's online_server setting, the saved room's server, the
+    config's online_server, and only then the release's default lobby (defaults/release.json)."""
     room = _read_json(Path(user_dir) / 'online_room.json')
-    return str(values.get('online_server') or room.get('server') or (config or {}).get('online_server') or '').strip().rstrip('/')
+    own = os.environ.get('BBVR_LOBBY_URL') or values.get('online_server') or room.get('server') or (config or {}).get('online_server')
+    return str(own or default_lobby(port) or '').strip().rstrip('/')
 
 
-def online_env(values, config, user_dir, public=None, solo=False):
+def online_env(values, config, user_dir, public=None, solo=False, port=None):
     """Environment for a game started from a room (user/online_room.json + user/online_identity.json, both written
     by `bbvr_cli.py online ...`). {} for "Play solo" (solo=True), when there is no room and the dev `online` option is
     off, or when ONLINE_PLAY is off. In a public build only a room switches online on (the dev option is hidden)."""
@@ -914,7 +922,7 @@ def online_env(values, config, user_dir, public=None, solo=False):
         env['BB_USER_NAME'] = str(ident.get('name') or ident['npid'])
         if ident.get('password'):
             env['BB_SHADNET_PASSWORD'] = str(ident['password'])
-    lobby = lobby_address(values, config, user_dir)
+    lobby = lobby_address(values, config, user_dir, port)
     game = str(values.get('online_game_server') or '').strip()
     if not game and lobby:
         # the lobby shares its host with the game server; the game port is two below the lobby's (online_hosts.online_webapi)

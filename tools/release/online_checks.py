@@ -25,6 +25,7 @@ REQUIRE (exe, variant online)
 Variant offline (BBPORT_ONLINE=OFF): in place of REQUIRE, the exe must hold none of the online client.
 """
 import argparse
+import json
 from pathlib import Path
 import re
 import sys
@@ -128,8 +129,15 @@ SKIP_DIRS = {'python', 'licenses', 'patches', '__pycache__'}
 SERVER_FILES = re.compile(r'(?i)(?:^|/)(?:online|shadnet-' + r'server|bb-coop-' + r'local|coopd[^/]*|coop_server[^/]*)(?:/|$|\.py$|\.sh$)')
 
 
-def check_tree(root, variant='online', public=True):
-    """(errors, warnings, passes) for an unpacked package folder: every text file, our own binaries, file names."""
+def valid_lobby(url):
+    """True for http(s)://host:port, nothing else (no path, credentials, query)."""
+    return bool(re.fullmatch(r'https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?:\d{2,5}', str(url)))
+
+
+def check_tree(root, variant='online', public=True, default_lobby=''):
+    """(errors, warnings, passes) for an unpacked package folder: every text file, our own binaries, file names.
+    default_lobby: the one address that may be injected at package time (make_release.py --default-lobby): exactly
+    the "default_lobby" key of defaults/release.json, and only with this value. Any other address stays a failure."""
     root = Path(root)
     errors, warnings, passes = [], [], []
     scanned = 0
@@ -159,6 +167,9 @@ def check_tree(root, variant='online', public=True):
             scanned += 1
             # SOURCES-THIRD-PARTY.txt lists package versions (a.b.c.d looks like an address): only ip:port counts there
             bare = path.name != 'SOURCES-THIRD-PARTY.txt'
+            if rel == 'defaults/release.json':
+                data, lobby_errors = _release_json_without_lobby(data, default_lobby)
+                errors += [f'{rel}: {x}' for x in lobby_errors]
             for name, examples in forbidden(data, public=False, bare_ips=bare):
                 if name == 'hard-coded IP address' and path.suffix == '.md':
                     continue
@@ -167,6 +178,22 @@ def check_tree(root, variant='online', public=True):
         passes.append('no server files or online/ folder in the package')
     passes.append(f'{scanned} text files and own binaries scanned')
     return errors, warnings, passes
+
+
+def _release_json_without_lobby(data, allowed):
+    """(data with the allowed default_lobby value removed, errors) for defaults/release.json."""
+    try:
+        doc = json.loads(data.decode('utf-8'))
+    except ValueError:
+        return data, []
+    if not isinstance(doc, dict) or 'default_lobby' not in doc:
+        return data, []
+    value = doc.pop('default_lobby')
+    if not allowed:
+        return data, ['default_lobby is set but no --default-lobby was given']
+    if value != allowed or not valid_lobby(value):
+        return data, ['default_lobby is not the --default-lobby value']
+    return json.dumps(doc).encode('utf-8'), []
 
 
 def report(title, errors, warnings, passes, out=print):
@@ -185,11 +212,12 @@ def main(argv=None):
     ap.add_argument('path', type=Path)
     ap.add_argument('--variant', choices=('online', 'offline'), default='online')
     ap.add_argument('--private', action='store_true', help='a private dev build: dev tools are allowed')
+    ap.add_argument('--default-lobby', default='', help='the one lobby address allowed in defaults/release.json (tree)')
     args = ap.parse_args(argv)
     if args.kind == 'exe':
         result = check_exe(args.path.read_bytes(), args.variant, not args.private)
     else:
-        result = check_tree(args.path, args.variant, not args.private)
+        result = check_tree(args.path, args.variant, not args.private, args.default_lobby)
     return 0 if report(args.kind, *result) else 1
 
 

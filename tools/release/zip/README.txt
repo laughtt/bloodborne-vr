@@ -20,7 +20,7 @@ LEGAL
   FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne are trademarks of their
   owners.
 * Free software under the GPL (see LICENSE, COPYING.GPL-3.0, THIRD_PARTY_NOTICES.md, SOURCES-THIRD-PARTY.txt, SOURCE.txt).
-* Co-op (up to 3 players) needs a lobby address from whoever hosts one; solo play needs no server.
+* Co-op (up to 3 players) uses the default lobby that comes with this release (nothing to type); solo play needs no server.
 
 WHAT YOU NEED
 -------------
@@ -121,34 +121,35 @@ off by default.
 
 PLAYING CO-OP (up to 3 players, join codes)
 -------------------------------------------
-Co-op is EXPERIMENTAL in this alpha: it needs a lobby address (looks like http://address:port) from
-whoever runs a lobby, and playing over the internet is not fully tested. Everyone needs game version 1.09 and
-this same release. Play solo needs no server and no account.
+Co-op is EXPERIMENTAL in this alpha. It uses the default lobby that comes with this release: there is
+nothing to type. Playing over the internet is not fully tested. Everyone needs game version 1.09 and this same
+release. Play solo needs no server and no account.
 
 A) HOST (the player whose world the others join)
 
 1. Open BloodborneVR.exe (the dashboard).
 2. On the Play tab press Play online.
-3. Paste the lobby address you were given into the address box and press Save (only once, it is remembered).
-4. Press Host a game. A room code like K7Q-M4X appears (it also shows in the dashboard title).
-5. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
-6. Press Start with this room, load your character and walk a little way into an area. Do not stand in the
+3. Press Host a game. A room code like K7Q-M4X appears (it also shows in the dashboard title).
+4. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
+5. Press Start with this room, load your character and walk a little way into an area. Do not stand in the
    area's entry zone, and the area's boss must still be alive.
-7. Nothing to press in the game: your bell rings by itself and your friends appear.
+6. Nothing to press in the game: your bell rings by itself and your friends appear.
 
 B) FRIEND (joining)
 
 1. Open BloodborneVR.exe.
 2. On the Play tab press Play online.
-3. Paste the SAME lobby address as the host and press Save (only once).
-4. Type the room code under Join a friend and press Join.
-5. Press Start with this room, load your character and stay in the same region as the host.
-6. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
+3. Type the room code under Join a friend and press Join.
+4. Press Start with this room, load your character and stay in the same region as the host.
+5. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
    it rings again by itself.
+
+Running your own lobby? Under Play online press the small Change next to "Lobby: default", enter your
+address and press Use. "Use the default lobby" switches back.
 
 If it does not work
 
-  * Host and friends must use the same lobby address and the same room code.
+  * Everyone must use the same release and have game version 1.09, and the friend must type the host's room code exactly.
   * The host must not stand in an area's entry zone, and that area's boss must not be dead yet.
   * Wait about a minute. If you saw "failed to acquire server information", restart the game.
   * The Windows firewall must allow BloodborneVR (allow it when Windows asks).

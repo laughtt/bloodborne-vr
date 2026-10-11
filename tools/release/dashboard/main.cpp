@@ -257,6 +257,7 @@ struct App {
     double online_poll_at = -100;
     char online_code[16] = "";
     bool alpha_ack = false;         // OK pressed on the early-alpha notice (the state catches up a moment later)
+    bool lobby_edit = false;        // the small "Change" under Play online: show the lobby address field
     char online_addr[160] = "";     // lobby address typed by the player (never shipped; saved with `online server`)
     bool online_open = false;       // the Play tab shows the Play online step instead of the profiles
     bool online_start = false;      // a host / join worked: start the game with the room
@@ -954,13 +955,40 @@ static void big_code(const std::string& code, float size)
 // The lobby address is a setting, never shipped: ask for it where the room is created / joined.
 static void lobby_address_field(bool busy)
 {
-    MutedWrapped("Your host's lobby address (once). Ask them for it.", 13);
+    MutedWrapped("Lobby address of your own server (http://address:port).", 13);
     ImGui::SetNextItemWidth(S(230));
     ImGui::InputTextWithHint("##lobby", "http://address:port", A.online_addr, sizeof(A.online_addr), ImGuiInputTextFlags_CharsNoBlank);
     ImGui::SameLine();
     if (busy || !A.online_addr[0]) ImGui::BeginDisabled();
     if (Button("Save", ImVec2(S(80), S(32)), true)) online_async({"server", A.online_addr});
     if (busy || !A.online_addr[0]) ImGui::EndDisabled();
+}
+
+// The release comes with a default lobby (defaults/release.json): nothing to type. A small line shows which lobby is
+// used, with a way to enter another one (own server) and to go back to the default.
+static void lobby_line(bool busy)
+{
+    if (!A.online_have || !A.online.contains("server") || jstr(A.online, "server").empty()) return;
+    const bool is_default = A.online.value("is_default", false);
+    ImGui::Dummy(ImVec2(0, S(6)));
+    Muted(is_default ? "Lobby: default" : "Lobby: your own");
+    ImGui::SameLine();
+    if (Button(A.lobby_edit ? "Hide" : "Change", ImVec2(S(80), S(24)), false, true)) A.lobby_edit = !A.lobby_edit;
+    if (!A.lobby_edit) return;
+    ImGui::SetNextItemWidth(S(230));
+    ImGui::InputTextWithHint("##lobbyown", "http://address:port", A.online_addr, sizeof(A.online_addr), ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::SameLine();
+    if (busy || !A.online_addr[0]) ImGui::BeginDisabled();
+    if (Button("Use", ImVec2(S(60), S(32)), true)) online_async({"server", A.online_addr});
+    if (busy || !A.online_addr[0]) ImGui::EndDisabled();
+    if (!is_default) {
+        if (busy) ImGui::BeginDisabled();
+        if (Button("Use the default lobby", ImVec2(S(190), S(30)), false, true)) {
+            A.online_addr[0] = 0;
+            online_async({"server", "default"});
+        }
+        if (busy) ImGui::EndDisabled();
+    }
 }
 
 static void online_messages()
@@ -1018,6 +1046,7 @@ static void online_start_card(ImVec2 size, bool ready)
             if (off) ImGui::BeginDisabled();
             if (Button("Join", ImVec2(S(80), S(34)), step == "join")) online_async({"join", A.online_code}, "join");
             if (off) ImGui::EndDisabled();
+            lobby_line(busy);
         }
         if (busy) Muted("Working...");
         online_messages();
@@ -1376,7 +1405,7 @@ static void tab_online(ImVec2 avail)
             Muted("Reading the room state...");
         } else if (!v.value("ok", true) || (v.contains("error") && !v.contains("in_room"))) {
             Heading("Room");
-            MutedWrapped(online_no_server() ? "No lobby address yet. Enter it once (your host gives it to you)." : jstr(v, "message", "The room server is not reachable."), 14);
+            MutedWrapped(online_no_server() ? "No lobby set. Enter the address of your lobby." : jstr(v, "message", "The room server is not reachable."), 14);
             if (online_no_server()) lobby_address_field(busy);
         } else if (in_room) {
             Heading("Room code");
@@ -1424,6 +1453,7 @@ static void tab_online(ImVec2 avail)
                 MutedWrapped("Your last room closed" + (jstr(v, "reason").empty() ? std::string(".") : " (" + jstr(v, "reason") + ")."), 14);
             }
         }
+        if (A.online_have && !in_room) lobby_line(busy);
         if (busy) {
             ImGui::Dummy(ImVec2(0, S(6)));
             Muted("Working...");

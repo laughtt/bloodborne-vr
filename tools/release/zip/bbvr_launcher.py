@@ -423,12 +423,12 @@ def run_with_settings(game, args):
     if wr:
         say('  Warning: ' + wr)
     OUT.mkdir(parents=True, exist_ok=True)
-    online = settings_mod.online_env(values, load_config(), DATA / 'user', solo=getattr(args, 'solo', False))
+    online = settings_mod.online_env(values, load_config(), DATA / 'user', solo=getattr(args, 'solo', False), port=PORT)
     if getattr(args, 'solo', False):
         say('  Play solo: online is off.')
     if online:
         plan['env'].update(online)
-        lobby = settings_mod.lobby_address(values, load_config(), DATA / 'user')
+        lobby = settings_mod.lobby_address(values, load_config(), DATA / 'user', PORT)
         if lobby and 'SHADPS4_HTTP_HOST_OVERRIDES_JSON' not in plan['env']:
             import bbvr_online
             hosts = bbvr_online.sync_host_overrides(lobby, DATA / 'user', say)

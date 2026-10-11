@@ -188,6 +188,36 @@ class OnlineCliTests(CliTests):
         with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
             self.assertEqual(bbvr_cli.run(['online', 'create'])['error'], 'no_server')
 
+    def _write_default(self, url):
+        (self.port / 'defaults').mkdir(exist_ok=True)
+        (self.port / 'defaults' / 'release.json').write_text(json.dumps({'default_lobby': url}))
+
+    def test_default_lobby_used_when_unset(self):
+        self._write_default(self.url)
+        with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
+            self.assertEqual(bbvr_cli.run(['online', 'server']), {'ok': True, 'server': self.url, 'is_default': True})
+            self.assertEqual(bbvr_cli.run(['online', 'create'])['code'], 'K7Q-M4X')
+            self.assertTrue(bbvr_cli.run(['online', 'view'])['is_default'])
+            self.assertEqual(bbvr_cli.run(['state'])['app']['lobby'], {'server': self.url, 'is_default': True})
+            self.assertEqual(S.lobby_address({}, L.load_config(), bbvr_cli._user_dir(), self.port), self.url.rstrip('/'))
+
+    def test_player_setting_beats_default_and_default_returns(self):
+        self._write_default('http://127.0.0.1:9')
+        with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
+            out = bbvr_cli.run(['online', 'server', self.url])
+            self.assertEqual((out['server'], out['is_default']), (self.url, False))
+            self.assertEqual(S.lobby_address({}, L.load_config(), bbvr_cli._user_dir(), self.port), self.url)
+            self.assertEqual(S.lobby_address({'online_server': 'http://127.0.0.1:7/'}, {}, bbvr_cli._user_dir(), self.port), 'http://127.0.0.1:7')
+            back = bbvr_cli.run(['online', 'server', 'default'])
+            self.assertEqual((back['server'], back['is_default']), ('http://127.0.0.1:9', True))
+
+    def test_env_beats_setting_and_default(self):
+        self._write_default('http://127.0.0.1:9')
+        bbvr_cli.run(['online', 'server', 'http://127.0.0.1:7'])
+        with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': self.url}):
+            self.assertEqual(bbvr_cli.run(['online', 'server'])['server'], self.url)
+            self.assertEqual(S.lobby_address({}, L.load_config(), bbvr_cli._user_dir(), self.port), self.url)
+
     def test_create_status_leave(self):
         bbvr_cli.run(['online', 'server', self.url])
         out = bbvr_cli.run(['online', 'create', 'Tester'])

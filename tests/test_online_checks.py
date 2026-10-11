@@ -119,6 +119,31 @@ class TreeChecks(unittest.TestCase):
         (self.root / 'run.py').write_text('SERVER = "' + HOST.decode() + ':' + PORT.decode() + '"\n')
         self.assertTrue(C.check_tree(self.root)[0])
 
+    def _release_json(self, **extra):
+        (self.root / 'defaults').mkdir(exist_ok=True)
+        import json
+        (self.root / 'defaults' / 'release.json').write_text(json.dumps(dict(update_repo='a/b', **extra)))
+
+    def test_injected_default_lobby_is_allowed_only_in_release_json(self):
+        lobby = 'http://10.9.8.7:4242'
+        self._release_json(default_lobby=lobby)
+        self.assertEqual(C.check_tree(self.root, default_lobby=lobby)[0], [])
+        # no --default-lobby, or another value: refused
+        self.assertTrue(C.check_tree(self.root)[0])
+        self.assertTrue(C.check_tree(self.root, default_lobby='http://10.9.8.7:4243')[0])
+        # the same address anywhere else is still refused
+        (self.root / 'run.py').write_text('LOBBY = "%s"' % lobby)
+        self.assertTrue(any('run.py' in x for x in C.check_tree(self.root, default_lobby=lobby)[0]))
+        (self.root / 'run.py').write_text('print("hi")')
+        self._release_json(default_lobby=lobby, other='http://10.9.8.9:4242')
+        self.assertTrue(C.check_tree(self.root, default_lobby=lobby)[0])
+
+    def test_valid_lobby_shape(self):
+        for ok in ('http://10.9.8.7:4242', 'https://lobby.example.org:443'):
+            self.assertTrue(C.valid_lobby(ok), ok)
+        for bad in ('10.9.8.7:4242', 'http://10.9.8.7', 'http://10.9.8.7:4242/x', 'http://u:p@10.9.8.7:4242', 'ftp://h:1'):
+            self.assertFalse(C.valid_lobby(bad), bad)
+
     def test_server_folder_fails(self):
         (self.root / 'online').mkdir()
         (self.root / 'online' / 'x.txt').write_text('x')
