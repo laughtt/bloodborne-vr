@@ -122,6 +122,21 @@ class MergeTests(unittest.TestCase):
             S.write_control(f, {'upscale': 'off'})
             self.assertIn('upscale=dlss', f.with_name('iq.txt.bak').read_text(encoding='utf-8'))
 
+    def test_item_wheel_on_by_default(self):
+        # the bridge's built-in layout has no wheel in game.active; the launcher adds it (off takes it out again)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = S.build_launch(S.effective_values(S.default_settings()), paths_in(tmp), NO_GPU, public=False)
+            self.assertEqual(plan['ui']['active'], S.WHEEL_MENUS)
+            a = Path(tmp)
+            live = a / 'ui_layouts.json'
+            live.write_text(json.dumps({'version': 2, 'game': {'active': S.NO_WHEEL_MENUS}}), encoding='utf-8')
+            self.assertTrue(S.apply_ui_overrides(a, plan['ui']))
+            self.assertIn('quick_wheel', json.loads(live.read_text())['game']['active'])
+            values = dict(S.effective_values(S.default_settings()), item_wheel=False)
+            off = S.build_launch(values, paths_in(tmp), NO_GPU, public=False)['ui']
+            S.apply_ui_overrides(a, off)
+            self.assertNotIn('quick_wheel', json.loads(live.read_text())['game']['active'])
+
     def test_ui_overrides_do_not_clobber_hand_edits(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp)

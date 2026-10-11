@@ -156,9 +156,9 @@ def _build_schema():
     a(_o('gun', 'combat', 'Gun aiming', 'bool', ('env', 'BB_VR_GUN_AIM'), True))
     a(_o('hitscale_env', 'combat', 'Hit shape scaling (feature)', 'bool', ('env', 'BB_VR_HIT_SCALE'), True, advanced=True))
     # ---- Body / arms ----
-    a(_o('hide', 'body', 'Hide parts of the body', 'choice', ('fp', 'hide'), 'body',
+    a(_o('hide', 'body', 'Hide parts of the body', 'choice', ('fp', 'hide'), 'hands_skin',
          choices=['none', 'head', 'body', 'hands', 'hands_skin', 'nohands', 'all'],
-         help='body hides all but arms, hands and weapons. hands also hides the bare arms (armour sleeves and gloves stay). hands_skin also hides armour sleeves: bare hands only, gloves vanish. nohands also hides the bare hands (weapons only), for the custom VR hands (custom_hands in ui_layouts.json or BB_XR_CUSTOM_HANDS=1). hands/hands_skin/nohands untested in game.'))
+         help='body hides all but arms, hands and weapons. hands also hides the bare arms (armour sleeves and gloves stay). hands_skin (default) also hides armour sleeves: bare hands only, gloves vanish. nohands also hides the bare hands (weapons only), for the custom VR hands (custom_hands in ui_layouts.json or BB_XR_CUSTOM_HANDS=1). hands/nohands untested in game.'))
     a(_o('arms', 'body', 'VR arms', 'bool', ('env', 'BB_VR_ARMS'), True, help='Arms follow the controllers (IK).'))
     a(_o('arm_attack', 'body', 'Arm weight while attacking', 'float', ('fp', 'arm_attack'), 1.0, min=0.0, max=1.0, step=0.05))
     a(_o('arm_weight', 'body', 'Arm weight (max)', 'float', ('fp', 'arm_weight'), None, min=0.0, max=1.0, step=0.05))
@@ -170,6 +170,8 @@ def _build_schema():
     a(_o('arm_log', 'body', 'Log arm data', 'bool', ('fp', 'arm_log'), False, advanced=True))
     # ---- UI ----
     a(_o('ui', 'ui', 'VR menus and HUD', 'bool', ('env', 'BB_VR_UI'), True, help='Dashboard, quick wheel and wrist counters.'))
+    a(_o('item_wheel', 'ui', 'Item wheel (hold the right stick click)', 'bool', ('ui', 'active'), True,
+         help='The quick wheel on the right stick click hold, next to the dashboard and the wrist counters.'))
     a(_o('lock_on', 'ui', 'Right stick click locks on', 'bool', ('ui', 'lock_on'), False, live_ui=True))
     a(_o('r3_hold', 'ui', 'Hold time for the item wheel (s)', 'float', ('ui', 'r3_hold_s'), 0.5, min=0.15, max=3.0, step=0.05))
     a(_o('hud_head', 'ui', 'HUD follows your head', 'bool', ('ui', 'hud.head'), False))
@@ -221,6 +223,10 @@ def is_live(opt):
 
 
 # ---- profiles --------------------------------------------------------------------------------
+
+# ui_layouts.json game.active with and without the item wheel (the bridge's built-in default has none)
+WHEEL_MENUS = ['dashboard', 'quick_wheel', 'wrist_counters']
+NO_WHEEL_MENUS = ['dashboard', 'wrist_counters']
 
 PROFILES = {
     'Default': {},
@@ -692,6 +698,8 @@ def build_launch(values, paths, caps=None, public=None):
             key = o['target'][1]
             files['iq'][key] = None if val is None else to_text(o, val)
         elif kind == 'ui':
+            if o['id'] == 'item_wheel' and val is not None:
+                val = WHEEL_MENUS if val else NO_WHEEL_MENUS
             if val is not None:
                 ui[o['target'][1]] = val
     if upscale != 'dlss':  # the DLSS keys mean nothing then; keep them out of the file
