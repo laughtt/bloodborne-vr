@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "item_sheet.h"
 #include "json.h"
 #include "model.h"
 #include "png_read.h"
@@ -86,9 +87,43 @@ bool UiAtlas::Load(const std::filesystem::path& dir, std::string& log) {
     }
     width = w;
     height = h;
+    AppendItemSheet(dir.parent_path(), log);
     log += "icons: " + std::to_string(icons.size()) + " pictures, " +
            std::to_string(items.size()) + " items (" + (dir / "icons.png").string() + ")\n";
     return true;
+}
+
+/// Appends the item texture sheet (item_sheet.h) below the icons: the held meshes sample it.
+void UiAtlas::AppendItemSheet(const std::filesystem::path& assets, std::string& log) {
+    ItemSheet sheet;
+    uint32_t sw = 0, sh = 0;
+    int channels = 0;
+    std::vector<uint8_t> sp;
+    std::string error;
+    if (!sheet.Load(assets) || sheet.icons_w != width || sheet.icons_h != height ||
+        !ReadPng((assets / "items" / "tex_sheet.png").string(), sw, sh, channels, sp, error) || channels != 4 ||
+        sw != sheet.sheet_w || sh != sheet.sheet_h) {
+        return;
+    }
+    const uint32_t nw = sheet.Width(), nh = sheet.Height();
+    std::vector<uint8_t> out(size_t(nw) * nh * 4, 0);
+    for (uint32_t y = 0; y < height; ++y) {
+        std::copy_n(pixels.begin() + ptrdiff_t(size_t(y) * width * 4), size_t(width) * 4,
+                    out.begin() + ptrdiff_t(size_t(y) * nw * 4));
+    }
+    for (uint32_t y = 0; y < sh; ++y) {
+        std::copy_n(sp.begin() + ptrdiff_t(size_t(y) * sw * 4), size_t(sw) * 4,
+                    out.begin() + ptrdiff_t(size_t(height + y) * nw * 4));
+    }
+    // The held meshes are solid: the effect textures (vials, antidote) carry sprite alpha, which would
+    // make the bottle vanish in icon mode. Only the icon cells (the paper cards) keep their cut-out.
+    for (size_t i = size_t(height) * nw * 4 + 3; i < out.size(); i += 4) {
+        out[i] = 255;
+    }
+    pixels = std::move(out);
+    width = nw;
+    height = nh;
+    log += "item textures: " + std::to_string(sheet.rects.size()) + " appended to the icon atlas\n";
 }
 
 const UiItem* UiAtlas::Find(const std::string& key) const {

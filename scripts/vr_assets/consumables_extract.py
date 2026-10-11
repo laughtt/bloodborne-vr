@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import item_tex
 import throwables_extract as tx
 
 # goods id -> (name, sfx mesh id, how it was found)
@@ -40,13 +41,14 @@ def export(root: Path, out: Path, quiet: bool = False) -> list:
     out = out / 'consumables'
     out.mkdir(parents=True, exist_ok=True)
     meshes, _fxrs = tx._sfx_entries(root)
+    tex = (out.parent, tx._sfx_tpfs(root))
     done = []
     for goods, (name, mesh, how) in CONSUMABLE_MESH.items():
         if mesh not in meshes:
             if not quiet:
                 print(f'cs_{goods}: {name}: s{mesh:05d} not in the bundle')
             continue
-        model = tx.convert_sfx_mesh(meshes[mesh], f'cs_{goods}')
+        model = tx.convert_sfx_mesh(meshes[mesh], f'cs_{goods}', tex=tex)
         model.extra.update(goods=goods, name=name, sfx_mesh=mesh, how=how,
                            source=f'sfx/frpg_sfxbnd_commoneffects.ffxbnd.dcx s{mesh:05d}.flver')
         model.extra['kind'] = 'consumable'
@@ -56,4 +58,5 @@ def export(root: Path, out: Path, quiet: bool = False) -> list:
             size = model.extra['size']
             print(f'{path.name}: {name} <- s{mesh:05d} ({model.vertex_count} vertices, '
                   f'{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f} m; {how})')
+    item_tex.flush(out.parent)
     return done

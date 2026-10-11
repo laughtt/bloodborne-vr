@@ -42,6 +42,7 @@
 #include "vr_stereo.h"
 #include "vr_arms.h"
 #include "vr_gun.h"
+#include "vr_visceral.h"
 #include "vr_hitbox.h"
 #include "gpu/bbgpu.h"
 #include <stdatomic.h>
@@ -91,6 +92,7 @@ static struct {
     float h1_game[4][4];
     int h1_game_valid;
     int fp;             /* H1 put this frame's camera at the hunter's eyes (BB_VR_FP=1) */
+    int cinema;         /* a cutscene with alternate eyes: the game's camera, the cinema screen */
     float h1_out[20];   /* H1's final camera: matrix, FOV, aspect, near, far */
     uint64_t next_log[2];
     int fired[2];
@@ -462,6 +464,15 @@ static int vh_first_person(const BbHookContext *ctx, float *cam, int logging) {
     return 1;
 }
 
+/* The cinema screen for a cutscene (alternate eyes, bbgpu_vr_set_cinema): told on a change. */
+static void vh_set_cinema(int on) {
+    if (on == vh.cinema) return;
+    vh.cinema = on;
+    bbgpu_vr_set_cinema(on);
+    fprintf(stderr, "VR head: %s\n", on ? "cutscene: the game's own camera, frames on the cinema screen"
+                                        : "cutscene over: head tracking and eyes again");
+}
+
 /* H1: rbx = the draw step's private PersCam. */
 static ABI void vh_hook_h1(BbHookContext *ctx) {
     vh_init();
@@ -497,7 +508,18 @@ static ABI void vh_hook_h1(BbHookContext *ctx) {
         const uint32_t hits = atomic_exchange_explicit(&vh_lod_hits, 0, memory_order_relaxed);
         if (hits) fprintf(stderr, "VR head:   LOD fix: %u contexts kept at the game's LOD distances in the last second\n", hits);
     }
-    if (fp_on && (vh.fp = vh_first_person(ctx, cam, logging))) return;
+    if (fp_on && (vh.fp = vh_first_person(ctx, cam, logging))) {
+        vh_set_cinema(0);
+        return;
+    }
+    /* A real-time cutscene (Remo, boss intro) or the debug camera with alternate eyes: the game's own
+     * camera (no head pose, FOV or eye offset: a moving cutscene camera with head tracking is not
+     * comfortable), no eye view published, and the presenter shows the frames on the cinema screen. */
+    vh_set_cinema(fp_on && vr_stereo_enabled() && vr_fp_cutscene());
+    if (vh.cinema) {
+        if (logging) fprintf(stderr, "VR head:   cutscene: the game's camera, frames on the cinema screen\n");
+        return;
+    }
     if (!vh.enabled) return;
     if (!vh.frame.valid) {
         if (logging) fprintf(stderr, "VR head:   no head pose: camera unchanged\n");
@@ -532,7 +554,7 @@ static ABI void vh_hook_h2(BbHookContext *ctx) {
         vr_stereo_h2(cam, vh.seq); /* alternate-eye stereo: the eye offset if H2 follows the eye (findings/22) */
         return;
     }
-    if (!vh.enabled) return;
+    if (!vh.enabled || vh.cinema) return; /* a cutscene on the cinema screen: the game's camera */
     const uint64_t now = vh_now_us();
     if (vh.h2_seq == vh.seq) { /* no H1 since the last H2: H1 is not installed */
         ++vh.seq;
@@ -581,6 +603,7 @@ void runtime_vr_head_register(void) {
     vr_stereo_register();
     vr_arms_register();
     vr_gun_register();
+    vr_visceral_register();
     vr_hitscale_register();
     vr_atkspeed_register();
 }

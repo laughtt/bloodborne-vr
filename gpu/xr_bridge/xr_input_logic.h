@@ -207,6 +207,39 @@ struct SwingGate {
     }
 };
 
+/// The left-hand gun thrust (L2), tuned for a gun parry (docs/vr/findings/41-parry.md). The hand's
+/// velocity relative to the head `rel` is split along the pointing axis `fwd` (unit): thrust t =
+/// rel . fwd, alignment a = t / |rel|. Fires on the ONSET of a jab: armed, t >= kOn, a >= kAlign
+/// (the stroke runs along the barrel, not a sideways swing or a reach), t still rising, and kDebounce
+/// since the last shot. Re-arms when t < kRearm. blocked (snap turn, recenter) disarms.
+struct ShootGate {
+    float on = 1.5f, align = 0.8f, rearm = 0.5f;
+    double debounce_ms = 250.0;
+    bool armed = true;
+    double last_ms = -1e9;
+    float prev = 0.0f;
+    bool Update(double now_ms, const float rel[3], const float fwd[3], bool blocked) {
+        const float t = rel[0] * fwd[0] + rel[1] * fwd[1] + rel[2] * fwd[2];
+        const float sp = std::sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        const float a = sp > 1e-3f ? t / sp : 0.0f;
+        const float before = prev;
+        prev = t;
+        if (blocked) {
+            armed = false;
+            return false;
+        }
+        if (armed && t >= on && a >= align && t > before && now_ms - last_ms >= debounce_ms) {
+            armed = false;
+            last_ms = now_ms;
+            return true;
+        }
+        if (t < rearm) {
+            armed = true;
+        }
+        return false;
+    }
+};
+
 /// A heavy swing followed by the right grip held keeps R2 held (a charged attack) until the grip
 /// is released. A grip held without a heavy swing does nothing.
 struct HeavyCharge {

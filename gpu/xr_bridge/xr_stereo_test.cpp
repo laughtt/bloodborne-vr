@@ -7,6 +7,8 @@
 //     lost, repeated, in a still scene (L and R differ only by the eye offset) and while strafing
 //     at exactly one IPD per frame (L of frame n = R of frame n+1);
 //   - frames without a camera or with an unknown one are held, then go to the mono path;
+//   - a frame whose first scene camera is another view (sewers) pairs by its other cameras;
+//   - a cutscene reported by the host sends every frame to the mono path (cinema) at once;
 //   - the bridge shows the eyes only when both have an image newer than the latest mono one;
 //   - the age statistics of the pacing log.
 // Exit code 0 when every check passes.
@@ -333,6 +335,76 @@ void TestOffAxis() {
     std::printf("PASS off-axis eyes pair by their half-width\n");
 }
 
+// The Central Yharnam sewers: the frame's first G-buffer camera is another view (a mirrored one
+// here), the eye's camera comes second. One camera: unmatched for the whole area, mono; all the
+// frame's cameras: every frame pairs, and from the first matched frame on the eyes are back.
+void TestOtherSceneCamera() {
+    Config config;
+    config.fallback_frames = 30;
+    Pairing old_way{config}, p{config};
+    int wrong = 0, mono_old = 0;
+    for (int n = 0; n < 200; ++n) {
+        const EyeView v = View(uint64_t(n + 1), n & 1, Moving(n));
+        old_way.Add(v);
+        p.Add(v);
+        // The extra view: the eye camera mirrored about a water plane 2 m below.
+        Cam mirror = Moving(n);
+        for (int i = 0; i < 3; ++i) {
+            mirror.rows[i][1] = -mirror.rows[i][1];
+        }
+        mirror.pos[1] = -6.5f - 2.0f - (mirror.pos[1] + 6.5f + 2.0f);
+        const FrameCamera cams[2] = {Frame(View(uint64_t(n + 1), n & 1, mirror)), Frame(v)};
+        mono_old += old_way.OnFrame(cams[0]).kind == Kind::Mono;
+        const Decision d = p.OnFrame(cams, 2);
+        wrong += d.kind != Kind::Eye || d.eye != (n & 1) || d.camera != 1;
+    }
+    CHECK(mono_old == 171 && old_way.stats().held_unmatched == 200);
+    CHECK(wrong == 0 && !p.Mono() && p.stats().other_camera == 200);
+    CHECK(p.stats().eye[0] == 100 && p.stats().eye[1] == 100 && p.stats().side_failures == 0);
+    // The diagnostics of an unmatched frame: how far the nearest view was.
+    Pairing q{config};
+    q.Add(View(1, 0, Moving(0)));
+    const Decision u = q.OnFrame(Frame(View(1, 0, MakeCam(1.0f, 0.0f, 120.0f, -6.5f, -15.0f))));
+    CHECK(std::string_view(u.reason) == "unmatched" && u.best_rotation > 0.1f &&
+          u.best_rotation < 2.0f && u.best_position < 0.1f);
+    // A frame with no cameras at all is "no camera", as with one empty camera.
+    CHECK(std::string_view(q.OnFrame(nullptr, 0).reason) == "no camera");
+    std::printf("PASS another scene camera first: paired by the frame's other cameras\n");
+}
+
+// A real-time cutscene (Remo): the host stops publishing eye views and reports it; every frame goes
+// to the mono path (the cinema screen) at once, not after 30 held frames; after it the eyes come
+// back with the first matched frame.
+void TestCinema() {
+    Config config;
+    config.fallback_frames = 30;
+    Pairing p{config};
+    for (int n = 0; n < 10; ++n) {
+        const EyeView v = View(uint64_t(n + 1), n & 1, Moving(n));
+        p.Add(v);
+        CHECK(p.OnFrame(Frame(v)).kind == Kind::Eye);
+    }
+    p.SetCinema(true);
+    CHECK(p.Cinema());
+    const FrameCamera cutscene = Frame(View(99, 0, MakeCam(2.0f, 0.2f, 0.0f, 0.0f, 0.0f)));
+    int mono = 0;
+    for (int n = 0; n < 50; ++n) {
+        const Decision d = p.OnFrame(cutscene);
+        mono += d.kind == Kind::Mono && std::string_view(d.reason) == "cinema";
+    }
+    CHECK(mono == 50 && p.Mono() && p.stats().cinema == 50 && p.stats().held_unmatched == 0);
+    // Even a frame whose camera matches an old view goes to the cinema screen while it is on.
+    CHECK(p.OnFrame(Frame(View(9, 0, Moving(8)))).kind == Kind::Mono);
+    p.SetCinema(false);
+    // The last cutscene frames after the end (the hook publishes again from the next frame): mono.
+    CHECK(p.OnFrame(cutscene).kind == Kind::Mono);
+    const EyeView back = View(11, 0, Moving(11));
+    p.Add(back);
+    const Decision d = p.OnFrame(Frame(back));
+    CHECK(d.kind == Kind::Eye && d.eye == 0 && !p.Mono());
+    std::printf("PASS cutscene: the cinema screen at once, the eyes again after it\n");
+}
+
 void TestRingOverflow() {
     Pairing p;
     std::vector<EyeView> views;
@@ -416,6 +488,8 @@ int main() {
     TestSideAndTransposed();
     TestOffAxis();
     TestRingOverflow();
+    TestOtherSceneCamera();
+    TestCinema();
     TestAltEyes();
     TestAges();
     std::printf("%d checks, %d failures\n", checks, failures);

@@ -23,10 +23,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -36,6 +38,10 @@
 #include "vr_ui_filter.h"
 #include "vr_game_hitbox.h"
 #include "vr_held_items.h"
+#include "vr_held_mesh.h"
+#include "vr_hand_model.h"
+#include "vr_skin_model.h"
+#include "vr_room_line.h"
 
 namespace vrui {
 
@@ -103,11 +109,29 @@ public:
 
     // Tests and logs.
     const held::HeldItem& HeldItemState() const { return held_item; }
+    /// The hand (0 left, 1 right) that holds a menu item, -1 none: any thread (the bridge hides that hand's marker
+    /// quad, which would cover the item at the grip).
+    int HeldHandForMarker() const { return held_marker_hand.load(std::memory_order_relaxed); }
     const sb::SwingReadout& Readout() const { return readout; }
     sb::UiSystem& Menus() { return menus; }
     bool Active() const { return active; }
     bool HudVisible() const { return hud_visible; }
     size_t HudVertices() const { return hud_canvas.world.size() + hud_canvas.top.size(); }
+    /// The HUD's front-layer triangles of the last Build (the held item, the hands: tests and the offline render).
+    const std::vector<sb::UiVertex>& HudTop() const { return hud_canvas.top; }
+    /// The custom hands (vr_hand_model.h): on (the layout's custom_hands.on or BB_XR_CUSTOM_HANDS)
+    /// and loaded; the triangles they drew last Build.
+    bool CustomHandsOn() const;
+    bool CustomHandsReady() const { return hand_models.Ready(); }
+    size_t HandTriangles() const { return hand_tris; }
+    /// The custom character model override (vr_skin_model.h): the config is read from the BB_VR_SKIN*
+    /// environment on first use (SetSkinConfig replaces it, for tests) and the mesh is loaded once,
+    /// on the first Build. The triangles drawn last Build, and the targets they were drawn for.
+    void SetSkinConfig(const skin::Config& c) { skin_cfg = c; skin_cfg_read = true; skin_tried = false; skin_ok = false; }
+    bool SkinLoaded() const { return skin_ok; }
+    size_t SkinTriangles() const { return skin_tris; }
+    /// The hand pose drawn last Build (tests).
+    const hand::Pose& HandPose(int h) const { return hand_pose[h ? 1 : 0]; }
 
 private:
     struct Ticket {
@@ -124,12 +148,20 @@ private:
     /// Something the user asked for that the game will not get: said in the headset and logged.
     void Refuse(const std::string& what, const std::string& why, std::string& log);
     void DrawGunRay(const sb::UiGameLayout& g);
-    void DrawHeldItem(const sb::UiGameLayout& g);
+    /// The held item; with the custom hands its mesh goes into `hands` at the palm socket.
+    void DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands = nullptr);
+    /// The custom hands (and the held item in one of them), sorted together into the HUD's top.
+    void DrawHands(const sb::UiGameLayout& g);
     /// Physical items (vr_held_items.h): a picked consumable goes into a hand instead of being used.
     bool StartHeld(const sb::UiAction& a, int slot, uint32_t id, std::string& log);
     void StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::string& log);
     void FireHeld(const held::Result& r, const FrameInput& in, std::string& log);
     void AddTired(std::vector<Haptic>& haptics);
+    /// BBXR_UI_HELD (the host hides that hand's weapon): sent when the grip closes on the item,
+    /// refreshed every kHeldSignalS, cleared (a = -1) when the item leaves the hand. `Locked`: the
+    /// caller holds `mutex` (FireHeld, so the clear precedes the use's actions).
+    void SyncHeldSignal();
+    void SyncHeldSignalLocked();
 
     double last_contact_pulse[2] = {-1.0e9, -1.0e9}; // per hand, the last weapon-contact pulse
     std::filesystem::path assets;
@@ -175,6 +207,19 @@ private:
     double now = 0.0;
     sb::UiPose head_pose, left_grip; // this frame's, for the HUD
     sb::UiPose left_aim;             // the gun ray's origin
+    vrui::room::Reader room_line;    // "Room K7Q-M4X  2/3" for the dashboard title (vr_room_line.h)
+    held::MeshCache held_meshes;     // the held item's 3D meshes (vr_held_mesh.h)
+    skin::Config skin_cfg;           // BB_VR_SKIN*, read once
+    skin::SkinMesh skin_mesh;        // loaded once (first Build), normalized
+    bool skin_cfg_read = false, skin_tried = false, skin_ok = false, skin_announced = false;
+    size_t skin_tris = 0;
+    void DrawSkins();
+    hand::HandModels hand_models;    // <assets>/hands/{left,right}.glb, loaded on first use
+    int custom_hands_env = -1;       // BB_XR_CUSTOM_HANDS: -1 unset, else 0/1
+    FrameInput hands_in;             // this frame's controllers, for the hands
+    hand::Pose hand_pose[2];
+    size_t hand_tris = 0;
+    m3::Quat held_grip_rot;          // the holding hand's grip rotation this frame (StepHeld)
     double last_pull = -1e9;         // the last left-trigger (L2) pull
     double last_pull_log = -1e9;
     bool ray_in_world = false;    void (*recenter)() = nullptr;
@@ -182,6 +227,11 @@ private:
     held::HeldItem held_item;
     double held_menu_ignore_until = -1.0; // the menu that took the pick is closing
     double held_fired_at = -1e9;
+    std::atomic<int> held_marker_hand{-1};
+    int32_t held_sig_id = 0;              // the item the host was told is in a hand (0: none)
+    int held_sig_hand = 1;
+    double held_sig_at = -1e9;
+    std::set<int> held_logged;            // goods whose mesh / stand-in was logged
     // The action the host is carrying out (shown until it is done, gave up, or 8 s passed).
     std::string pending;
     double pending_at = -1.0;

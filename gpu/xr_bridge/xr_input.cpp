@@ -6,8 +6,11 @@
 //                      a click (sent on release) is the game UI's DASHBOARD toggle with BB_VR_UI=1
 //                      (vr_ui_filter.h; plain L3 without it); held 1 s alone = recenter
 //   right stick        camera / turn; click = R3 (lock-on)
-//   A circle (dodge, sprint), B cross (interact), X square (use the quick item, weak haptic tick),
-//   Y triangle (blood vial)
+//   The pad bits this file sends are the UI's view: A circle, B cross, X square, Y triangle (the
+//   dashboard / wheel bindings read these). What the GAME gets in the world is remapped in
+//   vr_ui_filter.h FaceRemap: A = d-pad right pulse (swap the right weapon), B = circle (roll,
+//   sprint), X = d-pad left pulse (swap the left weapon), Y = cross (interact); no heal button
+//   (the quick wheel and the vial held at the mouth do it). X still gives a weak haptic tick.
 //   triggers           with gestures (BB_XR_TRIGGERS unset, the default): the left trigger is L2
 //                      (shoot, held, with the analog L2); the RIGHT trigger does nothing in the world.
 //                      BB_XR_TRIGGERS=switch: the left trigger is a d-pad left pulse (swap the left
@@ -39,8 +42,10 @@
 // logged, one line per kind per 2 s):
 //   right hand swing faster than 2 m/s, moving away from the head (not the return stroke), not
 //     while L3 is held -> R1 (R2 with the right grip held or above 3.5 m/s),
-//   left hand thrust along its pointing direction faster than 1.8 m/s, measured relative to the
-//     head and ignored for 300 ms after a snap turn or recenter -> L2,
+//   left hand thrust along its pointing direction (onset: 1.5 m/s and rising, the stroke within
+//     about 37 degrees of the barrel, 250 ms between shots; BB_XR_SHOOT_SPEED / _ALIGN / _REARM /
+//     _DEBOUNCE_MS, findings/41), measured relative to the head and ignored for 300 ms after a
+//     snap turn or recenter -> L2,
 //   left hand within 10 cm of the mouth with the left grip held for 0.3 s -> triangle (vial).
 // Gesture buttons are pressed for 100 ms.
 
@@ -66,8 +71,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr float HeavySpeed = 3.5f;
-constexpr float SwingRearm = 1.0f; // shoot rearm only
-constexpr float ShootSpeed = 1.8f;
 constexpr double TriggerPulseMs = 120.0;
 constexpr double PulseMs = 100.0;
 constexpr const char* OptionsChord = "the dashboard's Options button (BB_VR_UI=1; left stick click + B with BB_XR_CHORDS=1)";
@@ -122,7 +125,7 @@ struct State {
     uint32_t pending_gestures = 0;
 
     // Gesture state (frame loop thread only).
-    bool shoot_armed = true;
+    xrpad::ShootGate shoot; // BB_XR_SHOOT_SPEED / _ALIGN / _REARM / _DEBOUNCE_MS
     Clock::time_point pulse_until[32]{};
     xrpad::SwingGate swing;
     xrpad::HeavyCharge charge;
@@ -651,6 +654,23 @@ bool Create(XrInstance instance, XrSession session, LogFn log) {
         const double v = std::atof(tap);
         if (v >= 50.0 && v <= 2000.0) s->grip_tap.max_ms = v;
     }
+    // The gun thrust (findings/41): onset speed m/s, alignment cos, rearm m/s, debounce ms.
+    if (const char* v = std::getenv("BB_XR_SHOOT_SPEED")) {
+        const float x = static_cast<float>(std::atof(v));
+        if (x >= 0.5f && x <= 6.0f) s->shoot.on = x;
+    }
+    if (const char* v = std::getenv("BB_XR_SHOOT_ALIGN")) {
+        const float x = static_cast<float>(std::atof(v));
+        if (x >= -1.0f && x <= 0.99f) s->shoot.align = x;
+    }
+    if (const char* v = std::getenv("BB_XR_SHOOT_REARM")) {
+        const float x = static_cast<float>(std::atof(v));
+        if (x >= 0.0f && x <= 3.0f) s->shoot.rearm = x;
+    }
+    if (const char* v = std::getenv("BB_XR_SHOOT_DEBOUNCE_MS")) {
+        const double x = std::atof(v);
+        if (x >= 0.0 && x <= 2000.0) s->shoot.debounce_ms = x;
+    }
     const char* chords = std::getenv("BB_XR_CHORDS");
     s->chords = chords && chords[0] == '1';
     s->layer.chords = s->chords;
@@ -904,13 +924,9 @@ void Update(XrTime time, bool focused) {
             const Vec3 rel{velocity[0].x - head_velocity.x, velocity[0].y - head_velocity.y,
                            velocity[0].z - head_velocity.z};
             const float thrust = rel.x * forward.x + rel.y * forward.y + rel.z * forward.z;
-            if (turning) {
-                s->shoot_armed = false;
-            } else if (s->shoot_armed && thrust > ShootSpeed) {
+            const float rel_a[3] = {rel.x, rel.y, rel.z}, fwd_a[3] = {forward.x, forward.y, forward.z};
+            if (s->shoot.Update(now_ms, rel_a, fwd_a, turning)) {
                 Fire(BBXR_GESTURE_SHOOT, BBXR_BTN_L2, 0, now, thrust);
-                s->shoot_armed = false;
-            } else if (thrust < SwingRearm * 0.5f) {
-                s->shoot_armed = true;
             }
         }
         if (in.active && in.head.valid && in.grip[0].valid) {

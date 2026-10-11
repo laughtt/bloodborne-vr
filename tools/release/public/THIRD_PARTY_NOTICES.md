@@ -35,6 +35,7 @@ through the "or any later version" option of the source files. The source reposi
 | DejaVu Sans font | `gpu/third_party/fonts` | Bitstream Vera / DejaVu free licence (`LICENSE-DejaVu.txt`) |
 | AMD GCN headers | `gpu/third_party/gcn` | MIT-style (AMD) |
 | nlohmann/json 3.12.0 | `packaging/windows/licenses/` | MIT |
+| WebXR Input Profiles generic hand model (`left.glb`, `right.glb`; the custom VR hands, docs/vr/findings/40) | `<assets>/hands/`, licence `packaging/windows/licenses/webxr-input-profiles-generic-hand-LICENSE.txt` | MIT (Copyright (c) 2019 Amazon) |
 | Community patches (frame rate, effects) in `patches/Bloodborne.xml` | `patches/` | Authors named in each entry (illusion, Kyo and others), from the public shadPS4 patch collections; the VR hook entries are this project's |
 
 ## Runtime libraries shipped in the Windows release zip (`bin/`)

@@ -280,7 +280,41 @@ static void test_fp(void) {
     printf("PASS first person\n");
 }
 
+/* Real-time cutscenes (src/vr_fp_math.h vr_cutscene_raw / vr_cutscene_update). */
+static void test_cutscene(void) {
+    float a[4][4], b[4][4];
+    vr_cam_from_heading(a, 30 * VR_DEG, vr_v3(10, 2, -5));
+    memcpy(b, a, sizeof(b));
+    CHECK(vr_cam_same_view(a, b, 0.02f, 0.5f), "same matrix: same view");
+    b[3][0] += 0.4f;
+    CHECK(vr_cam_same_view(a, b, 0.02f, 0.5f), "0.4 m apart within 0.5 m");
+    b[3][0] += 0.2f;
+    CHECK(!vr_cam_same_view(a, b, 0.02f, 0.5f), "0.6 m apart: another view");
+    vr_cam_from_heading(b, 33 * VR_DEG, vr_v3(10, 2, -5));
+    CHECK(!vr_cam_same_view(a, b, 0.02f, 0.5f), "3 deg of heading: another view");
+    /* raw: the field camera is not the game's (debug camera, Remo slot), or a Remo plays with its camera */
+    CHECK(vr_cutscene_raw(0, 0, 0), "not the field camera: cutscene");
+    CHECK(!vr_cutscene_raw(1, 0, 0), "field camera, no Remo: gameplay");
+    CHECK(vr_cutscene_raw(1, 2, 1) && vr_cutscene_raw(1, 1, 1), "Remo playing with the game's camera");
+    CHECK(!vr_cutscene_raw(1, 3, 0), "a Remo flag but the gameplay camera: no cutscene");
+    CHECK(!vr_cutscene_raw(1, 0x10, 1), "other Remo flags do not count");
+    /* hysteresis: on after 3 frames, off after 20, single frames ignored */
+    VrCutsceneLatch l = {0, 0};
+    int on_at = -1;
+    for (int i = 0; i < 10 && on_at < 0; ++i)
+        if (vr_cutscene_update(&l, 1)) on_at = i;
+    CHECK(on_at == (int)VR_CUTSCENE_ON - 1, "on after %u frames (at %d)", VR_CUTSCENE_ON, on_at);
+    CHECK(vr_cutscene_update(&l, 0) && vr_cutscene_update(&l, 1), "one gameplay frame keeps the cinema screen");
+    int off_at = -1;
+    for (int i = 0; i < 40 && off_at < 0; ++i)
+        if (!vr_cutscene_update(&l, 0)) off_at = i;
+    CHECK(off_at == (int)VR_CUTSCENE_OFF - 1, "off after %u frames (at %d)", VR_CUTSCENE_OFF, off_at);
+    CHECK(!vr_cutscene_update(&l, 1) && !vr_cutscene_update(&l, 0) && !vr_cutscene_update(&l, 1) &&
+          !vr_cutscene_update(&l, 1), "flicker does not enter");
+}
+
 int main(void) {
+    test_cutscene();
     test_fp();
     test_identity();
     test_directions();

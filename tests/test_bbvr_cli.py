@@ -43,6 +43,16 @@ class CliTests(unittest.TestCase):
         self.assertFalse(st['app']['installed'])
         self.assertEqual(st['update']['status'], 'unchecked')
 
+    def test_alpha_notice_is_once_per_version(self):
+        (self.port / 'VERSION.txt').write_text('0.1.0-alpha.2', encoding='utf-8')
+        st = bbvr_cli.run(['state'])
+        self.assertTrue(st['app']['alpha_notice'])
+        self.assertIn('EARLY ALPHA', st['app']['alpha_text'])
+        self.assertFalse(bbvr_cli.run(['alpha-ack'])['app']['alpha_notice'])
+        self.assertEqual(L.load_config()['alpha_notice_seen'], '0.1.0-alpha.2')
+        (self.port / 'VERSION.txt').write_text('0.1.0-alpha.3', encoding='utf-8')  # a new version shows it again
+        self.assertTrue(bbvr_cli.run(['state'])['app']['alpha_notice'])
+
     def test_save_profile_and_values_share_the_web_menu_file(self):
         bbvr_cli.run(['save'], json.dumps({'profile': 'Comfort'}))
         self.assertEqual(S.load_settings(self.port / 'user' / 'bbvr_settings.json')['profile'], 'Comfort')
@@ -51,6 +61,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(st['values']['fps'], 90)
         saved = S.load_settings(self.port / 'user' / 'bbvr_settings.json')
         self.assertEqual(saved['custom']['fps'], 90)
+
+    def test_play_tab_profile_cards_and_view_toggle(self):
+        st = bbvr_cli.run(['state'])
+        for name in ('Default', 'Comfort', 'Performance', 'Quality (DLSS)'):
+            self.assertIn(name, st['profiles'])  # the Play tab shows one card per profile, with its note
+            self.assertTrue(st['profile_notes'][name])
+        self.assertEqual(st['values']['mode'], 'alt')  # the View toggle: 3D (alt) by default
+        self.assertIn('rtx', st['caps']['gpus'][0] if st['caps']['gpus'] else {'rtx': False})
+        # Performance: a plain profile pick
+        st = bbvr_cli.run(['save'], json.dumps({'profile': 'Performance'}))
+        self.assertEqual(st['profile'], 'Performance')
+        self.assertEqual(st['values']['eye_res'], '1.5')
+        # Flat screen (mono): the dashboard sends the full values with mode changed; nothing else moves
+        vals = dict(st['values'])
+        vals['mode'] = 'mono'
+        st2 = bbvr_cli.run(['save'], json.dumps({'values': vals}))
+        self.assertEqual(st2['values']['mode'], 'mono')
+        self.assertEqual(st2['profile'], 'Custom')
+        self.assertEqual(st2['values']['eye_res'], '1.5')
+        self.assertEqual(st2['values']['upscale'], 'fsr1')
+        self.assertEqual(S.build_launch(S.effective_values(S.load_settings(self.port / 'user' / 'bbvr_settings.json')),
+                                        bbvr_cli.make_menu()[0].paths, {})['env']['BB_XR_MODE'], 'mono')
+        # back to 3D
+        vals['mode'] = 'alt'
+        self.assertEqual(bbvr_cli.run(['save'], json.dumps({'values': vals}))['values']['mode'], 'alt')
 
     def test_game_dir_needs_eboot_and_accept_is_remembered(self):
         game = self.port / 'dump'
@@ -109,6 +144,101 @@ class CliTests(unittest.TestCase):
         (self.port / 'defaults').mkdir()
         (self.port / 'defaults' / 'release.json').write_text('{"update_repo": "a/b"}')
         self.assertEqual(S.release_defaults(self.port)['update_repo'], 'a/b')
+
+
+class OnlineCliTests(CliTests):
+    """online create|join|leave|status against a stand-in lobby (a tiny in-process REST server)."""
+
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import threading
+        calls = self.calls = []
+
+        class Lobby(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+                action = self.path.rsplit('/', 1)[-1]
+                calls.append((action, body))
+                if action == 'join' and body.get('code') != 'K7Q-M4X':
+                    status, out = 404, {'ok': False, 'error': 'not_found', 'message': 'No such room'}
+                elif action in ('create', 'join'):
+                    status, out = 200, {'ok': True, 'code': 'K7Q-M4X', 'token': 'tok',
+                                        'role': 'host' if action == 'create' else 'guest'}
+                elif action == 'status':
+                    status, out = 200, {'ok': True, 'in_room': body.get('token') == 'tok'}
+                else:
+                    status, out = 200, {'ok': True}
+                data = json.dumps(out).encode()
+                self.send_response(status)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.srv = http.server.HTTPServer(('127.0.0.1', 0), Lobby)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.url = 'http://127.0.0.1:%d' % self.srv.server_address[1]
+
+    def test_no_server_is_a_clean_error(self):
+        with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
+            self.assertEqual(bbvr_cli.run(['online', 'create'])['error'], 'no_server')
+
+    def test_create_status_leave(self):
+        bbvr_cli.run(['online', 'server', self.url])
+        out = bbvr_cli.run(['online', 'create', 'Tester'])
+        self.assertEqual((out['ok'], out['code'], out['role']), (True, 'K7Q-M4X', 'host'))
+        npid = self.calls[-1][1]['npid']
+        self.assertRegex(npid, r'^Tester_[2-9A-Z]{4}$')
+        self.assertTrue(bbvr_cli.run(['online', 'status'])['in_room'])
+        self.assertEqual(bbvr_cli.run(['online', 'leave']), {'ok': True, 'left': True})
+        self.assertEqual(bbvr_cli.run(['online', 'status']), {'ok': True, 'in_room': False})
+        self.assertEqual(bbvr_cli.run(['online', 'create'])['ok'], True)
+        self.assertEqual(self.calls[-1][1]['npid'], npid)          # identity is stable
+
+    def test_join_errors_and_unreachable(self):
+        bbvr_cli.run(['online', 'server', self.url])
+        self.assertEqual(bbvr_cli.run(['online', 'join', 'ZZZ-ZZZ'])['error'], 'not_found')
+        self.assertEqual(bbvr_cli.run(['online', 'join', 'K7Q-M4X'])['role'], 'guest')
+        bbvr_cli.run(['online', 'server', 'http://127.0.0.1:9'])
+        self.assertEqual(bbvr_cli.run(['online', 'join', 'K7Q-M4X'])['error'], 'unreachable')
+
+    def test_start_flow_host_join_solo(self):
+        """The dashboard's Play online / Play solo: the room file and the launcher environment each leads to."""
+        bbvr_cli.run(['online', 'server', self.url])
+        user = bbvr_cli._user_dir()
+        values = {'online_autobell': True}
+        # Play solo: no room, no online vars; the choice is remembered
+        self.assertEqual(bbvr_cli.run(['online', 'mode', 'solo'])['play_mode'], 'solo')
+        self.assertEqual(S.online_env(values, L.load_config(), user, public=True), {})
+        # Host a game: create, remember "host", the room file has the code, the env makes the game the host
+        out = bbvr_cli.run(['online', 'create'])
+        self.assertEqual(bbvr_cli.run(['online', 'mode', 'host']), {'ok': True, 'play_mode': 'online', 'online_step': 'host'})
+        room = json.loads((user / 'online_room.json').read_text(encoding='utf-8'))
+        self.assertEqual((room['code'], room['role']), (out['code'], 'host'))
+        for public in (False, True):
+            env = S.online_env(values, L.load_config(), user, public=public)
+            self.assertEqual((env['BB_ONLINE_ROOM'], env['BB_ONLINE_ROLE']), ('K7Q-M4X', 'host'))
+            self.assertTrue(env['BB_ONLINE_ROOM_FILE'].endswith('online_room.json'))
+            # Play solo again with the room still saved: online stays off
+            self.assertEqual(S.online_env(values, L.load_config(), user, public=public, solo=True), {})
+        st = bbvr_cli.run(['state'])['app']
+        self.assertEqual((st['play_mode'], st['online_step'], st['online_play']), ('online', 'host', True))
+        # Join a friend: leave, join by code, guest env
+        bbvr_cli.run(['online', 'leave'])
+        self.assertFalse((user / 'online_room.json').exists())
+        self.assertEqual(bbvr_cli.run(['online', 'join', 'K7Q-M4X'])['role'], 'guest')
+        bbvr_cli.run(['online', 'mode', 'join'])
+        env = S.online_env(values, L.load_config(), user, public=True)
+        self.assertEqual((env['BB_ONLINE_ROOM'], env['BB_ONLINE_ROLE']), ('K7Q-M4X', 'guest'))
+        self.assertEqual(bbvr_cli.run(['state'])['app']['online_step'], 'join')
+        # the view the dashboard polls carries the code
+        view = bbvr_cli.run(['online', 'view'])
+        self.assertTrue(view['in_room'] and view['code'] == 'K7Q-M4X')
 
 
 if __name__ == '__main__':

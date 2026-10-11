@@ -122,6 +122,7 @@
 #define VA_WORLD_CHR_MAN 0x593E878u
 #define VA_LOCK_TGT_MAN 0x593E860u     /* LockTgtMan (constructor 0x1c8d8f0, debug "IsLockMode:") */
 #define VA_SPRJ_CAMERA 0x593E8F8u
+#define VA_SPRJ_REMO 0x5940058u /* SprjRemo: +8 the playing Remo's player (camera +0x120, flags +0x168) */
 #define VA_PLAYER_INS_VTABLE 0x578F310u /* findings/13 3.1 */
 #define VA_DISP_ENTITY_VTABLE 0x57A0820u /* SprjFD4ModelDispEntity (constructor 0x2120bc4) */
 
@@ -134,7 +135,9 @@
 #define FP_HIDE_BASE (1u << 24) /* the base body model [P + 0x48] */
 #define FP_HIDE_SKIN_HEAD (1u << 25) /* the skin's (slot 1) head and neck: display mask groups 41 47 48 49 */
 #define FP_HIDE_SKIN_BODY (1u << 26) /* the skin's torso, legs, feet: groups 34 42 45 46 50 61 */
-#define FP_HIDE_ALL_BITS (FP_HIDE_SLOTS | FP_HIDE_BASE | FP_HIDE_SKIN_HEAD | FP_HIDE_SKIN_BODY)
+#define FP_HIDE_SKIN_ARMS (1u << 27) /* the skin's arms: group 43 (the hands, 44, stay) */
+#define FP_HIDE_SKIN_HANDS (1u << 28) /* the skin's hands: group 44 (nohands: the custom VR hands replace them) */
+#define FP_HIDE_ALL_BITS (FP_HIDE_SLOTS | FP_HIDE_BASE | FP_HIDE_SKIN_HEAD | FP_HIDE_SKIN_BODY | FP_HIDE_SKIN_ARMS | FP_HIDE_SKIN_HANDS)
 #define FP_TRACE_MAX (100u << 20)
 
 enum { FP_ANCHOR_HEAD = 0, FP_ANCHOR_BODY = 1, FP_ANCHOR_RAW = 2, FP_ANCHOR_STABLE = 3 };
@@ -200,6 +203,7 @@ static struct {
     /* the hunter's own model */
     uint32_t hide;         /* FP_HIDE_* / slot bits hidden while in first person */
     int hide_tp;           /* also in third person (diagnostics: see what a part is) */
+    int held_hide;         /* held_hide=1: the weapon models of the hand holding a bridge item are hidden */
     uint8_t hide_bits;     /* the display flags cleared (+0x210; 1 = drawn; diagnostics: hide_bits=) */
     int hidden;            /* display entities hidden this frame */
     uintptr_t parts_dumped;/* the parts holder last listed in the log */
@@ -214,6 +218,7 @@ static struct {
     VrVec3 dash_offset;    /* the dash's camera minus the eye, this H1 (vr_fp_dash_offset) */
     VrVec3 body_pos;
     float body_yaw;
+    VrCutsceneLatch cutscene; /* real-time cutscene (Remo) or debug camera: cinema screen */
 } fp;
 
 /* Shared with the pad sampler and the in-game step's hook (other threads). */
@@ -228,7 +233,12 @@ static _Atomic int fp_sync_on;                /* H1: turn the game camera this f
 static _Atomic int fp_cam_fired;              /* the in-game step hook ran (it is installed) */
 static _Atomic uint32_t fp_cam_own_bits;      /* float: the game camera's own heading (logs) */
 static _Atomic uint32_t fp_cam_turns;         /* frames the hook turned the game camera */
+static _Atomic int fp_cutscene_on;            /* H1: this frame shows a cutscene (vr_fp_cutscene) */
 static _Atomic int fp_frame_active;           /* H1 put this frame's camera in first person */
+static _Atomic int fp_held_hand = -1;         /* vr_fp_held_item: the hand holding a bridge item (0 left, 1 right), -1 none */
+static _Atomic uint64_t fp_held_time_us;      /* ... when the bridge last said so (it refreshes every ~2 s) */
+static _Atomic int fp_held_last_hand = -1;    /* the hand that held an item last (the fire block's tail) */
+static _Atomic uint64_t fp_held_release_us;   /* ... when it let go (hand -1 from the bridge) */
 static _Atomic int fp_turn_follow = 1;        /* the hook turns the follow camera too (control deep=0: no) */
 
 static uint64_t fp_now_us(void) {
@@ -321,11 +331,24 @@ static int anchor_parse(const char *v) {
  * go by clearing those groups in its display mask (+0x170), the arms (43) and hands (44) stay. */
 #define FP_SKIN_HEAD_GROUPS ((1ull << 41) | (1ull << 47) | (1ull << 48) | (1ull << 49))
 #define FP_SKIN_BODY_GROUPS ((1ull << 34) | (1ull << 42) | (1ull << 45) | (1ull << 46) | (1ull << 50) | (1ull << 61))
+#define FP_SKIN_ARM_GROUPS (1ull << 43)
+#define FP_SKIN_HAND_GROUPS (1ull << 44)
 #define FP_HIDE_WEAPONS 0x0001FF80u
+/* hands: body + the skin's arms (43). Slot 4 (arm armour: sleeves AND gloves, one mesh set, no
+ * separable glove group known) stays, so gloves never vanish; sleeves of armour stay with it.
+ * hands_skin: also hides slot 4: only the bare skin hands (44) remain, gloves are lost. */
+#define FP_HIDE_HANDS (FP_HIDE_BODY | FP_HIDE_SKIN_ARMS)
+#define FP_HIDE_HANDS_SKIN (FP_HIDE_HANDS | FP_SLOT(4))
+/* nohands: hands_skin + the skin's hands (44): no arms, sleeves, gloves or hands, only the weapons;
+ * for the custom VR hand model of the bridge (custom_hands, docs/vr/findings/40-custom-hands.md). */
+#define FP_HIDE_NOHANDS (FP_HIDE_HANDS_SKIN | FP_HIDE_SKIN_HANDS)
 static const struct { const char *name; uint32_t bits; } fp_hide_groups[] = {
     {"none", 0},
     {"head", FP_HIDE_HEAD},          /* face, hair, hat: what the near plane cut */
     {"body", FP_HIDE_BODY},          /* all but the arms (skin, sleeves), hands and weapons */
+    {"hands", FP_HIDE_HANDS},        /* body + bare skin arms; armour sleeves/gloves (slot 4) stay */
+    {"hands_skin", FP_HIDE_HANDS_SKIN}, /* + slot 4: sleeves gone, bare hands only (gloves too) */
+    {"nohands", FP_HIDE_NOHANDS},    /* + the skin hands (44): weapons only, for the custom VR hands */
     {"all", FP_HIDE_ALL_BITS},
     {"weapons", FP_HIDE_WEAPONS},
     {"skin", FP_SLOT(1)},
@@ -333,6 +356,8 @@ static const struct { const char *name; uint32_t bits; } fp_hide_groups[] = {
     {"base", FP_HIDE_BASE},
     {"skinhead", FP_HIDE_SKIN_HEAD},
     {"skinbody", FP_HIDE_SKIN_BODY},
+    {"skinarms", FP_HIDE_SKIN_ARMS},
+    {"skinhands", FP_HIDE_SKIN_HANDS},
 };
 /* hide=<token>[+<token>...]: a group name, sN (ChrAsm slot N), or a number (slot bits; bit 24 the
  * base body, 25/26 the skin's head/torso groups). Returns 0 (and leaves *out) when a token is not
@@ -424,6 +449,9 @@ static void fp_init(void) {
     fp.state = "starting";
     fp.on = 1;
     fp.hide_bits = 1;
+    fp.held_hide = 1;
+    e = getenv("BB_VR_FP_HELD_HIDE");
+    if (e && *e) fp.held_hide = atoi(e) != 0;
     e = getenv("BB_VR_FP_CONTROL");
     fp.control = e && *e ? e : NULL;
     e = getenv("BB_VR_FP_TRACE");
@@ -438,10 +466,10 @@ static void fp_init(void) {
             fprintf(stderr, "VR FP: trace %s could not be opened\n", trace);
     }
     if (fp.enabled)
-        fprintf(stderr, "VR FP: first person on (anim_lock %s, anchor %s, smooth %.2f s, floor %.2f, near %.2f m, turn %s (snap %.0f deg, smooth %.0f deg/s), move %s, hide 0x%x, camera heading sync %s, stick remap %s%s%s)\n",
+        fprintf(stderr, "VR FP: first person on (anim_lock %s, anchor %s, smooth %.2f s, floor %.2f, near %.2f m, turn %s (snap %.0f deg, smooth %.0f deg/s), move %s, hide 0x%x, held_hide %d, camera heading sync %s, stick remap %s%s%s)\n",
                 anim_lock_name(fp.anim_lock), anchor_name(fp.anchor), fp.smooth, fp.floor_frac, fp.near_plane,
                 fp.turn_game ? "game" : vrt_turn_name(fp.turn.turn), fp.turn.snap_rad / VR_DEG,
-                fp.turn.smooth_rad_s / VR_DEG, vrt_move_name(fp.turn.move), fp.hide, fp.sync ? "on" : "off",
+                fp.turn.smooth_rad_s / VR_DEG, vrt_move_name(fp.turn.move), fp.hide, fp.held_hide, fp.sync ? "on" : "off",
                 fp.remap ? "on (the residual with the hook)" : "off", fp.trace ? ", trace " : "",
                 fp.trace ? trace : "");
 }
@@ -453,7 +481,61 @@ int vr_fp_enabled(void) {
 
 int vr_fp_active(void) { return atomic_load_explicit(&fp_frame_active, memory_order_relaxed); }
 
+int vr_fp_cutscene(void) { return atomic_load_explicit(&fp_cutscene_on, memory_order_relaxed); }
+
+/* The bridge draws a held item (vial, molotov...) in a VR hand: that hand's weapon models are hidden
+ * so the game's weapon does not stick out of it. Called from the UI pad thread; vr_fp_frame (game
+ * thread) reads the pair. Hand mapping, from the "VR FP: part" dumps (out/vr_all_alt.log,
+ * out/dlss-vr/vr_dlss_alt.log): WP_A_2600 (Hunter Blunderbuss, a left-hand gun, findings/13:592) sits
+ * in ChrAsm slot 7/8 and WP_A_0800 (Saw Cleaver, findings/14:91) in slot 13: left hand = slots 7-10,
+ * right hand = slots 11-14. */
+void vr_fp_held_item(int hand, uint32_t item) {
+    (void)item;
+    const int h = hand == 0 || hand == 1 ? hand : -1;
+    const int prev = atomic_load_explicit(&fp_held_hand, memory_order_relaxed);
+    if (h < 0 && prev >= 0) { /* it let go: remember who, for the tail of the fire block */
+        atomic_store_explicit(&fp_held_last_hand, prev, memory_order_relaxed);
+        atomic_store_explicit(&fp_held_release_us, fp_now_us(), memory_order_relaxed);
+    }
+    atomic_store_explicit(&fp_held_time_us, fp_now_us(), memory_order_relaxed);
+    atomic_store_explicit(&fp_held_hand, h, memory_order_relaxed);
+}
+
+/* The hand whose attack inputs are blocked now (gpu/xr_bridge/vr_held_fire.h): the one holding a bridge item
+ * (refreshed within 5 s), or the one that let go less than tail_ms ago; -1 none. Any thread. */
+int vr_fp_held_fire_hand(unsigned tail_ms) {
+    const uint64_t now = fp_now_us();
+    const int hh = atomic_load_explicit(&fp_held_hand, memory_order_relaxed);
+    if (hh >= 0 && now - atomic_load_explicit(&fp_held_time_us, memory_order_relaxed) < 5000000u) return hh;
+    const int last = atomic_load_explicit(&fp_held_last_hand, memory_order_relaxed);
+    if (last >= 0 && now - atomic_load_explicit(&fp_held_release_us, memory_order_relaxed) < (uint64_t)tail_ms * 1000u)
+        return last;
+    return -1;
+}
+
 VrVec3 vr_fp_dash_offset(void) { return fp.dash_offset; }
+
+/* The throw's facing (vr_fp_throw_face): heading bits and the end time; 0 = none. Written by the pad thread
+ * (the release) and the game thread (the launch), read by H1. */
+static _Atomic uint32_t fp_throw_heading_bits;
+static _Atomic uint64_t fp_throw_until_us;
+static int fp_throw_logged;
+void vr_fp_throw_face(float heading, uint64_t until_us) {
+    if (!isfinite(heading)) return;
+    atomic_store_explicit(&fp_throw_heading_bits, f2u(heading), memory_order_relaxed);
+    atomic_store_explicit(&fp_throw_until_us, until_us, memory_order_release);
+}
+void vr_fp_throw_face_end(uint64_t until_us) {
+    const uint64_t u = atomic_load_explicit(&fp_throw_until_us, memory_order_acquire);
+    if (u > until_us) atomic_store_explicit(&fp_throw_until_us, until_us, memory_order_release);
+}
+/* H1: 1 and the heading while a throw holds the body. */
+static int fp_throw_face_now(uint64_t now, float *heading) {
+    const uint64_t u = atomic_load_explicit(&fp_throw_until_us, memory_order_acquire);
+    if (!u || now >= u) return 0;
+    *heading = u2f(atomic_load_explicit(&fp_throw_heading_bits, memory_order_relaxed));
+    return isfinite(*heading);
+}
 
 /* While a dodge plays under face_dodge=game the body is not turned by us: the arms must use the game's
  * live yaw (it can change in the step, before the arms run) instead of the H1 snapshot's. */
@@ -479,6 +561,7 @@ int vr_fp_body(VrVec3 *pos, float *yaw) {
  *   anim_lock=0|1|2 (comfort: 1 = the eye fixed above the root, no animation sway, flinch or yaw;
  *   2 = also eases root-motion bursts) anim_smooth=<s> (mode 2, default 0.25) anim_speed=<m/s> (mode 2: burst threshold, 4.5)
  *   hide=none|head|body|all|... (fp_parse_hide) hide_tp=0|1 (also in third person: diagnostics)
+ *   held_hide=1|0 (BB_VR_FP_HELD_HIDE) hide the weapons of the hand holding a bridge item (vr_fp_held_item)
  *   turn=snap|smooth|off|game snap=<deg> (0: game) turn_speed=<deg/s> deadzone= expo= turn_accel=<s>
  *   snap_on= snap_off= snap_repeat=<s> move=body|head|controller recenter=view|reset
  *   lock=view|game|turn lock_auto=<deg> (vr_turn_math.h, the same keys as the sandbox's)
@@ -516,6 +599,7 @@ static void fp_poll_control(uint64_t now) {
         else if (!strcmp(k, "anim_speed") && ok && x >= 0.5f && x <= 30.0f) fp.anim_speed = x;
         else if (!strcmp(k, "hide")) { if (!fp_parse_hide(v, &fp.hide)) fprintf(stderr, "VR FP: hide=%s not understood\n", v); }
         else if (!strcmp(k, "hide_tp")) fp.hide_tp = x != 0.0f;
+        else if (!strcmp(k, "held_hide")) fp.held_hide = x != 0.0f;
         else if (!strcmp(k, "hide_bits") && ok && x >= 1.0f && x <= 3.0f) fp.hide_bits = (uint8_t)x; /* bits 2-5 are never restored */
         else if (!strcmp(k, "turn") && !strcmp(v, "game")) fp.turn_game = 1;
         else if (!strcmp(k, "turn") && vrt_config_set(&fp.turn, k, v)) fp.turn_game = 0;
@@ -530,9 +614,9 @@ static void fp_poll_control(uint64_t now) {
         else if (!strcmp(k, "deep")) atomic_store_explicit(&fp_turn_follow, x != 0.0f, memory_order_relaxed);
     }
     fclose(f);
-    fprintf(stderr, "VR FP: control file: fp %d near %.3f anchor %s smooth %.2f floor %.2f forward %.2f up %.2f hide 0x%x%s | turn %s snap %.0f speed %.0f accel %.2f move %s lock %s lock_auto %.0f recenter %s | sync %d remap %d | anim_lock %s smooth %.2f s speed %.1f m/s\n",
+    fprintf(stderr, "VR FP: control file: fp %d near %.3f anchor %s smooth %.2f floor %.2f forward %.2f up %.2f hide 0x%x%s held_hide %d | turn %s snap %.0f speed %.0f accel %.2f move %s lock %s lock_auto %.0f recenter %s | sync %d remap %d | anim_lock %s smooth %.2f s speed %.1f m/s\n",
             fp.on, fp.near_plane, anchor_name(fp.anchor), fp.smooth, fp.floor_frac, fp.forward, fp.up, fp.hide,
-            fp.hide_tp ? " (third person too)" : "", fp.turn_game ? "game" : vrt_turn_name(fp.turn.turn),
+            fp.hide_tp ? " (third person too)" : "", fp.held_hide, fp.turn_game ? "game" : vrt_turn_name(fp.turn.turn),
             fp.turn.snap_rad / VR_DEG, fp.turn.smooth_rad_s / VR_DEG, fp.turn.accel_s, vrt_move_name(fp.turn.move),
             vrt_lock_name(fp.turn.lock), fp.turn.lock_auto_rad / VR_DEG, fp.turn.recenter_keeps_view ? "view" : "reset",
             fp.sync, fp.remap, anim_lock_name(fp.anim_lock), fp.anim_smooth, fp.anim_speed);
@@ -862,6 +946,102 @@ static void fp_parts_dump(uintptr_t player) {
     }
 }
 
+/* Held-item weapon hide, belt and braces (the bit-0 clear alone did not hide the gun in the headset, bb-probe-all53:
+ * slot 7 WP_A_2600 read 0x3f -> 0x3e and still drew). IsVisible (0x2121c80) draws a part when bit 0 of +0x210 is set AND
+ * (context group mask & disp +0x224) and (& disp +0x234) differ from the reference; the mesh groups drawn are the 128-bit
+ * mask at +0x170 (the proven skin-hide path). So each held slot also gets +0x170 and +0x224/+0x234 zeroed; the game's
+ * values are kept and put back when the hold ends or the slot changes (only if ours is still there). Per slot. */
+typedef struct {
+    uintptr_t disp;
+    int have;
+    uint8_t game[48], ours[48]; /* +0x170 (16 B), +0x224 (16 B), +0x234 (16 B) */
+} FpHeldSave;
+static FpHeldSave fp_held_save[FP_ASM_SLOTS];
+static struct { uint64_t last_us; unsigned frames, models, bit0, mask; } fp_held_stats;
+static void fp_held_pack(uintptr_t disp, uint8_t *out) {
+    memcpy(out, (const void *)(disp + 0x170), 16);
+    memcpy(out + 16, (const void *)(disp + 0x224), 16);
+    memcpy(out + 32, (const void *)(disp + 0x234), 16);
+}
+static void fp_held_unpack(uintptr_t disp, const uint8_t *in) {
+    memcpy((void *)(disp + 0x170), in, 16);
+    memcpy((void *)(disp + 0x224), in + 16, 16);
+    memcpy((void *)(disp + 0x234), in + 32, 16);
+}
+/* Called every H1 frame before fp_hide_apply: `mask` = the held hand's slots (0 = release). */
+static void fp_held_hide(uintptr_t player, uint32_t mask) {
+    uintptr_t holder = 0;
+    if (!player || !rd_ptr(player + 0x4D0, &holder)) return;
+    for (int i = 0; i < FP_ASM_SLOTS; ++i) {
+        FpHeldSave *sv = &fp_held_save[i];
+        const uintptr_t disp = fp_disp_of(fp_part(holder, i));
+        if (sv->have && (sv->disp != disp || !((mask >> i) & 1))) { /* released, or another model in the slot */
+            uint8_t cur[48];
+            if (sv->disp == disp && disp) {
+                fp_held_pack(disp, cur);
+                if (!memcmp(cur, sv->ours, 48)) fp_held_unpack(disp, sv->game);
+            }
+            sv->have = 0;
+        }
+        if (!disp || !((mask >> i) & 1)) continue;
+        uint8_t cur[48];
+        fp_held_pack(disp, cur);
+        if (!sv->have || memcmp(cur, sv->ours, 48)) { /* first time, or the game wrote its masks again */
+            if (sv->have) ++fp_held_stats.mask;
+            memcpy(sv->game, cur, 48);
+            sv->disp = disp;
+            sv->have = 1;
+        }
+        memset(sv->ours, 0, 48);
+        if (memcmp(cur, sv->ours, 48)) fp_held_unpack(disp, sv->ours);
+        ++fp_held_stats.models;
+        if (*(const volatile uint8_t *)(disp + 0x210) & 1) ++fp_held_stats.bit0; /* the game set the draw bit again (every frame) */
+    }
+    if (!mask) { memset(&fp_held_stats, 0, sizeof(fp_held_stats)); return; }
+    ++fp_held_stats.frames;
+    const uint64_t now = fp_now_us();
+    if (!fp_held_stats.last_us) fp_held_stats.last_us = now;
+    if (fp.log && now - fp_held_stats.last_us >= 1000000u) {
+        fprintf(stderr, "VR FP: held hide check (method: draw bit 0 + display mask +0x170 + group masks +0x224/+0x234 zeroed): "
+                "%u frames, %u model-frames, draw bit re-hidden %u, masks re-zeroed after a game rewrite %u\n",
+                fp_held_stats.frames, fp_held_stats.models, fp_held_stats.bit0, fp_held_stats.mask);
+        memset(&fp_held_stats, 0, sizeof(fp_held_stats));
+        fp_held_stats.last_us = now;
+    }
+}
+
+/* A held bridge item hides its hand's weapon slots (left 7-10, right 11-14): what the log shows when that
+ * changes, for the next headset run: every slot of both hands (7-16) with its model name and display flags
+ * (+0x210) before and after the hide, so a weapon that stays drawn is seen (a slot outside the mask, another
+ * model, or a bit the game sets again). `before` flags are read ahead of fp_hide_apply by the caller. */
+static void fp_held_log(uintptr_t player, int hand, uint32_t mask, const uint32_t *before, int applied) {
+    uintptr_t holder = 0;
+    rd_ptr(player + 0x4D0, &holder);
+    fprintf(stderr, "VR FP: held item: %s hand holds it, hiding %d weapon model(s) of ChrAsm slots mask 0x%x (left 7-10, right 11-14):\n",
+            hand == 0 ? "left" : "right", applied, mask);
+    for (int i = 7; i <= 16; ++i) {
+        const uintptr_t m = fp_part(holder, i);
+        if (!m) { fprintf(stderr, "VR FP:   held hide slot %2d empty\n", i); continue; }
+        const uintptr_t disp = fp_disp_of(m);
+        char name[32];
+        fp_model_name(m, name, sizeof(name));
+        const uint32_t after = disp ? *(const uint32_t *)(disp + 0x210) : 0;
+        fprintf(stderr, "VR FP:   held hide slot %2d %s %s flags 0x%08x -> 0x%08x%s\n", i, name, (mask >> i) & 1 ? "(in the mask)" : "(NOT in the mask)",
+                before[i - 7], after, (mask >> i) & 1 ? (after & 1 ? "  STILL DRAWN" : "  hidden") : "");
+        if (disp) {
+            uint64_t m[2], g[4];
+            uint8_t cur[48];
+            fp_held_pack(disp, cur);
+            if (fp_held_save[i].have) memcpy(cur, fp_held_save[i].game, 48); /* the game's values, before our zeroing */
+            memcpy(m, cur, 16);
+            memcpy(g, cur + 16, 32);
+            fprintf(stderr, "VR FP:     slot %2d disp 0x%llx display mask %016llx%016llx group masks +0x224 %016llx%016llx +0x234 %016llx%016llx (the game's values; zeroed while held, back on release)\n",
+                    i, (unsigned long long)disp, (unsigned long long)m[1], (unsigned long long)m[0], (unsigned long long)g[1],
+                    (unsigned long long)g[0], (unsigned long long)g[3], (unsigned long long)g[2]);
+        }
+    }
+}
+
 /* ---- lock-on: LockTgtMan [0x593E860] ---- */
 
 /* 1 while the player is locked on; *heading (the camera heading's sense) toward the target when
@@ -1162,6 +1342,27 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
         int field = 1;
         const float *fm = (const float *)(cam_field + 0x10);
         for (int i = 0; i < 16; ++i) field &= fabsf(fm[i] - game[i / 4][i % 4]) <= 1e-4f;
+        /* Real-time cutscenes (Remo, boss intros): the field check alone misses them (the Gascoigne
+         * intro kept field == game camera), so also: a Remo is playing and the game camera is its
+         * camera (vr_cutscene_raw). The H1/H2 hooks then leave the game's camera alone and the
+         * presenter puts the frames on the cinema screen (runtime_vr_head.c, bbgpu_vr_set_cinema). */
+        uintptr_t remo_mgr = 0, remo = 0;
+        int remo_flags = 0, remo_game = 0;
+        if (rd_ptr(va(VA_SPRJ_REMO), &remo_mgr) && rd_ptr(remo_mgr + 8, &remo) && fp_readable(remo + 0x120, 0x50)) {
+            remo_flags = *(const uint8_t *)(remo + 0x168);
+            remo_game = vr_cam_same_view(game, (const float (*)[4])(remo + 0x120), 0.02f, 0.5f);
+        } else {
+            remo = 0;
+        }
+        const int was_cut = fp.cutscene.on;
+        const int cut = vr_cutscene_update(&fp.cutscene, vr_cutscene_raw(field, remo_flags, remo_game));
+        atomic_store_explicit(&fp_cutscene_on, cut, memory_order_relaxed);
+        if (cut != was_cut || (logging && (cut || remo)))
+            fprintf(stderr, "VR FP: %s: field camera %s, Remo 0x%llx flags 0x%02x (its camera %s the game's)\n",
+                    cut != was_cut ? (cut ? "cutscene starts (cinema screen)" : "cutscene over (first person)")
+                                   : (cut ? "cutscene" : "Remo check"),
+                    field ? "is the game's" : "is not the game's", (unsigned long long)remo, remo_flags,
+                    remo_game ? "is" : "is not");
         if (!fp_read_chain(&c)) break;
         fp.body_ok = 1;
         fp.body_pos = c.pos;
@@ -1194,7 +1395,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
             world.x += root_dx;
             world.z += root_dz;
         } else fp.anim_state.valid = 0;
-        if (!field) { fp.state = "cutscene or debug camera"; break; }
+        if (cut) { fp.state = field ? "cutscene (Remo camera)" : "cutscene or debug camera"; break; }
         /* Downed (death, knockdown): the raw eye low for a while -> third person. */
         fp.down_time = have_eye && eye_raw.y < FP_DOWN_HEIGHT ? fp.down_time + dt : 0.0f;
         if (fp.down_s > 0.0f && fp.down_time > fp.down_s) { fp.state = "downed"; break; }
@@ -1207,10 +1408,41 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
     if (c.player) {
         if (fp.log) fp_parts_dump(c.player);
         const int hiding = fp.hide && (active || fp.hide_tp);
-        if (hiding) fp.hidden = fp_hide_apply(c.player, fp.hide);
+        /* A held bridge item: its hand's weapons (slots 7-10 left, 11-14 right) too, even with hide=0;
+         * lapses 5 s after the last refresh (the bridge repeats every 2 s) or at once on hand -1. The
+         * game sets the draw bit every frame, so not clearing it again shows the weapons. */
+        uint32_t held_mask = 0;
+        if (fp.held_hide && active) {
+            const int hh = atomic_load_explicit(&fp_held_hand, memory_order_relaxed);
+            if (hh >= 0 && fp_now_us() - atomic_load_explicit(&fp_held_time_us, memory_order_relaxed) < 5000000u)
+                held_mask = hh == 0 ? 0x780u : 0x7800u;
+        }
+        static uint32_t held_mask_logged;
+        uint32_t before[10] = {0};
+        const int held_log = held_mask != held_mask_logged;
+        if (held_log && held_mask) { /* the display flags of the weapon slots before our write */
+            uintptr_t holder = 0;
+            rd_ptr(c.player + 0x4D0, &holder);
+            for (int i = 7; i <= 16; ++i) {
+                const uintptr_t d = fp_disp_of(fp_part(holder, i));
+                before[i - 7] = d ? *(const uint32_t *)(d + 0x210) : 0;
+            }
+        }
+        fp_held_hide(c.player, held_mask);
+        if (hiding || held_mask) {
+            const int n = fp_hide_apply(c.player, (hiding ? fp.hide : 0) | held_mask);
+            if (hiding) fp.hidden = n;
+            if (held_log && held_mask) fp_held_log(c.player, held_mask == 0x780u ? 0 : 1, held_mask, before, n);
+        }
+        if (held_log) {
+            if (!held_mask) fprintf(stderr, "VR FP: held item: released, the weapon models draw again\n");
+            held_mask_logged = held_mask;
+        }
         fp_skin_mask(c.player, !hiding ? 0
                      : ((fp.hide & FP_HIDE_SKIN_HEAD) ? FP_SKIN_HEAD_GROUPS : 0) |
-                       ((fp.hide & FP_HIDE_SKIN_BODY) ? FP_SKIN_BODY_GROUPS : 0));
+                       ((fp.hide & FP_HIDE_SKIN_BODY) ? FP_SKIN_BODY_GROUPS : 0) |
+                       ((fp.hide & FP_HIDE_SKIN_ARMS) ? FP_SKIN_ARM_GROUPS : 0) |
+                       ((fp.hide & FP_HIDE_SKIN_HANDS) ? FP_SKIN_HAND_GROUPS : 0));
     }
     const int was_locked = fp.locked;
     fp.locked = c.player ? fp_lock_state(&c, &fp.target_yaw, &fp.target_valid) : 0;
@@ -1270,16 +1502,29 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
          * yaw, so there is no feedback; the eye (anchor head) is recomputed with the new yaw. */
         fp.phys_now = c.phys;
         fp.dodge_live = 0;
-        if (fp.face && c.phys && (!fp.locked || fp.face_lockon)) {
-            const float want0 = vr_wrap_pi(fp.turn_out.view_yaw - VR_PI); /* the hunter faces yaw + pi */
+        /* A throw (vr_fp_throw_face): from the release until its bullet launches the body faces the aim's heading,
+         * whatever the face mode, lock-on or stick: the game throws along the body (its launch matrix is the
+         * character's), and a body turned away from the view (the stick turned it, face=attack leaves the game's
+         * facing outside attacks) threw backwards. */
+        float throw_heading = 0.0f;
+        const int throw_face = c.phys && fp_throw_face_now(now, &throw_heading);
+        if (throw_face && !fp_throw_logged) {
+            fprintf(stderr, "VR FP: throw: body faces the aim heading %.1f deg (it faced %.1f deg, view %.1f deg)\n",
+                    throw_heading / VR_DEG, vr_facing_heading(c.yaw) / VR_DEG, fp.turn_out.view_yaw / VR_DEG);
+        }
+        if (!throw_face && fp_throw_logged)
+            fprintf(stderr, "VR FP: throw: body facing released (faces %.1f deg)\n", vr_facing_heading(c.yaw) / VR_DEG);
+        fp_throw_logged = throw_face;
+        if ((fp.face || throw_face) && c.phys && (!fp.locked || fp.face_lockon || throw_face)) {
+            const float want0 = vr_wrap_pi((throw_face ? throw_heading : fp.turn_out.view_yaw) - VR_PI); /* the hunter faces yaw + pi */
             const float dev = fabsf(vr_wrap_pi(c.yaw - fp.face_last));
             const int attack_mode = fp.face == 4;
             const int dodge_on = (fp.face_dodge != 1 || attack_mode) && fp_dodge_update(&c, now);
             const int attack_on = attack_mode && fp_attack_update(&c);
             /* face=attack: the view only during an attack (and a dodge when face_dodge asks for it); otherwise the
              * game's own facing (locomotion turns the body toward the stick: overriding it made the stick dead) */
-            const int idle = attack_mode && !attack_on && !(dodge_on && fp.face_dodge != 0);
-            const int dodging = (fp.face_dodge == 0 && dodge_on) || idle;
+            const int idle = !throw_face && attack_mode && !attack_on && !(dodge_on && fp.face_dodge != 0);
+            const int dodging = !throw_face && ((fp.face_dodge == 0 && dodge_on) || idle);
             if (fp.face_dodge == 2) fp_strafe(&c, &world, eye, root_dx, root_dz, dodge_on, now);
             if (fp.face_writes && fp.face_pending_ok && !dodging && dev > 1.4f && fp.log && now >= fp.next_flip_log) {
                 fp.next_flip_log = now + 1000000;
@@ -1300,13 +1545,14 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
                 fp.ease_off = attack_mode ? 0.0f : vr_wrap_pi(c.yaw - want0);
             } else if (isfinite(want0) && fp_readable(c.phys + 0x1D4, 4)) {
                 float w = want0;
-                if (fp.ease_off != 0.0f) { /* back to the view after a dodge */
+                if (fp.ease_off != 0.0f && !throw_face) { /* back to the view after a dodge */
                     fp.ease_off -= fp.ease_off * fminf(dt / face_ease_s, 1.0f);
                     if (dt <= 0.0f || fabsf(fp.ease_off) < 0.01f) fp.ease_off = 0.0f;
                     w = vr_wrap_pi(want0 + fp.ease_off);
                 }
-                /* written one frame late: this frame renders what the arms' snapshot of the last H1 assumed */
-                const float x = fp.face_pending_ok ? fp.face_pending : w;
+                /* written one frame late: this frame renders what the arms' snapshot of the last H1 assumed (a throw:
+                 * at once, the launch may come within a frame or two) */
+                const float x = fp.face_pending_ok && !throw_face ? fp.face_pending : w;
                 *(volatile float *)(c.phys + 0x1D4) = x;
                 if (fp.log && !fp.face_writes) fprintf(stderr, "VR FP: face %s: yaw %.1f -> %.1f deg\n", face_name(fp.face), c.yaw / VR_DEG, x / VR_DEG);
                 fp.face_pending = w;

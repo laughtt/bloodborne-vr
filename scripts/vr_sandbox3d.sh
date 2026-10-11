@@ -23,6 +23,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# From Git Bash (not the MSYS2 shell) MSYSTEM_PREFIX is unset: default to the CLANG64 tree.
+prefix="${MSYSTEM_PREFIX:-/c/msys64/clang64}"
+if ! command -v ninja >/dev/null 2>&1; then
+    export PATH="$prefix/bin:/c/msys64/usr/bin:$PATH"
+fi
+
 extract=0
 pass=()
 for arg in "$@"; do
@@ -81,7 +87,7 @@ out/xr-bridge/sandbox3d/bbport_xr_sandbox3d_dash_test.exe out/vr_assets
 run="out/sandbox3d/run-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run"
 cp out/xr-bridge/bbport_xr.dll out/xr-bridge/sandbox3d/bbport_xr_sandbox3d.exe \
-    "$MSYSTEM_PREFIX/bin/libopenxr_loader.dll" "$run/"
+    "$prefix/bin/libopenxr_loader.dll" "$run/"
 # Keep the three newest run folders (a folder still in use stays: its files are locked).
 ls -1d out/sandbox3d/run-* 2>/dev/null | sort | head -n -3 | while read -r old; do
     rm -rf "$old" 2>/dev/null || true

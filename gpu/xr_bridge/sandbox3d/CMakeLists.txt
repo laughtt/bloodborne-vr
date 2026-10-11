@@ -25,7 +25,7 @@ endforeach()
 add_custom_target(bbport_xr_sandbox3d_shaders DEPENDS ${SB3D_SHADER_HEADERS})
 
 set(SB3D_CORE config.cpp config.h json.h math3d.h model.cpp model.h rig.cpp rig.h
-    consumables_config.cpp consumables_config.h)
+    consumables_config.cpp consumables_config.h parry.cpp parry.h hands_config.h)
 
 add_executable(bbport_xr_sandbox3d main.cpp renderer.cpp renderer.h scene.cpp scene.h
     image_out.h ${SB3D_CORE})
@@ -123,6 +123,16 @@ target_link_options(bbport_xr_sandbox3d_throw_test PRIVATE -static-libstdc++ -st
 # gestures, the inventory and the player state; the scripted headless tests in
 # bbport_xr_sandbox3d_consume_test.exe. (consumables_config.cpp is part of SB3D_CORE: config.cpp
 # reads the "consumables" object.)
+# The parry trainer (parry.h, docs/vr/findings/41-parry.md): the left-hand gun thrust through the game's
+# ShootGate, the aim assist, the bullet and the telegraphing dummy (parry.cpp is part of SB3D_CORE:
+# config.cpp reads the "parry" object); its drawing and the custom hands (custom_hands.h,
+# ../vr_hand_model.h); the scripted tests in bbport_xr_sandbox3d_parry_test.exe.
+target_sources(bbport_xr_sandbox3d PRIVATE parry_view.cpp parry_view.h custom_hands.cpp custom_hands.h)
+add_executable(bbport_xr_sandbox3d_parry_test parry_test.cpp throw_config.cpp throw_config.h ${SB3D_PHYSICS}
+    ${SB3D_CORE})
+target_include_directories(bbport_xr_sandbox3d_parry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_options(bbport_xr_sandbox3d_parry_test PRIVATE -static-libstdc++ -static-libgcc)
+
 set(SB3D_CONSUME consumables.cpp consumables.h)
 target_sources(bbport_xr_sandbox3d PRIVATE ${SB3D_CONSUME})
 add_executable(bbport_xr_sandbox3d_consume_test consumables_test.cpp ${SB3D_CONSUME} ${SB3D_THROW}

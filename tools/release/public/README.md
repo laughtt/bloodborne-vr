@@ -5,7 +5,7 @@ own PS4 x86-64 code runs natively on a shadPS4-derived Vulkan renderer; an OpenX
 stereo rendering, head tracking, first-person view, controller-driven arms and weapons, and VR
 menus.
 
-> **Alpha, single-player only.** Expect bugs and comfort issues.
+> **Early alpha.** Single-player is the supported mode; co-op is experimental. Expect bugs and comfort issues.
 >
 > **No game files are included.** You need your own legally obtained, decrypted dump. This is an
 > unofficial fan project, not affiliated with, endorsed or sponsored by Sony Interactive
@@ -36,7 +36,11 @@ steps, known issues and how to report bugs. The controls are summarised below.
 | Left trigger (hold) | Hold the gun (L2) |
 | Left-hand thrust forward (gun held) | Shoot |
 | Left grip (squeeze) | L1 (transform) |
-| A / B / X / Y | Circle (dodge, sprint) / Cross (interact) / Square (use quick item) / Triangle (blood vial; also left hand at your mouth with the left grip held) |
+| A (right controller) | Swap the right-hand weapon |
+| B (right controller) | Roll / dodge, hold to sprint |
+| X (left controller) | Swap the left-hand weapon |
+| Y (left controller) | Interact (doors, pickups, ladders) |
+| Heal | Pick the Blood Vial on the quick wheel, or bring it to your mouth (left hand, left grip held) |
 | Right stick click (tap) | Open the item wheel: pick with your right hand (touch or point) or the stick |
 | Left stick click while standing | Open the VR dashboard (equipment, items, options) |
 | Left stick click while moving | Jump |
@@ -57,6 +61,60 @@ trigger** confirms, **B** goes back, and the menu button closes the menu.
 * **Molotovs, throwing knives and the like:** swing and let go of the grip to throw; the throw is aimed from your hand.
 * Hits with your weapon and bounces off walls give a haptic pulse in the controller.
 * The grey hand markers and the gun laser are off by default.
+
+## Co-op: how to join (up to 3 players)
+
+Co-op is **EXPERIMENTAL** in this alpha: it needs a **lobby address** (looks like `http://address:port`) from
+whoever runs a lobby, and playing over the internet is not fully tested. Everyone needs game version 1.09 and
+this same release. **Play solo** needs no server and no account.
+
+**A) HOST (the player whose world the others join)**
+
+1. Open `BloodborneVR.exe` (the dashboard).
+2. On the **Play** tab press **Play online**.
+3. Paste the lobby address you were given into the address box and press **Save** (only once, it is remembered).
+4. Press **Host a game**. A room code like `K7Q-M4X` appears (it also shows in the dashboard title).
+5. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
+6. Press **Start with this room**, load your character and walk a little way into an area. Do not stand in the
+   area's entry zone, and the area's boss must still be alive.
+7. Nothing to press in the game: your bell rings by itself and your friends appear.
+
+**B) FRIEND (joining)**
+
+1. Open `BloodborneVR.exe`.
+2. On the **Play** tab press **Play online**.
+3. Paste the SAME lobby address as the host and press **Save** (only once).
+4. Type the room code under **Join a friend** and press **Join**.
+5. Press **Start with this room**, load your character and stay in the same region as the host.
+6. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
+   it rings again by itself.
+
+**If it does not work**
+
+- Host and friends must use the same lobby address and the same room code.
+- The host must not stand in an area's entry zone, and that area's boss must not be dead yet.
+- Wait about a minute. If you saw "failed to acquire server information", restart the game.
+- The Windows firewall must allow BloodborneVR (allow it when Windows asks).
+- Co-op is experimental and internet play is not fully tested.
+
+**Leave a room / play solo:** press **Leave** (the host sees **Close room**) in the Play online card, or **Leave room**
+on the **Online** tab. **Back** returns to the Play tab, where **Play solo** starts the game without a room.
+
+## Comfort, one-eye viewing and weaker PCs
+
+On the dashboard's **Play** tab, under the profile cards, **View** switches between **3D** and **Flat screen (mono)**, and
+picking a profile card (**Default**, **Comfort**, **Performance**, **Quality (DLSS)**) saves it at once. On a PC without an
+NVIDIA RTX card the Play tab also says "Low fps? Try Performance."
+
+- **Cannot see 3D with both eyes, flicker or discomfort:** set **View** to **Flat screen (mono)** (or Options tab, Display / VR,
+  **Stereo mode** = mono, or start with `BloodborneVR.exe --mono`). You get one big flat screen in the headset and the
+  controllers still work. If the depth looks wrong in 3D, try **Swap eyes** (Options, switch **Advanced** on) and **Stereo scale**.
+- **Motion sickness:** pick the **Comfort** profile (snap turning, locked and eased camera animation, steadier camera).
+- **Weaker PC or low fps:** pick the **Performance** profile (FSR 1 at 1.5x the frame instead of 2x, lower model detail).
+  You can also lower **Frame limit (fps)** and **Eye resolution** (Options tab, Display / VR and DLSS). With an NVIDIA RTX card,
+  the **Quality (DLSS)** profile gives the best picture.
+- **Defaults:** Stereo mode alt (true 3D), Frame limit 72 fps, FSR 1 upscaling (DLSS quality on an RTX card), eye
+  resolution 2x the 1080p frame, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
 
 ## Updating (keep your saves)
 

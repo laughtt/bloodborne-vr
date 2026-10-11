@@ -63,12 +63,26 @@ and use your own legally obtained dump. It is not affiliated with, endorsed or s
 Interactive Entertainment, FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne
 are trademarks of their owners.
 """
+ALPHA_NOTICE = ('EARLY ALPHA: many bugs, crashes are possible, please be patient. Crash reports stay on this PC '
+                '(they are never uploaded); see README.txt to report a bug.')
 HOOKS = ';'.join(settings_mod.HOOKS_BASE)
 PATCHES = ';'.join(name for name, oid, *_ in settings_mod.PATCHES if settings_mod.BY_ID[oid]['default'])
 
 
 def say(text=''):
     print(text, flush=True)
+
+
+def app_version():
+    try:
+        return (PORT / 'VERSION.txt').read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def alpha_notice_due(config, version=None):
+    """True until the player pressed OK on the early-alpha notice for this version (config key alpha_notice_seen)."""
+    return config.get('alpha_notice_seen') != (app_version() if version is None else version)
 
 
 def ask(prompt, default=None):
@@ -308,10 +322,19 @@ def launch(env_extra, menu=None):
     for old in sorted(LOGS.glob('bbvr-*.log'))[:-9]:
         old.unlink(missing_ok=True)
     say(f'Starting. Put the headset on. Log: {log}')
+    say(ALPHA_NOTICE)
     if menu:
         menu.game_running = True
+    heartbeat = None
+    if env.get('BB_ONLINE_ROOM_FILE'):  # in a room: keep the room file (members, sign, summoned) fresh while the game runs
+        try:
+            import bbvr_online
+            heartbeat = bbvr_online.start_thread(DATA / 'user', log=say, room_file=env['BB_ONLINE_ROOM_FILE'])[1]
+        except Exception as err:  # the game must start without it
+            say(f'  Online: room heartbeat not started ({err})')
     # The game's output goes to the console and to the log (a crash report is saved by run.py, docs/CRASH_REPORTS.md).
     with open(log, 'w', encoding='utf-8', errors='replace') as handle:
+        handle.write(ALPHA_NOTICE + '\n')
         child = subprocess.Popen([sys.executable, str(PORT / 'run.py')], cwd=PORT, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         while True:
@@ -326,6 +349,8 @@ def launch(env_extra, menu=None):
             sys.stdout.write(text.encode(enc, 'replace').decode(enc, 'replace'))
             sys.stdout.flush()
         code = child.wait()
+    if heartbeat:
+        heartbeat.set()
     if menu:
         menu.game_running = False
     shutil.copyfile(log, LOGS / 'bbvr-latest.log')
@@ -398,6 +423,18 @@ def run_with_settings(game, args):
     if wr:
         say('  Warning: ' + wr)
     OUT.mkdir(parents=True, exist_ok=True)
+    online = settings_mod.online_env(values, load_config(), DATA / 'user', solo=getattr(args, 'solo', False))
+    if getattr(args, 'solo', False):
+        say('  Play solo: online is off.')
+    if online:
+        plan['env'].update(online)
+        lobby = settings_mod.lobby_address(values, load_config(), DATA / 'user')
+        if lobby and 'SHADPS4_HTTP_HOST_OVERRIDES_JSON' not in plan['env']:
+            import bbvr_online
+            hosts = bbvr_online.sync_host_overrides(lobby, DATA / 'user', say)
+            if hosts:
+                plan['env']['SHADPS4_HTTP_HOST_OVERRIDES_JSON'] = str(hosts)
+        say('  Online: ' + (f'room {online["BB_ONLINE_ROOM"]} as {online["BB_ONLINE_ROLE"]}' if 'BB_ONLINE_ROOM' in online else 'on'))
     changed = settings_mod.apply_files(plan, paths)
     if changed:
         say('  Updated: ' + ', '.join(Path(c).name for c in changed))
@@ -418,6 +455,7 @@ def run_with_settings(game, args):
 def main():
     ap = argparse.ArgumentParser(description='Bloodborne VR alpha launcher')
     ap.add_argument('--check', action='store_true', help='run the checks only')
+    ap.add_argument('--solo', action='store_true', help='play solo: online off even when a room is saved (the dashboard Play solo button)')
     ap.add_argument('--mono', action='store_true', help='flat screen in the headset (no stereo)')
     ap.add_argument('--game-dir', help='game folder (remembered)')
     ap.add_argument('--reset', action='store_true', help='forget the game folder and the extracted VR data')

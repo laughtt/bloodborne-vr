@@ -83,6 +83,8 @@ void runtime_vr_head_register(void);
 /* "Misses are free" stamina (src/runtime_vr_stamina.c, BB_VR_STAMINA): registers the stamina cost,
  * hit and tick hook handlers. */
 void runtime_vr_stamina_register(void);
+/* Always-on hook that pre-faults the ribbon vertex buffer (src/runtime_redzone_guard.c); BB_REDZONE_GUARD=0 disables. */
+void runtime_redzone_guard_install(unsigned char *image);
 /* The game side of the VR UI (src/runtime_vr_ui.c, BB_VR_UI=1): the image base for its reads; the
  * pad sampler's hook (the game's state to the bridge, the headset's choices as button presses: the
  * buttons to add); the stamina tickets as swing events (BBXR_EV_*). */
@@ -90,6 +92,14 @@ void runtime_vr_ui_register(unsigned char *image);
 /* The net state monitor (src/runtime_vr_netstate.c, BB_NET_STATE_LOG=1): logs changes of the game's network flags. */
 #define runtime_vr_netstate_register(image) ((void)(image))
 uint32_t runtime_vr_ui_pad(uint32_t buttons);
+/* Auto-bell for rooms (src/runtime_online_bell.c, src/vr_online_bell.h): BB_ONLINE_ROLE=host|guest. tick returns 0 none, 1 ring,
+ * 2 give (the item is runtime_online_bell_item()); direct: the ring uses the game's direct item-use call (no pad presses).
+ * result: the ring finished, reached 1 accepted / 0 not reached / -1 refused by the game right now (busy character);
+ * path "direct" or "pad" (may be NULL). */
+int runtime_online_bell_armed(void);
+unsigned runtime_online_bell_item(void);
+int runtime_online_bell_tick(double now, int in_world, int alive, int menu_open, int busy, int acting, int bell_count, int direct);
+void runtime_online_bell_result(double now, int reached, const char *path);
 void runtime_vr_ui_event(uint32_t kind, int32_t a, int32_t b, int32_t c);
 /* A filter the pad sampler runs on every read, after all sources are merged (first person: snap
  * turn on the right stick, src/runtime_vr_fp.c). Sticks are 0..255, 128 = centred. */

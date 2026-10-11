@@ -264,6 +264,23 @@ void CameraMotion::RecordMotionWith(vk::CommandBuffer cmdbuf, vk::ImageView dept
 }
 
 void CameraMotion::OnConstants(const float* data) {
+    // bbport VR stereo: every distinct camera of the frame's G-buffer passes (any far plane).
+    if (data[0] > 1.0f && data[0] < 1e6f && data[4] >= 64.0f && data[5] >= 64.0f &&
+        std::abs(data[1] * data[0] - 1.0f) <= 1e-3f && data[52] != 0.0f && data[57] != 0.0f) {
+        if (!frame_cameras_open) {
+            frame_cameras_open = true;
+            frame_camera_count = 0;
+        }
+        bool known = false;
+        for (u32 i = 0; i < frame_camera_count && !known; ++i) {
+            known = std::memcmp(frame_views[i].data(), data + 8, 12 * sizeof(float)) == 0;
+        }
+        if (!known && frame_camera_count < kMaxFrameCameras) {
+            std::memcpy(frame_views[frame_camera_count].data(), data + 8, 12 * sizeof(float));
+            frame_proj_x[frame_camera_count] = data[52];
+            ++frame_camera_count;
+        }
+    }
     // Scene constants: far plane 3000, 1/far, and the render size. bbport VR: the [0] value moves
     // with the near plane (3001.49 at the first-person camera's 0.2 m instead of 3000 at the
     // game's 0.05 m), so it is matched within 100.
@@ -299,6 +316,10 @@ void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
     if (!frame_has_camera) InvalidateHistory();
     finished_depth = frame_has_camera ? depth_id : VideoCore::ImageId{};
     frame_has_camera = false;
+    if (!frame_cameras_open) {
+        frame_camera_count = 0; // a frame without G-buffer cameras (menus, loading)
+    }
+    frame_cameras_open = false;
     depth_id = {};
 }
 

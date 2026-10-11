@@ -26,6 +26,10 @@ import sys
 
 PUBLIC_BUILD = True  # tools/release/export_public.py rewrites this to True in the public tree
 SCHEMA_VERSION = 1
+# The start flow (dashboard "Play online" / "Play solo", a room code in the game) is part of every build, public too;
+# only the dev options flagged online=True stay hidden there. The lobby address is never shipped: it is the player's
+# online_server setting.
+ONLINE_PLAY = True
 
 
 def is_public():
@@ -153,7 +157,8 @@ def _build_schema():
     a(_o('hitscale_env', 'combat', 'Hit shape scaling (feature)', 'bool', ('env', 'BB_VR_HIT_SCALE'), True, advanced=True))
     # ---- Body / arms ----
     a(_o('hide', 'body', 'Hide parts of the body', 'choice', ('fp', 'hide'), 'body',
-         choices=['none', 'head', 'body', 'all'], help='body hides all but arms, hands and weapons.'))
+         choices=['none', 'head', 'body', 'hands', 'hands_skin', 'nohands', 'all'],
+         help='body hides all but arms, hands and weapons. hands also hides the bare arms (armour sleeves and gloves stay). hands_skin also hides armour sleeves: bare hands only, gloves vanish. nohands also hides the bare hands (weapons only), for the custom VR hands (custom_hands in ui_layouts.json or BB_XR_CUSTOM_HANDS=1). hands/hands_skin/nohands untested in game.'))
     a(_o('arms', 'body', 'VR arms', 'bool', ('env', 'BB_VR_ARMS'), True, help='Arms follow the controllers (IK).'))
     a(_o('arm_attack', 'body', 'Arm weight while attacking', 'float', ('fp', 'arm_attack'), 1.0, min=0.0, max=1.0, step=0.05))
     a(_o('arm_weight', 'body', 'Arm weight (max)', 'float', ('fp', 'arm_weight'), None, min=0.0, max=1.0, step=0.05))
@@ -191,6 +196,14 @@ def _build_schema():
          ('launch', 'extra_env'), '', advanced=True, help='Passed to the game as written. Only names starting with BB_ are used.'))
     a(_o('online', 'advanced', 'Private build option', 'bool', ('env', 'BB_ONLINE'), False, online=True,
          help='Not available in this build.'))
+    a(_o('online_server', 'advanced', 'Lobby address', 'text', ('launch', 'online_server'), None, online=True,
+         help='Base address of the room server (the CLI "online server" command sets the same value).'))
+    a(_o('online_game_server', 'advanced', 'Game server address', 'text', ('launch', 'online_game_server'), None, online=True,
+         help='host:port the game signs in to. Empty: taken from the lobby address.'))
+    a(_o('online_autobell', 'advanced', 'Ring the bells automatically in a room', 'bool', ('env', 'BB_ONLINE_AUTOBELL'), True,
+         online=True, help='In a room the game rings the Beckoning Bell (host) or the Small Resonant Bell (guest) by itself.'))
+    a(_o('online_give_bells', 'advanced', 'Give the bells when missing', 'bool', ('env', 'BB_ONLINE_BELL_GIVE'), True,
+         online=True, advanced=True, help='In a room, adds a missing Beckoning / Small Resonant Bell (key items, never used up) so a new character can co-op. Off: the game only logs that it is missing.'))
     return O
 
 
@@ -869,6 +882,60 @@ def release_defaults(port):
         return {}
 
 
+def _read_json(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def lobby_address(values, config, user_dir):
+    """The lobby the player entered: the online_server setting, else the saved room's server, else the config's."""
+    room = _read_json(Path(user_dir) / 'online_room.json')
+    return str(values.get('online_server') or room.get('server') or (config or {}).get('online_server') or '').strip().rstrip('/')
+
+
+def online_env(values, config, user_dir, public=None, solo=False):
+    """Environment for a game started from a room (user/online_room.json + user/online_identity.json, both written
+    by `bbvr_cli.py online ...`). {} for "Play solo" (solo=True), when there is no room and the dev `online` option is
+    off, or when ONLINE_PLAY is off. In a public build only a room switches online on (the dev option is hidden)."""
+    public = is_public() if public is None else public
+    if solo or (public and not ONLINE_PLAY):
+        return {}
+    room = _read_json(Path(user_dir) / 'online_room.json')
+    ident = _read_json(Path(user_dir) / 'online_identity.json')
+    in_room = bool(room.get('code') and room.get('role') in ('host', 'guest') and not room.get('closed'))
+    if not (in_room or (values.get('online') and not public)):
+        return {}
+    env = {'BB_ONLINE': '1'}
+    if ident.get('npid'):
+        env['BB_SHADNET_NPID'] = str(ident['npid'])
+        env['BB_USER_NAME'] = str(ident.get('name') or ident['npid'])
+        if ident.get('password'):
+            env['BB_SHADNET_PASSWORD'] = str(ident['password'])
+    lobby = lobby_address(values, config, user_dir)
+    game = str(values.get('online_game_server') or '').strip()
+    if not game and lobby:
+        # the lobby shares its host with the game server; the game port is two below the lobby's (online_hosts.online_webapi)
+        host, _, port = lobby.split('://', 1)[-1].partition('/')[0].rpartition(':')
+        if host and port.isdigit() and int(port) > 2:
+            game = f'{host}:{int(port) - 2}'
+    if game:
+        env['BB_ONLINE_SERVER'] = game
+    if in_room:
+        env['BB_ONLINE_ROLE'] = room['role']
+        env['BB_ONLINE_ROOM'] = str(room['code'])
+        env['BB_ONLINE_ROOM_FILE'] = str(Path(user_dir) / 'online_room.json')
+        env['BB_ONLINE_STATUS_FILE'] = str(Path(user_dir) / 'online_bell_status.json')
+        env['BB_ONLINE_AUTOBELL'] = '1' if values.get('online_autobell') is not False else '0'
+        if values.get('online_give_bells') is not False:
+            env['BB_ONLINE_BELL_GIVE'] = '1'  # a new character without the bells can still co-op
+        if values.get('online_free_bells') is not False:
+            env['BB_ONLINE_FREE_BELLS'] = '1'  # the co-op bells cost no Insight (src/vr_free_bells.h)
+    return env
+
+
 def make_paths(port, game_dir, data=None):
     data = Path(data) if data else Path(port)
     out = data / 'out'
@@ -895,7 +962,7 @@ def page_state(settings, caps, public=None):
     values = {k: v for k, v in effective_values(settings, caps).items() if not (public and BY_ID[k].get('online'))}
     runtimes = caps['runtimes']
     return {
-        'public': public, 'tabs': [{'id': t, 'label': l} for t, l in TABS], 'options': opts, 'values': values,
+        'public': public, 'online_play': ONLINE_PLAY, 'tabs': [{'id': t, 'label': l} for t, l in TABS], 'options': opts, 'values': values,
         'profile': settings['profile'], 'profiles': PROFILE_ORDER, 'profile_notes': PROFILE_NOTES,
         'show_menu': settings.get('show_menu', True),
         'caps': {'gpus': caps['gpus'],

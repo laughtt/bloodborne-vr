@@ -36,6 +36,20 @@ def default_msys2():
     return Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64'
 
 
+def tool_env(msys2):
+    """Environment for clang / llvm-rc: the MSYS2 bin first on PATH, and a TEMP / TMP that exists. llvm-rc (and windres)
+    write the preprocessed .rc to a temp file and fail with "Unable to create temp file" when TEMP / TMP is unset or
+    names a folder that is gone (a sandboxed shell, a cleaned temp folder)."""
+    env = dict(os.environ, PATH=str(msys2 / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    for var in ('TEMP', 'TMP'):
+        if not (env.get(var) and Path(env[var]).is_dir()):
+            scratch = REPO / 'out' / 'release_cache' / 'tmp'
+            scratch.mkdir(parents=True, exist_ok=True)
+            env['TEMP'] = env['TMP'] = str(scratch)
+            break
+    return env
+
+
 def available(msys2=None):
     msys2 = msys2 or default_msys2()
     return bool(find_tool('clang', msys2) and find_tool('llvm-rc', msys2))
@@ -52,7 +66,7 @@ def build(out, version='0.1.0', msys2=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         res = Path(tmp) / 'bbvr.res'
-        env = dict(os.environ, PATH=str(msys2 / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+        env = tool_env(msys2)
         steps = [
             [rc, '/I', str(msys2 / 'include'), f'-DBBVR_FILEVER={",".join(map(str, nums))}', f'-DBBVR_FILEVER_STR="{text}"',
              '/FO', str(res), str(SRC / 'bbvr.rc')],

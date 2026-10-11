@@ -23,6 +23,7 @@ import struct
 from pathlib import Path
 
 import bbmodel
+import item_tex
 import souls
 
 # goods id -> (name, [(sfx mesh id, how it was found)]); the first mesh is the item's.
@@ -67,6 +68,11 @@ def _sfx_entries(root: Path):
     return meshes, fxrs
 
 
+def _sfx_tpfs(root: Path) -> dict:
+    data = souls.bnd4_read((root / 'sfx' / 'frpg_sfxbnd_commoneffects.ffxbnd.dcx').read_bytes())
+    return item_tex.index_bundle(data)
+
+
 def fxr_mesh_refs(fxr: bytes, mesh_ids) -> list:
     """The s##### ids a .fxr names: 32-bit words equal to a mesh id (the resource ids of the
     effect's model layers; FXR is not parsed further)."""
@@ -74,7 +80,9 @@ def fxr_mesh_refs(fxr: bytes, mesh_ids) -> list:
                    if v in mesh_ids})
 
 
-def convert_sfx_mesh(entry, name: str, center: bool = True) -> bbmodel.Model:
+def convert_sfx_mesh(entry, name: str, center: bool = True, tex=None) -> bbmodel.Model:
+    """tex: (out dir, {basename: tpf entry} of the bundle) to also decode each submesh's albedo
+    (item_tex.py) and name it in the submesh's "texture"."""
     flver = souls.flver_read(entry.data)
     model = bbmodel.Model(name)
     model.bones.append({'name': 'root', 'parent': -1, 'deform': True,
@@ -106,9 +114,15 @@ def convert_sfx_mesh(entry, name: str, center: bool = True) -> bbmodel.Model:
         out = [([p[k] - c[k] for k in range(3)], n, uv, (0, 0, 0, 0), (1.0, 0.0, 0.0, 0.0))
                for p, n, uv in verts]
         material = flver.materials[mesh.material] if mesh.material < len(flver.materials) else None
-        model.add_mesh({'name': f'{name}/{mi}', 'part': name, 'slot': 'weapon',
-                        'material': material.name if material else '',
-                        'mask': -1, 'hidden': False, 'dominant_bone': 0}, out, tris)
+        info = {'name': f'{name}/{mi}', 'part': name, 'slot': 'weapon',
+                'material': material.name if material else '',
+                'mask': -1, 'hidden': False, 'dominant_bone': 0}
+        if tex is not None and material is not None:
+            stem = item_tex.albedo_stem(flver, material)
+            key = item_tex.add(tex[0], stem, tex[1], '_alp' not in (material.mtd or '').lower()) if stem else None
+            if key:
+                info['texture'] = key
+        model.add_mesh(info, out, tris)
     model.extra = {'kind': 'throwable', 'source_center': c,
                    'size': [hi[k] - lo[k] for k in range(3)]}
     return model
@@ -136,6 +150,7 @@ def export(root: Path, out: Path, extra_meshes=(), quiet: bool = False) -> list:
     out = out / 'throwables'
     out.mkdir(parents=True, exist_ok=True)
     meshes, fxrs = _sfx_entries(root)
+    tex = (out.parent, _sfx_tpfs(root))
     rows = bullet_table(root)
     # Which flight effects name which mesh (for the findings doc and a sanity check).
     for r in rows:
@@ -151,7 +166,7 @@ def export(root: Path, out: Path, extra_meshes=(), quiet: bool = False) -> list:
             if not quiet:
                 print(f'th_{r["goods"]}: {r["name"]}: no mesh ({r["sfx_mesh_how"]})')
             continue
-        model = convert_sfx_mesh(meshes[mesh], f'th_{r["goods"]}')
+        model = convert_sfx_mesh(meshes[mesh], f'th_{r["goods"]}', tex=tex)
         model.extra.update(goods=r['goods'], name=r['name'], sfx_mesh=mesh,
                            source=f'sfx/frpg_sfxbnd_commoneffects.ffxbnd.dcx s{mesh:05d}.flver',
                            how=r['sfx_mesh_how'])
@@ -165,8 +180,9 @@ def export(root: Path, out: Path, extra_meshes=(), quiet: bool = False) -> list:
         if mesh not in meshes:
             print(f'sfx mesh s{mesh:05d}: not in the bundle')
             continue
-        model = convert_sfx_mesh(meshes[mesh], f'sfx_s{mesh:05d}')
+        model = convert_sfx_mesh(meshes[mesh], f'sfx_s{mesh:05d}', tex=tex)
         done.append(model.write(out))
         if not quiet:
             print(f'{done[-1].name}: s{mesh:05d} ({model.vertex_count} vertices)')
+    item_tex.flush(out.parent)
     return done

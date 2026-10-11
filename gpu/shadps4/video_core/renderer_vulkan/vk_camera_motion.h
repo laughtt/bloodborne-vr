@@ -84,6 +84,17 @@ public:
         shadow = current.shadow;
         return true;
     }
+    /// bbport VR alternate-eye stereo: the distinct cameras of this frame's G-buffer passes (world
+    /// to view 3x4 rows and projection x scale), in draw order, up to kMaxFrameCameras. The first
+    /// G-buffer pass is not always the main view (an extra view rendered first, or a far plane
+    /// other than 3000 that the main-camera signature rejects): the eye pairing tries them all.
+    static constexpr u32 kMaxFrameCameras = 4;
+    [[nodiscard]] u32 FrameCameras(std::array<std::array<float, 12>, kMaxFrameCameras>& views,
+                                   std::array<float, kMaxFrameCameras>& proj_x) const noexcept {
+        views = frame_views;
+        proj_x = frame_proj_x;
+        return frame_camera_count;
+    }
     /// Vertical field of view and near/far planes of the current camera.
     [[nodiscard]] float VerticalFov() const noexcept;
     [[nodiscard]] float Near() const noexcept;
@@ -159,6 +170,11 @@ private:
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;
     bool frame_has_camera = false;
+    // bbport VR: this frame's G-buffer cameras (FrameCameras); kept until the next frame's first.
+    std::array<std::array<float, 12>, kMaxFrameCameras> frame_views{};
+    std::array<float, kMaxFrameCameras> frame_proj_x{};
+    u32 frame_camera_count = 0;
+    bool frame_cameras_open = false;
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};

@@ -79,19 +79,33 @@ XrStereo::Status XrStereo::GetStatus() {
     return Status{{stats.eye[0], stats.eye[1]}, pairing.LastEye(), pairing.Run()};
 }
 
-xrstereo::Decision XrStereo::OnFrame(const float* camera_view, float proj_x, const float* shadow,
-                                     u64 draws_total) {
+void XrStereo::SetCinema(bool on) {
     std::scoped_lock lock{mutex};
-    xrstereo::FrameCamera frame;
-    if (camera_view) {
-        frame.has_view = true;
-        std::memcpy(frame.view, camera_view, sizeof(frame.view));
+    if (pairing.Cinema() == on) {
+        return;
     }
-    if (proj_x > 0.0f && std::isfinite(proj_x)) {
-        frame.has_proj = true;
-        frame.proj_x = proj_x;
+    pairing.SetCinema(on);
+    std::printf("VR stereo: %s\n", on ? "cutscene: frames go to the cinema screen"
+                                      : "cutscene over: eye frames again once the eyes match");
+}
+
+xrstereo::Decision XrStereo::OnFrame(const float* const* camera_views, const float* proj_x,
+                                     size_t count, const float* shadow, u64 draws_total) {
+    std::scoped_lock lock{mutex};
+    constexpr size_t kMaxCameras = 4;
+    std::array<xrstereo::FrameCamera, kMaxCameras> frames{};
+    count = std::min(count, kMaxCameras);
+    for (size_t i = 0; i < count; ++i) {
+        if (camera_views && camera_views[i]) {
+            frames[i].has_view = true;
+            std::memcpy(frames[i].view, camera_views[i], sizeof(frames[i].view));
+        }
+        if (proj_x && proj_x[i] > 0.0f && std::isfinite(proj_x[i])) {
+            frames[i].has_proj = true;
+            frames[i].proj_x = proj_x[i];
+        }
     }
-    const xrstereo::Decision d = pairing.OnFrame(frame);
+    const xrstereo::Decision d = pairing.OnFrame(frames.data(), count);
     const u64 draws = last_draws ? draws_total - last_draws : 0;
     last_draws = draws_total;
     const double now = Seconds();
@@ -146,6 +160,18 @@ xrstereo::Decision XrStereo::OnFrame(const float* camera_view, float proj_x, con
                                "path\n"
                              : "VR stereo: eye frames again%s: alternate eyes\n",
                     was_mono ? d.reason : "");
+        if (was_mono && std::strcmp(d.reason, "unmatched") == 0) {
+            // Which camera the frames had: how far the nearest published eye view was.
+            std::printf("VR stereo:   %zu scene camera(s) in the frame, the nearest eye view %.4f "
+                        "off in rotation, %.3f m in position (tolerance %.4f, %.3f m)\n",
+                        count, d.best_rotation, d.best_position, 2e-3, 2e-3);
+        }
+    }
+    if (d.kind == xrstereo::Kind::Eye && d.camera != 0 && !other_camera_logged) {
+        other_camera_logged = true;
+        std::printf("VR stereo: a frame matched its eye by scene camera %u of %zu (the first "
+                    "main-pass camera was another view)\n",
+                    d.camera + 1, count);
     }
     if (trace) {
         std::fprintf(trace, "%llu,%.4f,%s,%d,%llu,%u,%d,%s,%llu,%.6g,%.6g\n",
@@ -191,6 +217,13 @@ void XrStereo::LogWindow() {
                 static_cast<unsigned long long>(delta(s.side_failures, logged.side_failures)),
                 given ? double(delta(s.lag_sum, logged.lag_sum)) / double(given) : 0.0,
                 delta(s.transposed, logged.transposed) ? " (rotation matched as columns)" : "");
+    if (const u64 cinema = delta(s.cinema, logged.cinema),
+        other = delta(s.other_camera, logged.other_camera);
+        cinema || other) {
+        std::printf("VR stereo:   cinema screen (cutscene) %llu frames, matched by another scene "
+                    "camera than the first %llu\n",
+                    static_cast<unsigned long long>(cinema), static_cast<unsigned long long>(other));
+    }
     if (eye_draw_frames[0] && eye_draw_frames[1]) {
         std::printf("VR stereo:   draws/frame L %.1f R %.1f, consecutive L/R frames differ by "
                     "%.2f draws on average%s\n",

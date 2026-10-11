@@ -13,6 +13,8 @@ bundled Python; the launcher's dry run (settings, control files, environment) ag
 imported by every exe / dll resolves to a file in bin/, next to the exe or in System32 (PE import tables, no
 dependency walker needed); the bundled Python imports all launcher / script modules; the DLSS DLLs and NVIDIA licence
 text are in the package, no user data shipped; where the player's files went (installed: %LOCALAPPDATA%\\BloodborneVR; zip: the folder itself);
+the public build checks of online_checks.py on the installed files (the exe has the online client and the room bells,
+no server code / address / test account / dev tool anywhere in the package, dev options hidden in the settings);
 the uninstaller exists, removes the program and keeps the player's files. Exit code 0 when everything passed.
 The report (text) goes next to the package unless --report says otherwise.
 """
@@ -141,6 +143,31 @@ def check_imports(app, rep):
 
 # ---------------------------------------------------------------------------------------------- checks
 
+def check_online_client(app, rep, state):
+    """The public package ships the online client and the room bells, and nothing of the server or the dev tools."""
+    import online_checks
+    exe = app / 'bin' / 'bb-probe.exe'
+    if not exe.is_file():
+        rep.add(False, 'online client check: bin\\bb-probe.exe missing')
+        return
+    errors, warnings, passes = online_checks.check_exe(exe.read_bytes(), 'online', True)
+    wanted = {'online client': 'host exe has the online client (shadNet, Matching2, HTTP)',
+              'room bells': 'host exe has the room bells',
+              'dev tools': 'host exe has no dev tools (BB_DEBUG_GIVE / BB_DEBUG_USE / BB_NET_TRACE / BB_NET_BREAK)'}
+    for key, label in wanted.items():
+        key_errors = [e for e in errors if (e.startswith('online client missing') if key == 'online client' else
+                                            e.startswith('room bells missing') if key == 'room bells' else e.startswith('dev tool'))]
+        rep.add(not key_errors, label, '; '.join(key_errors))
+    rest = [e for e in errors if not e.startswith(('online client missing', 'room bells missing', 'dev tool'))]
+    rep.add(not rest, 'host exe holds no server code, server address, test account or hard-coded IP / port', '; '.join(rest))
+    for text in warnings:
+        rep.note(f'      (note: {text})')
+    errors, warnings, passes = online_checks.check_tree(app, 'online', True)
+    rep.add(not errors, 'package files: no server files, addresses or test accounts', '; '.join(errors[:4]))
+    if state is not None:
+        rep.add(state.get('public') is True, 'dev options hidden in the settings (public build)')
+
+
 def check_png(path):
     try:
         data = Path(path).read_bytes()
@@ -191,6 +218,7 @@ def check_package(app, mode, env, work, fake_local, rep):
         crash = state.get('crash', {})
         rep.add(Path(crash.get('dir', '?')) == fake_local / 'BloodborneVR' / 'crashes' and crash.get('count') == 0,
                 'crash reports folder is %LOCALAPPDATA%\\BloodborneVR\\crashes', crash.get('dir', ''))
+    check_online_client(app, rep, state)
     # The update check must be quiet whatever the network says (repo private / offline).
     code, out = run([python, app / 'launcher' / 'bbvr_cli.py', 'update-check'], env, app, timeout=60)
     try:
@@ -206,6 +234,12 @@ def check_package(app, mode, env, work, fake_local, rep):
     code, out = run([python, app / 'launcher' / 'bbvr_launcher.py', '--dry-run', '--skip-checks', '--no-menu', '--game-dir', game],
                     env, app, timeout=90)
     rep.add(code == 0 and 'BB_GAME_DIR=' in out and 'BB_PROBE=' in out, 'launcher dry run (no game started)', f'exit {code}' + ('' if code == 0 else ' ' + out[-300:]))
+    # The start flow: Play solo has no online variables; the helper answers the remembered start choice (no network).
+    code, out = run([python, app / 'launcher' / 'bbvr_launcher.py', '--dry-run', '--skip-checks', '--no-menu', '--solo', '--game-dir', game],
+                    env, app, timeout=90)
+    rep.add(code == 0 and 'BB_ONLINE' not in out, 'Play solo: launcher dry run has no online variables', f'exit {code}' + ('' if code == 0 else ' ' + out[-300:]))
+    code, out = run([python, app / 'launcher' / 'bbvr_cli.py', 'online', 'mode', 'solo'], env, app, timeout=60)
+    rep.add(code == 0 and '"play_mode": "solo"' in out, 'start flow helper (online mode) answers', out[-200:] if code else '')
     where = (fake_local / 'BloodborneVR') if mode == 'installer' else app
     rep.add((where / 'out' / 'fp.txt').is_file(), f'control files written under {where}')
     if mode == 'installer':
@@ -213,7 +247,7 @@ def check_package(app, mode, env, work, fake_local, rep):
 
     # The bundled interpreter imports the launcher and the scripts it runs.
     code_src = ("import sys; sys.path[:0] = ['launcher', 'scripts']; "
-                "import bbvr_launcher, bbvr_menu, bbvr_settings, bbvr_cli, bbvr_update, crash_report, patches, mods, prepare; "
+                "import bbvr_launcher, bbvr_menu, bbvr_settings, bbvr_cli, bbvr_update, bbvr_online, crash_report, patches, mods, prepare; "
                 "import run; print('imports ok')")
     code, out = run([python, '-c', code_src], env, app, timeout=60)
     rep.add(code == 0 and 'imports ok' in out, 'bundled python imports launcher + scripts', out[-300:] if code else '')

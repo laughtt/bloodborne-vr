@@ -155,14 +155,27 @@ struct UiHeldItems {
     // Heals, cures, body buffs: the item within mouth_radius_m of the mouth (head local) and below
     // the eyes for mouth_hold_s (the sandbox's consumables: mouth, mouth_radius_m, below_eyes_m).
     m3::Vec3 mouth{0.0f, -0.10f, -0.07f};
-    float mouth_radius_m = 0.12f, below_eyes_m = 0.03f, mouth_hold_s = 0.3f;
+    float mouth_radius_m = 0.24f, below_eyes_m = 0.03f, mouth_hold_s = 0.3f;
     // Weapon buffs: the item within blade_radius_m of the blade (blade_start: the share of the weapon's
     // length that is handle) for blade_hold_s: a touch, not a rub.
     float blade_radius_m = 0.10f, blade_start = 0.25f, blade_hold_s = 0.12f;
+    // The extra mid zone: a sphere of blade_mid_radius_m (was 0.14, now 3x) in the middle of the blade part,
+    // moved blade_mid_offset_m out of the blade toward the player's head.
+    float blade_mid_radius_m = 0.42f, blade_mid_offset_m = 0.25f;
     float blade_fallback_m = 0.18f;   // no hitbox data for the weapon: this far around its bone
     // Throwables: letting go of the grip faster than this throws (m/s); slower puts the item back.
     float throw_min_speed = 1.5f;
     float throw_window_s = 0.08f, throw_peak_weight = 0.5f; // the release velocity estimate
+    // Aimed throw (default): hold the grip to aim, let go to throw. "flick" is the old release-velocity throw.
+    std::string throw_mode = "aim";
+    // launch = bias + gain * (grip elevation - level): a neutral hand (grip -Z about +20 deg) throws nearly flat
+    float throw_aim_pitch_bias_deg = 3.0f, throw_aim_level_deg = 20.0f, throw_aim_gain = 1.2f;
+    float throw_aim_min_pitch_deg = -30.0f, throw_aim_max_pitch_deg = 60.0f;
+    float throw_eye_height_m = 1.65f; // the floor is this far under the headset
+    // Marks (Hunter's Mark...): squeezing the grip to at least crush_squeeze for crush_hold_s crushes it.
+    float crush_squeeze = 0.92f, crush_hold_s = 0.4f;
+    // Tells the host (BBXR_UI_HELD) which item is in a hand so it hides that hand's weapon.
+    bool hide_weapon = true;
     float lockout_s = 0.8f;           // swings and the swap tap stay off this long after the item left the hand
     float use_timeout_s = 4.0f;       // a gesture's action the game never answered
     UiPulse pick{0.3f, 0.03f}, use{0.5f, 0.05f}, touch{0.2f, 0.03f}, cancel{0.25f, 0.04f};
@@ -177,6 +190,16 @@ struct UiCollisionHaptics {
     UiPulse object{0.7f, 0.12f};      // ... or an object
     float strength_ref = 40.0f;       // the stamina an attack pays at full strength
     bool scale_by_strength = true;    // hit / wall / object blend towards hit_strong by strength
+};
+
+/// The custom VR hands ("game" object, "custom_hands"; vr_hand_model.h, docs/vr/findings/40):
+/// the generic hand model at each controller in place of the game's hands (fp.txt hide=nohands).
+/// Off by default; BB_XR_CUSTOM_HANDS=1/0 overrides `on`.
+struct UiCustomHands {
+    bool on = false;
+    UiColor color{0.30f, 0.22f, 0.17f, 1.0f}; // a dark leather glove (linear)
+    float scale = 1.0f;                      // the model's size (the asset is an adult hand)
+    bool weapon_grip = true;                 // a hand holding a game weapon keeps the weapon grip
 };
 
 struct UiGameLayout {
@@ -200,6 +223,7 @@ struct UiGameLayout {
     // blade, throw); false: picking it uses it at once, as before.
     bool held_items = true;
     UiHeldItems held;
+    UiCustomHands custom_hands;
     UiCollisionHaptics collision_haptics;
     // Item use through the game's own buttons (src/runtime_vr_ui.c).
     float press_s = 0.06f;           // how long each d-pad / square press is held

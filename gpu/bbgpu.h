@@ -17,6 +17,7 @@ typedef struct {
 /* Registers kernel event queues (needed with or without graphics). */
 void bbgpu_register_kernel(void);
 /* Co-op: the game folder and param.sfo identity for the network and PSN libraries. */
+void bbnet_configure(const char *app0, const char *serial, const char *title, const char *app_ver);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
@@ -106,6 +107,10 @@ typedef struct {
     float center[3];                             /* camera position before the eye offset */
 } BbVrEyeView;
 void bbgpu_vr_set_eye_view(const BbVrEyeView *view);
+/* VR alternate-eye stereo: 1 while the game shows a real-time cutscene (Remo) or the debug camera.
+ * The camera hooks then leave the game's camera alone and publish no eye view; the presenter sends
+ * every finished frame to the flat cinema screen (no 30-frame wait for the mono fallback) until 0. */
+void bbgpu_vr_set_cinema(int on);
 /* What the presenter gave to each eye so far (the eye schedule's starvation guard). Returns 0
  * while alternate-eye stereo is off. */
 typedef struct {

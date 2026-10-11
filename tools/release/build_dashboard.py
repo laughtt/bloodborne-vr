@@ -40,7 +40,7 @@ def build(out, version='0.1.0', msys2=None, copy_dlls=False):
     out = Path(out).resolve()
     obj = out.parent / 'obj'
     obj.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, PATH=str(msys2 / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    env = build_stub.tool_env(msys2)
     nums, text = build_stub.file_version(version)
     flags = ['--target=x86_64-w64-windows-gnu', '-std=c++17', '-O2', '-DNDEBUG', '-Wall', '-Wno-unused-function',
              f'-DBBVR_VERSION="{version}"', f'-I{SRC}', f'-I{IMGUI}', f'-I{IMGUI / "backends"}', f'-I{msys2 / "include"}',

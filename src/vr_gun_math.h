@@ -58,6 +58,24 @@ static inline void vg_yaw_pitch(VrVec3 d, float *yaw_deg, float *pitch_deg) {
     *pitch_deg = asinf(vr_clampf(n.y, -1.0f, 1.0f)) / VR_DEG;
 }
 
+/* The difference of two headings in degrees, 0..180. */
+static inline float vg_heading_diff_deg(float a_deg, float b_deg) {
+    float d = fmodf(a_deg - b_deg, 360.0f);
+    if (d < -180.0f) d += 360.0f;
+    if (d > 180.0f) d -= 360.0f;
+    return fabsf(d);
+}
+
+/* The physics yaw (PlayerIns physics +0x1D4) that makes the body face `heading` (radians, vg_yaw_pitch's
+ * convention): the face is the model's -Z, so the body looks along yaw + pi (vr_fp_math.h vr_facing_heading).
+ * The throw turns the body to its aim this way: the game launches a thrown item along the body. */
+static inline float vg_body_yaw_for_heading(float heading) {
+    float y = fmodf(heading - VR_PI, 2.0f * VR_PI);
+    if (y < -VR_PI) y += 2.0f * VR_PI;
+    if (y > VR_PI) y -= 2.0f * VR_PI;
+    return y;
+}
+
 /* The angle (degrees) between two directions. */
 static inline float vg_angle_deg(VrVec3 a, VrVec3 b) {
     const VrVec3 x = vam_norm(a, vr_v3(0, 0, 1)), y = vam_norm(b, vr_v3(0, 0, 1));
@@ -162,6 +180,109 @@ static inline float vg_throw_launch(float m[3][4], float *target, VrVec3 origin,
         target[2] = p.z;
     }
     return turn;
+}
+
+/* A throw that spawns several bullets (the rope molotov's chain 110/111/112, the gloves' fan, a knife
+ * pair): the first bullet's turn (its Z onto the release direction) and origin shift are kept and applied
+ * to every later bullet of the same throw, so their spread relative to each other is unchanged. */
+typedef struct {
+    VrQuat q;        /* the first bullet's turn */
+    VrVec3 old_o;    /* the first bullet's launch origin before the move */
+    VrVec3 shift;    /* hand - old_o (zero when the hand was too far: origin kept) */
+    int moved;
+} VgThrowGroup;
+/* Built from the first bullet's launch matrix BEFORE vg_throw_launch changes it (same turn and reach rule). */
+static inline VgThrowGroup vg_throw_group_make(const float m[3][4], VrVec3 origin, VrVec3 dir, float max_shift) {
+    VgThrowGroup g;
+    const VrVec3 z = vam_norm(vg_launch_axis(m, 2), vr_v3(0, 0, 1));
+    g.q = vg_turn(z, dir);
+    g.old_o = vg_launch_origin(m);
+    g.moved = vam_len(vr_sub(origin, g.old_o)) <= max_shift;
+    g.shift = g.moved ? vr_sub(origin, g.old_o) : vr_v3(0, 0, 0);
+    return g;
+}
+/* A later bullet of the group: its axes turned by the group's turn; its origin shifted by the group's
+ * shift only when it spawns within `near_m` of the first bullet's old origin (a bullet born elsewhere,
+ * e.g. at the impact, keeps its place). The aim point (may be NULL) is turned about the old origin and
+ * shifted the same way. Returns the turn in degrees; *old_dir / *new_dir (may be NULL) the Z before / after. */
+static inline float vg_throw_group_apply(float m[3][4], float *target, const VgThrowGroup *g, float near_m, int *moved,
+                                         VrVec3 *old_dir, VrVec3 *new_dir) {
+    const VrVec3 o = vg_launch_origin((const float (*)[4])m);
+    const VrVec3 z0 = vam_norm(vg_launch_axis((const float (*)[4])m, 2), vr_v3(0, 0, 1));
+    if (old_dir) *old_dir = z0;
+    vg_launch_turn(m, g->q);
+    const int shift = g->moved && vam_len(vr_sub(o, g->old_o)) <= near_m;
+    const VrVec3 no = shift ? vr_add(o, g->shift) : o;
+    m[0][3] = no.x;
+    m[1][3] = no.y;
+    m[2][3] = no.z;
+    if (target) {
+        const VrVec3 p = vr_add(no, vr_qrotate(g->q, vr_sub(vr_v3(target[0], target[1], target[2]), o)));
+        target[0] = p.x;
+        target[1] = p.y;
+        target[2] = p.z;
+    }
+    const VrVec3 z1 = vam_norm(vg_launch_axis((const float (*)[4])m, 2), vr_v3(0, 0, 1));
+    if (new_dir) *new_dir = z1;
+    if (moved) *moved = shift;
+    return vg_angle_deg(z0, z1);
+}
+
+/* The throw speed from the hand (findings/39 1A option ii): the factor on the game's projectile speed
+ * for a release at `speed_mps` (the hand's speed relative to the head), clamp(speed / ref, min, max).
+ * No speed (<= 0) or a bad reference leaves the game's speed (1). */
+static inline float vg_throw_speed_factor(float speed_mps, float ref, float lo, float hi) {
+    if (!(speed_mps > 0.0f) || !(ref > 0.0f) || !isfinite(speed_mps)) return 1.0f;
+    return vr_clampf(speed_mps / ref, lo, hi);
+}
+
+/* Gun parry aim assist (docs/vr/findings/41-parry.md). The game's lock-on candidate list gives enemy
+ * points; the one the ray passes closest to (in angle, within `range` m of the muzzle) pulls the ray
+ * toward itself. The cone grows as the enemy gets close, where a 5 degree miss is more than the body:
+ *   cone(d) = clamp(atan(radius / d), cone_min, cone_max)             degrees
+ *   w = strength * (1 - smoothstep(inner * cone, cone, angle))        0 outside the cone
+ *   dir' = normalize(lerp(ray, to_target, w))
+ * so a ray inside the inner part of the cone (inner = 0.4) is pulled strength of the way, fading to
+ * nothing at the cone's edge. strength 0 turns it off; 1 snaps onto the point. */
+typedef struct {
+    float radius, cone_min, cone_max, strength, inner, range;
+} VgAssist;
+static inline VgAssist vg_assist_defaults(void) {
+    VgAssist a = {0.6f, 4.0f, 18.0f, 0.8f, 0.4f, 12.0f};
+    return a;
+}
+static inline float vg_assist_cone(const VgAssist *a, float dist) {
+    const float c = atan2f(a->radius, dist > 0.1f ? dist : 0.1f) / VR_DEG;
+    return vr_clampf(c, a->cone_min, a->cone_max);
+}
+/* Returns the new unit direction. *picked = the index of the pulling target (-1: none), *angle = the
+ * ray's angle to it before the pull (degrees; may be NULL). */
+static inline VrVec3 vg_assist_dir(VrVec3 ray, VrVec3 muzzle, const VrVec3 *targets, int n, const VgAssist *a, int *picked,
+                                   float *angle) {
+    int best = -1;
+    float best_angle = 1e9f, best_w = 0.0f;
+    VrVec3 best_dir = ray;
+    ray = vam_norm(ray, ray);
+    for (int i = 0; i < n; ++i) {
+        const VrVec3 d = vr_sub(targets[i], muzzle);
+        const float dist = vam_len(d);
+        if (!(dist > 0.3f) || dist > a->range) continue;
+        const VrVec3 dn = vr_scale(d, 1.0f / dist);
+        const float ang = vg_angle_deg(ray, dn);
+        const float cone = vg_assist_cone(a, dist);
+        if (ang >= cone || ang >= best_angle) continue;
+        const float lo = a->inner * cone;
+        float t = vr_clampf((ang - lo) / (cone - lo), 0.0f, 1.0f);
+        t = t * t * (3.0f - 2.0f * t);
+        best = i;
+        best_angle = ang;
+        best_w = a->strength * (1.0f - t);
+        best_dir = dn;
+    }
+    if (picked) *picked = best;
+    if (angle) *angle = best < 0 ? 0.0f : best_angle;
+    if (best < 0 || best_w <= 0.0f) return ray;
+    return vam_norm(vam_lerp(ray, best_dir, vr_clampf(best_w, 0.0f, 1.0f)), ray);
 }
 
 /* Bullet id filter: "all", or comma separated ids and ranges ("500-999,1100"). Returns 1 when `id`

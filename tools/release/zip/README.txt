@@ -1,5 +1,13 @@
-BLOODBORNE VR  (alpha, single-player)
-=====================================
+BLOODBORNE VR  (early alpha)
+============================
+
+*** EARLY ALPHA ***
+Expect many bugs and crashes. Please be patient: this is a first public test, not a finished game.
+* Crash reports stay on YOUR PC (%LOCALAPPDATA%\BloodborneVR\crashes, or crashes\ next to the program).
+  They are never uploaded. If you want to help, look inside report.zip and send it yourself.
+* To report a bug: open an issue on the project page (the "Bug report" form) and attach
+  logs\bbvr-latest.log. See REPORTING BUGS at the end.
+* The dashboard shows this notice once per version (press OK); the launcher also prints it at start.
 
 An unofficial fan project that runs YOUR copy of Bloodborne (PS4, CUSA03173, version 1.09)
 natively on Windows with a Vulkan renderer and an OpenXR bridge for VR headsets.
@@ -12,7 +20,7 @@ LEGAL
   FromSoftware or any trademark holder. PlayStation, PS4 and Bloodborne are trademarks of their
   owners.
 * Free software under the GPL (see LICENSE, COPYING.GPL-3.0, THIRD_PARTY_NOTICES.md, SOURCES-THIRD-PARTY.txt, SOURCE.txt).
-* This alpha is single-player only.
+* Co-op (up to 3 players) needs a lobby address from whoever hosts one; solo play needs no server.
 
 WHAT YOU NEED
 -------------
@@ -26,11 +34,9 @@ WHAT YOU NEED
 
 INSTALL
 -------
-Easiest: download BloodborneVR-<version>-Setup.exe, run it (SmartScreen: "More info", "Run anyway", see below),
-finish the wizard, then open "Bloodborne VR" from the Start menu, choose your game folder and press
-START VR. Setup.exe installs for your user only (no admin rights); the uninstaller (Settings > Apps) removes
-the program but keeps your saves, settings, logs and crash reports in %LOCALAPPDATA%\BloodborneVR.
-This zip is the portable option (everything stays in its folder); the steps below are for the zip.
+This download is the portable zip: nothing is installed, and the program, saves, settings and logs all stay in
+its own folder. Follow the 4 steps below. (If you downloaded a BloodborneVR-<version>-Setup.exe instead, it
+installs for your user only and keeps its data in %LOCALAPPDATA%\BloodborneVR; these steps then do not apply.)
 
 INSTALL THE ZIP IN 4 STEPS
 --------------------------
@@ -46,7 +52,7 @@ INSTALL THE ZIP IN 4 STEPS
    The first start checks the dump and builds the VR menu and hit-shape data from it (a few minutes,
    once; stays on your PC in out\vr_assets), the log under the button shows the progress. Put the
    headset on when it says "Starting". The first start compiles shaders and can take a while.
-   Logs are in logs\ (installed with Setup.exe: %LOCALAPPDATA%\BloodborneVR\logs).
+   Logs are in the logs\ folder next to BloodborneVR.exe.
 
 WINDOWS WARNING ON FIRST START: BloodborneVR.exe is an unsigned program (the alpha has no code-signing
 certificate yet), so Windows SmartScreen may say "Windows protected your PC". Click "More info", then
@@ -61,46 +67,120 @@ the same settings. Any other launcher option also runs the console launcher:
 CONTROLS (alpha; may change)
 ----------------------------
 Picture: controls.png in this folder (a labelled controller map).
-* Left stick: move. Right stick: camera / turn (smooth or snap: Options > Comfort).
-* Right-hand swing: light attack (R1). Swing with the right grip held, or a very hard swing:
-  heavy attack (R2); keep the grip held after the swing to charge.
-* Quick right-grip tap (under 0.35 s, no swing): swap the right-hand weapon.
-* Right trigger: nothing in the world.
-* Left trigger (hold): hold the gun (L2). Left-hand thrust forward: shoot.
-* Left grip (squeeze): L1 (transform).
-* A / B / X / Y: Circle (dodge, sprint) / Cross (interact) / Square (use quick item) /
-  Triangle (blood vial; or left hand at your mouth with the left grip held).
-* Right stick click (tap): item wheel; pick with your right hand (touch or point) or the stick.
-  Lock-on is off by default.
-* Left stick click while standing: VR dashboard (equipment, items, options). While moving: jump.
-  Held 1 second: recenter.
-* Left menu button: Options (pause). Held 1 second: recenter.
-* Swing at a staggered enemy: visceral attack (stagger one with a gun parry, or a charged heavy
-  from behind).
-* In the game's own menus (Options, pause): either stick moves the cursor (hold to repeat),
-  A or either trigger confirms, B goes back, the menu button closes the menu.
+
+  Control                  Does
+  -----------------------  ---------------------------------------------------------
+  B (right, upper)         Roll / dodge; hold to sprint
+  A (right, lower)         Switch the right-hand weapon (one press, one swap)
+  Y (left, upper)          Interact: doors, levers, pick up, talk
+  X (left, lower)          Switch the left-hand weapon (one press, one swap)
+  Left stick               Move
+  Left stick click         Moving: jump. Standing: open / close the dashboard. Held 1 s: recenter
+  Right stick              Turn / camera (smooth or snap: Options > Comfort)
+  Right stick click        Open the item wheel
+  Left trigger (hold)      Hold the gun; a left-hand thrust shoots
+  Right trigger            Nothing in the world (pointer click in the dashboard)
+  Left grip                Transform (L1)
+  Right grip               Heavy / charge modifier for swings; a quick tap swaps the right weapon
+  Left menu button         Options (pause); held 1 s: recenter
+
+There is no heal button: heal from the item wheel, or bring a vial to your mouth.
+In the game's own menus: A confirms, B goes back, either stick moves the cursor.
+
+  Gesture                                  Does
+  ---------------------------------------  ---------------------------------------------
+  Swing the right hand                     Light attack; with the right grip held: heavy attack
+  Thrust the left hand (trigger held)      Shoot
+  Shoot an attacking enemy just in time    Parry (stagger)
+  Jab the right hand at a staggered enemy  Visceral attack (up to 2 m away, automatic after a parry)
+
 Tuning files re-read while the game runs: out\fp.txt (first person, turning, comfort),
 out\stereo.txt (stereo scale). They are created from defaults\ on the first run.
 
-PHYSICAL ITEMS
---------------
-* Pick an item on the item wheel: it appears in your hand as a simple marker (squeeze that hand's grip within 5 s
-  to hold it; letting go without using it puts it back).
-* Vials, pills and other drinkables: bring it to your mouth to use it.
-* Weapon buffs (paper, oil): rub it along the blade with the other hand (the one without a weapon).
-* Molotovs, throwing knives and the like: swing and let go of the grip to throw; the throw is aimed from your hand.
-* Hits with your weapon and bounces off walls give a haptic pulse in the controller.
-* The grey hand markers and the gun laser are off by default.
+ITEMS: PICK, THEN USE WITH A GESTURE
+------------------------------------
+1. Open the item wheel (right stick click) or the dashboard (left stick click, standing).
+2. Point at the item and pull the right trigger: it goes straight into your hand (no grip squeeze). The weapon of that
+   hand hides and that hand cannot attack until the item is used or put back.
+3. Use it:
+
+  Item                                   Gesture
+  -------------------------------------  ------------------------------------------------
+  Blood vials, pellets, drinks           Bring it to your mouth (generous zone, forgiving)
+  Bells                                  Bring it to your head
+  Papers (fire, bolt)                    Touch it to the blade, or to the big zone in the air
+                                         just in front of the blade (toward you)
+  Molotovs, knives, pebbles, oil urns    Throw: hold the grip to aim (an arc and a ring show where it
+                                         lands), let go to throw
+  Hunter's marks, shaman bone blade      Crush: squeeze hard for 0.4 s
+
+4. Put it back: press a trigger, or open any menu.
+Drag and drop (dashboard): squeeze the grip on an inventory card, drag it to a quick slot, let go to assign it.
+Hits with your weapon and bounces off walls give a haptic pulse. The grey hand markers and the gun laser are
+off by default.
+
+PLAYING CO-OP (up to 3 players, join codes)
+-------------------------------------------
+Co-op is EXPERIMENTAL in this alpha: it needs a lobby address (looks like http://address:port) from
+whoever runs a lobby, and playing over the internet is not fully tested. Everyone needs game version 1.09 and
+this same release. Play solo needs no server and no account.
+
+A) HOST (the player whose world the others join)
+
+1. Open BloodborneVR.exe (the dashboard).
+2. On the Play tab press Play online.
+3. Paste the lobby address you were given into the address box and press Save (only once, it is remembered).
+4. Press Host a game. A room code like K7Q-M4X appears (it also shows in the dashboard title).
+5. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
+6. Press Start with this room, load your character and walk a little way into an area. Do not stand in the
+   area's entry zone, and the area's boss must still be alive.
+7. Nothing to press in the game: your bell rings by itself and your friends appear.
+
+B) FRIEND (joining)
+
+1. Open BloodborneVR.exe.
+2. On the Play tab press Play online.
+3. Paste the SAME lobby address as the host and press Save (only once).
+4. Type the room code under Join a friend and press Join.
+5. Press Start with this room, load your character and stay in the same region as the host.
+6. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
+   it rings again by itself.
+
+If it does not work
+
+  * Host and friends must use the same lobby address and the same room code.
+  * The host must not stand in an area's entry zone, and that area's boss must not be dead yet.
+  * Wait about a minute. If you saw "failed to acquire server information", restart the game.
+  * The Windows firewall must allow BloodborneVR (allow it when Windows asks).
+  * Co-op is experimental and internet play is not fully tested.
+
+Leave a room / play solo: press Leave (the host sees Close room) in the Play online card, or Leave room
+on the Online tab. Back returns to the Play tab, where Play solo starts the game without a room.
+
+COMFORT, ONE-EYE VIEWING AND WEAKER PCS
+----------------------------------------
+On the dashboard's Play tab, under the profile cards, View switches between 3D and Flat screen (mono), and
+picking a profile card (Default, Comfort, Performance, Quality (DLSS)) saves it at once. On a PC without an
+NVIDIA RTX card the Play tab also says "Low fps? Try Performance."
+
+  * Cannot see 3D with both eyes, flicker or discomfort: set View to Flat screen (mono) (or Options tab, Display / VR,
+    Stereo mode = mono, or start with BloodborneVR.exe --mono). You get one big flat screen in the headset and the
+    controllers still work. If the depth looks wrong in 3D, try Swap eyes (Options, switch Advanced on) and Stereo scale.
+  * Motion sickness: pick the Comfort profile (snap turning, locked and eased camera animation, steadier camera).
+  * Weaker PC or low fps: pick the Performance profile (FSR 1 at 1.5x the frame instead of 2x, lower model detail).
+    You can also lower Frame limit (fps) and Eye resolution (Options tab, Display / VR and DLSS). With an NVIDIA RTX card,
+    the Quality (DLSS) profile gives the best picture.
+  * Defaults: Stereo mode alt (true 3D), Frame limit 72 fps, FSR 1 upscaling (DLSS quality on an RTX card), eye
+    resolution 2x the 1080p frame, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
 
 UPDATING (KEEP YOUR SAVES)
 --------------------------
-* Setup.exe: just run the new BloodborneVR-<version>-Setup.exe; it installs over the old version. Your saves and
-  settings (in %LOCALAPPDATA%\BloodborneVR\user) are kept, and uninstalling keeps them too.
-* Zip: extract the new zip into a NEW folder, then copy the old folder's user\ folder (and bbvr_config.json if
-  it exists) into it. You can also extract the new zip over the old folder (your user\ folder is not part of the
-  zip, so it stays). Optional: copy out\ too to skip the first-start data build.
-* From the zip to Setup.exe: copy the zip folder's user\savedata to %LOCALAPPDATA%\BloodborneVR\user\ (create the
-  folder if needed) before the first start of the installed version.
+* Close the game and the dashboard first. Extract the new zip into a NEW folder, then copy the old folder's
+  user\ folder (and bbvr_config.json if it exists) into it. You can also extract the new zip over the old folder
+  (your user\ folder is not part of the zip, so it stays). Optional: copy out\ too to skip the first-start data
+  build. The dashboard only tells you when a newer version exists; it does not install it for you.
+* If you later switch to a Setup.exe version: copy the zip folder's user\savedata to
+  %LOCALAPPDATA%\BloodborneVR\user\ (create the folder if needed) before the first start of the installed version.
 
 SETTINGS (Options and DLSS tabs of the dashboard)
 -----------------------------------------------
@@ -116,13 +196,13 @@ DLSS is the default upscaler on an NVIDIA RTX GPU (quality, preset K; other GPUs
 (NVIDIA's DLSS runtime, unmodified, redistributed under the NVIDIA RTX SDKs LICENSE) and bin/bbport_dlss.dll (our bridge)
 are part of this download. This program uses NVIDIA DLSS; the licence and the end-user terms are in
 licenses/NVIDIA-DLSS-LICENSE.txt and licenses/NVIDIA-DLSS-NOTICE.txt. Not sponsored or endorsed by NVIDIA.
-ReShade: a globally installed ReShade Vulkan layer is kept out of the game automatically (set BB_ALLOW_RESHADE=1 to allow it).
+ReShade: a globally installed ReShade Vulkan layer is kept out of the game automatically.
 Choosing an OpenXR runtime in Advanced affects only this game. SteamVR on Pimax can show double
 images: pick the Pimax runtime.
 
 KNOWN ISSUES
 ------------
-* Alpha: expect rough edges, bugs, and comfort problems. Take breaks; sit if you feel unwell.
+* EARLY ALPHA: expect many bugs, crashes and comfort problems. Take breaks; sit if you feel unwell.
 * Some AMD graphics cards crash when the game world loads.
 * The character preview on the character-creation screen can stay empty (the character itself
   is created correctly).

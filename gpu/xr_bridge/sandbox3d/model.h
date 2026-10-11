@@ -33,6 +33,7 @@ struct Dummy {
 
 struct MeshRange {
     std::string name, part, slot, material;
+    std::string texture;  // item texture key (items/tex_sheet.json), empty = flat
     int mask = -1;
     bool hidden = false;  // masked by the outfit (EquipParamProtector invisibleFlag)
     int dominant_bone = -1;

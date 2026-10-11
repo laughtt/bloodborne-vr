@@ -22,5 +22,7 @@ void vr_hitscale_register(void);
 void vr_hitscale_hit(int contact, int32_t atk_id);
 /* src/runtime_vr_atkspeed.c (BB_VR_ATK_SPEED / atk_speed=, the hook "VR Attack Speed (chr dt)"): registers the handler. */
 void vr_atkspeed_register(void);
+/* A thrown item's use was sent (BB_VR_THROW_ANIM_SPEED, src/vr_throw_anim.h): speeds up its animation. */
+void vr_atkspeed_throw_begin(void);
 
 #endif

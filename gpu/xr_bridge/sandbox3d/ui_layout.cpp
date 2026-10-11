@@ -164,10 +164,12 @@ const char* const kDefaultLayout = R"JSON({
     "haptics": {"tick_light": [0.2, 0.025], "tick_heavy": [0.4, 0.035], "hit_light": [0.6, 0.06],
                 "hit_heavy": [1.0, 0.12], "tired": [0.5, 0.05]},
     "held_items": true,
+    "custom_hands": {"on": false, "color": [0.30, 0.22, 0.17, 1.0], "scale": 1.0, "weapon_grip": true},
     "held": {"grab_squeeze": 0.6, "release_squeeze": 0.35, "pickup_grace_s": 5.0,
-             "mouth": [0.0, -0.10, -0.07], "mouth_radius_m": 0.12, "below_eyes_m": 0.03, "mouth_hold_s": 0.3,
-             "blade_radius_m": 0.10, "blade_start": 0.25, "blade_hold_s": 0.12, "blade_fallback_m": 0.18,
+             "mouth": [0.0, -0.10, -0.07], "mouth_radius_m": 0.24, "below_eyes_m": 0.03, "mouth_hold_s": 0.3,
+             "blade_radius_m": 0.10, "blade_start": 0.25, "blade_mid_radius_m": 0.42, "blade_mid_offset_m": 0.25, "blade_hold_s": 0.12, "blade_fallback_m": 0.18,
              "throw_min_speed": 1.5, "throw_window_s": 0.08, "throw_peak_weight": 0.5,
+             "crush_squeeze": 0.92, "crush_hold_s": 0.4, "hide_weapon": true,
              "lockout_s": 0.8, "use_timeout_s": 4.0,
              "pick_haptic": [0.3, 0.03], "use_haptic": [0.5, 0.05], "touch_haptic": [0.2, 0.03],
              "cancel_haptic": [0.25, 0.04]},
@@ -569,6 +571,19 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
         Read(p["tired"], game.tired);
         Read(g["held_items"], game.held_items);
         {
+            const json::Value& ch = g["custom_hands"];
+            UiCustomHands& c = game.custom_hands;
+            if (ch.type == json::Value::Type::Bool) {
+                c.on = ch.boolean;
+            } else {
+                Read(ch["on"], c.on);
+                Read(ch["color"], c.color);
+                Read(ch["scale"], c.scale);
+                Read(ch["weapon_grip"], c.weapon_grip);
+            }
+            c.scale = std::clamp(c.scale, 0.6f, 1.5f);
+        }
+        {
             const json::Value& hv = g["held"];
             UiHeldItems& hi = game.held;
             Read(hv["grab_squeeze"], hi.grab_squeeze);
@@ -581,11 +596,23 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
             Read(hv["mouth_hold_s"], hi.mouth_hold_s);
             Read(hv["blade_radius_m"], hi.blade_radius_m);
             Read(hv["blade_start"], hi.blade_start);
+            Read(hv["blade_mid_radius_m"], hi.blade_mid_radius_m);
+            Read(hv["blade_mid_offset_m"], hi.blade_mid_offset_m);
             Read(hv["blade_hold_s"], hi.blade_hold_s);
             Read(hv["blade_fallback_m"], hi.blade_fallback_m);
             Read(hv["throw_min_speed"], hi.throw_min_speed);
             Read(hv["throw_window_s"], hi.throw_window_s);
             Read(hv["throw_peak_weight"], hi.throw_peak_weight);
+            Read(hv["throw_mode"], hi.throw_mode);
+            Read(hv["throw_aim_pitch_bias_deg"], hi.throw_aim_pitch_bias_deg);
+            Read(hv["throw_aim_level_deg"], hi.throw_aim_level_deg);
+            Read(hv["throw_aim_gain"], hi.throw_aim_gain);
+            Read(hv["throw_aim_min_pitch_deg"], hi.throw_aim_min_pitch_deg);
+            Read(hv["throw_aim_max_pitch_deg"], hi.throw_aim_max_pitch_deg);
+            Read(hv["throw_eye_height_m"], hi.throw_eye_height_m);
+            Read(hv["crush_squeeze"], hi.crush_squeeze);
+            Read(hv["crush_hold_s"], hi.crush_hold_s);
+            Read(hv["hide_weapon"], hi.hide_weapon);
             Read(hv["lockout_s"], hi.lockout_s);
             Read(hv["use_timeout_s"], hi.use_timeout_s);
             Read(hv["pick_haptic"], hi.pick);
@@ -599,10 +626,23 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
             hi.mouth_hold_s = std::clamp(hi.mouth_hold_s, 0.0f, 3.0f);
             hi.blade_radius_m = std::clamp(hi.blade_radius_m, 0.02f, 0.5f);
             hi.blade_start = std::clamp(hi.blade_start, 0.0f, 0.9f);
+            hi.blade_mid_radius_m = std::clamp(hi.blade_mid_radius_m, 0.02f, 0.5f);
+            hi.blade_mid_offset_m = std::clamp(hi.blade_mid_offset_m, 0.0f, 0.6f);
             hi.blade_hold_s = std::clamp(hi.blade_hold_s, 0.0f, 3.0f);
             hi.throw_min_speed = std::clamp(hi.throw_min_speed, 0.3f, 15.0f);
             hi.throw_window_s = std::clamp(hi.throw_window_s, 0.02f, 0.3f);
             hi.throw_peak_weight = std::clamp(hi.throw_peak_weight, 0.0f, 1.0f);
+            if (hi.throw_mode != "aim" && hi.throw_mode != "flick") {
+                hi.throw_mode = "aim";
+            }
+            hi.throw_aim_pitch_bias_deg = std::clamp(hi.throw_aim_pitch_bias_deg, -45.0f, 45.0f);
+            hi.throw_aim_level_deg = std::clamp(hi.throw_aim_level_deg, -60.0f, 60.0f);
+            hi.throw_aim_gain = std::clamp(hi.throw_aim_gain, 0.2f, 3.0f);
+            hi.throw_aim_min_pitch_deg = std::clamp(hi.throw_aim_min_pitch_deg, -80.0f, 80.0f);
+            hi.throw_aim_max_pitch_deg = std::clamp(hi.throw_aim_max_pitch_deg, hi.throw_aim_min_pitch_deg, 85.0f);
+            hi.throw_eye_height_m = std::clamp(hi.throw_eye_height_m, 0.5f, 2.5f);
+            hi.crush_squeeze = std::clamp(hi.crush_squeeze, 0.3f, 1.0f);
+            hi.crush_hold_s = std::clamp(hi.crush_hold_s, 0.0f, 3.0f);
             hi.lockout_s = std::clamp(hi.lockout_s, 0.0f, 5.0f);
             hi.use_timeout_s = std::clamp(hi.use_timeout_s, 1.0f, 20.0f);
         }

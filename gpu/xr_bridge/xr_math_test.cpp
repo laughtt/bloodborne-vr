@@ -329,6 +329,98 @@ void TestFollowOnReappear() {
     CHECK(!ShouldFollowOnReappear(Follow::Reappear, none, screen));
 }
 
+/// The cinema screen: in front of the current gaze on show, world-locked, lazy follow.
+void TestCinemaFollow() {
+    CinemaFollow::Config cfg;
+    const HeadSample far_head = Sample({15.0f, 0.1f, -20.0f}, 100.0f); // Pimax: real head, far origin
+    CHECK(!Plausible(far_head) && Usable(far_head));
+    // Placed at yaw 0 near the origin, the user now stands elsewhere and looks at yaw 100.
+    Pose screen = PlaceScreen({0.1f, 0.02f, 0.2f}, YawQuat(0.0f), kDistance);
+    CinemaFollow c;
+    CHECK(c.Show(cfg, far_head, kDistance, &screen));
+    CHECK(AheadOf(screen, far_head, 100.0f));
+    CHECK(HeadAngleToScreen(far_head, screen) < 1.0f);
+    // Level: head pitch/roll do not tilt the screen, only the yaw is used.
+    const Quat pitched = Multiply(YawQuat(40.0f), Quat{std::sin(0.3f), 0.0f, 0.0f, std::cos(0.3f)});
+    HeadSample looking_down = Sample({0.0f, 1.6f, 0.0f}, 0.0f);
+    looking_down.pose.orientation = pitched;
+    Pose level;
+    CHECK(c.Show(cfg, looking_down, kDistance, &level));
+    CHECK(std::fabs(level.position.y - 1.6f) < 1e-4f);
+    CHECK(std::fabs(Yaw(level.orientation) * kDeg - 40.0f) < 0.5f);
+    // Off by config, or no head: untouched.
+    CinemaFollow::Config off = cfg;
+    off.recenter_on_show = false;
+    Pose kept = screen;
+    CHECK(!c.Show(off, Good(170.0f), kDistance, &kept));
+    CHECK(Length(Sub(kept.position, screen.position)) == 0.0f);
+    HeadSample none;
+    CHECK(!c.Show(cfg, none, kDistance, &kept));
+
+    // World-lock: small head turns and walking never move it.
+    Pose locked = PlaceScreen(Good(0.0f).pose.position, Good(0.0f).pose.orientation, kDistance);
+    const Pose before = locked;
+    CinemaFollow w;
+    double t = 0.0;
+    for (; t < 10.0; t += kDt) {
+        const float yaw = 40.0f * std::sin(float(t));      // within 60 deg
+        CHECK(!w.Tick(t, cfg, Sample({0.2f * std::sin(float(t)), 0.0f, 0.1f}, yaw), kDistance,
+                      &locked));
+    }
+    CHECK(Length(Sub(locked.position, before.position)) == 0.0f);
+    CHECK(locked.orientation.y == before.orientation.y);
+
+    // Lazy follow: > 60 deg away must hold 1 s, then it glides in 0.6 s to the front.
+    const HeadSample away = Good(100.0f);
+    CinemaFollow f;
+    Pose s = before;
+    for (t = 0.0; t < 0.95; t += kDt) {
+        CHECK(!f.Tick(t, cfg, away, kDistance, &s));
+    }
+    CHECK(Length(Sub(s.position, before.position)) == 0.0f);
+    CHECK(!f.Tick(t, cfg, Good(10.0f), kDistance, &s)); // a glance back resets the timer
+    t += kDt;
+    const double t0 = t;
+    for (; t < t0 + 0.95; t += kDt) {
+        CHECK(!f.Tick(t, cfg, away, kDistance, &s));
+    }
+    bool started = false;
+    for (; t < t0 + 1.2 && !started; t += kDt) {
+        started = f.Tick(t, cfg, away, kDistance, &s);
+    }
+    CHECK(started && f.Gliding());
+    const double glide0 = t;
+    float mid = 0.0f;
+    for (; t < glide0 + 0.7; t += kDt) {
+        f.Tick(t, cfg, away, kDistance, &s);
+        if (t >= glide0 + 0.3 && mid == 0.0f) {
+            mid = HeadAngleToScreen(away, s);
+        }
+    }
+    CHECK(mid > 5.0f && mid < 95.0f); // on its way
+    CHECK(!f.Gliding());
+    CHECK(AheadOf(s, away, 100.0f));
+    CHECK(!f.Tick(t, cfg, away, kDistance, &s)); // arrived: quiet
+    // follow_deg 0: never.
+    CinemaFollow::Config never = cfg;
+    never.follow_deg = 0.0f;
+    CinemaFollow n;
+    Pose s2 = before;
+    for (t = 0.0; t < 5.0; t += kDt) {
+        CHECK(!n.Tick(t, never, away, kDistance, &s2));
+    }
+    CHECK(Length(Sub(s2.position, before.position)) == 0.0f);
+    // Hide forgets a pending timer.
+    CinemaFollow h;
+    for (t = 0.0; t < 0.9; t += kDt) {
+        h.Tick(t, cfg, away, kDistance, &s2);
+    }
+    h.Hide();
+    for (t = 0.9; t < 1.5; t += kDt) {
+        CHECK(!h.Tick(t, cfg, away, kDistance, &s2));
+    }
+}
+
 void TestFuzz() {
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> unit(0.0f, 1.0f);
@@ -628,6 +720,60 @@ void TestGripTap() {
     CHECK(!g.Update(5400, 0.0f, false));
 }
 
+void TestShootGate() {
+    const float fwd[3] = {0.0f, 0.0f, -1.0f};
+    auto rel = [](float x, float y, float z, float* o) { o[0] = x; o[1] = y; o[2] = z; };
+    float v[3];
+    xrpad::ShootGate g;
+    rel(0, 0, 0, v);
+    CHECK(!g.Update(0.0, v, fwd, false));
+    rel(0, 0, -1.0f, v); // below the onset
+    CHECK(!g.Update(11.0, v, fwd, false));
+    rel(0, 0, -1.6f, v); // onset: fires at 1.6 (the old gate waited for 1.8 plus)
+    CHECK(g.Update(22.0, v, fwd, false));
+    rel(0, 0, -3.5f, v); // the peak does not fire again
+    CHECK(!g.Update(33.0, v, fwd, false));
+    rel(0, 0, 0, v);
+    CHECK(!g.Update(44.0, v, fwd, false)); // re-armed
+    rel(0, 0, -2.0f, v);
+    CHECK(!g.Update(100.0, v, fwd, false)); // debounce: 250 ms after the last shot
+    rel(0, 0, 0, v);
+    g.Update(110.0, v, fwd, false);
+    rel(0, 0, -2.0f, v);
+    CHECK(g.Update(300.0, v, fwd, false));
+    // a sideways swing with a forward part is not a thrust (alignment 0.5)
+    xrpad::ShootGate s;
+    rel(0, 0, 0, v);
+    s.Update(0.0, v, fwd, false);
+    rel(2.6f, 0, -1.5f, v);
+    CHECK(!s.Update(11.0, v, fwd, false));
+    // a decelerating hand (already past the peak) does not fire on the way down
+    xrpad::ShootGate d;
+    rel(0, 0, 0, v);
+    d.Update(0.0, v, fwd, false);
+    rel(0, 0, -4.0f, v);
+    CHECK(d.Update(11.0, v, fwd, false)); // the first sample above onset fires
+    xrpad::ShootGate e;
+    rel(0, 0, -3.0f, v);
+    e.armed = true;
+    e.prev = 4.0f; // falling
+    CHECK(!e.Update(11.0, v, fwd, false));
+    // a snap turn disarms; the thrust that follows needs a rest first
+    xrpad::ShootGate b;
+    rel(0, 0, -2.0f, v);
+    CHECK(!b.Update(0.0, v, fwd, true));
+    rel(0, 0, -3.0f, v);
+    CHECK(!b.Update(11.0, v, fwd, false));
+    rel(0, 0, 0, v);
+    b.Update(22.0, v, fwd, false);
+    rel(0, 0, -2.0f, v);
+    CHECK(b.Update(33.0, v, fwd, false));
+    // backward motion never fires
+    xrpad::ShootGate r;
+    rel(0, 0, 2.5f, v);
+    CHECK(!r.Update(0.0, v, fwd, false));
+}
+
 void TestSwingDirection() {
     const xrpad::V3 head{0.0f, 1.6f, 0.0f}, hand{0.2f, 1.2f, -0.4f};
     CHECK(xrpad::SwingAwayFromHead({0.5f, 0.0f, -3.0f}, hand, head));  // forward
@@ -882,6 +1028,7 @@ int main() {
     TestFar();
     TestFallbackRedone();
     TestFollowOnReappear();
+    TestCinemaFollow();
     TestFuzz();
     TestL3Click();
     TestL3WhileMovingJumps();
@@ -896,6 +1043,7 @@ int main() {
     TestTriggerEdge();
     TestGripTap();
     TestSwingDirection();
+    TestShootGate();
     TestSwingGate();
     TestHeavyCharge();
     TestMouthDwell();

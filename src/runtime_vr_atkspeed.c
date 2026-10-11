@@ -35,7 +35,9 @@
  * their copy of the moveset times are unchanged. */
 #define _GNU_SOURCE
 #include "hooks.h"
+#include "vr_throw_anim.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +54,7 @@
 #define VA_PLAYER_INS_VTABLE 0x578F310u
 #define AS_MULT_MIN 0.5f
 #define AS_MULT_MAX 3.0f
+#define AS_THROW_MULT_MAX 4.0f /* the throw clip only, not attacks */
 #define AS_ATTACK_FROM 30000
 #define AS_ATTACK_TO 50000
 #define AS_LOG_EVERY_S 0.5
@@ -69,6 +72,11 @@ static struct {
     float m_time;
     double m_wall;
     int scaled_frames;
+    /* thrown items' animation (BB_VR_THROW_ANIM_SPEED, vr_throw_anim.h) */
+    float throw_mult;           /* 0 / 1 = off */
+    _Atomic uint32_t throw_req; /* bumped by the pad thread at a throw gesture */
+    uint32_t throw_seen;
+    VtaState throw_st;
 } as;
 
 static double as_now(void) {
@@ -192,10 +200,30 @@ static ABI void as_hook(BbHookContext *ctx) {
         return; /* every character passes here; only the player goes on */
     const double now = as_now();
     as_poll_control(now);
-    if (as.mult <= 0.0f) return;
+    const uint32_t req = atomic_load_explicit(&as.throw_req, memory_order_relaxed);
+    if (req != as.throw_seen) {
+        as.throw_seen = req;
+        if (as.throw_mult > 0.0f) vta_begin(&as.throw_st, now);
+    }
+    if (as.mult <= 0.0f && as.throw_st.state == 0) return;
     int anim;
     float clip;
     if (!as_ring(player, &anim, &clip)) return;
+    if (as.throw_st.state != 0) {
+        float *tdt = (float *)&ctx->ymm[0][0];
+        if (*tdt > 0.0f && *tdt <= 0.2f) {
+            const int was = as.throw_st.state;
+            const float k = vta_step(&as.throw_st, now, anim, clip, as.throw_mult);
+            if (k != 1.0f) *tdt *= k;
+            if (as.log && (was == 1 && as.throw_st.state == 2))
+                fprintf(stderr, "VR throw anim: clip %d latched, x%.2f\n", anim, as.throw_mult);
+            if (as.log && was == 2 && as.throw_st.state == 0)
+                fprintf(stderr, "VR throw anim: clip %d over (clip time %.3f s)\n", as.throw_st.anim, clip);
+            if (k != 1.0f) return;
+        }
+        if (as.throw_st.state != 0) return;
+    }
+    if (as.mult <= 0.0f) return;
     const int sub = anim >= 0 ? anim % 1000000 : -1;
     const int attack = sub >= AS_ATTACK_FROM && sub < AS_ATTACK_TO;
     float *dt = (float *)&ctx->ymm[0][0];
@@ -222,7 +250,18 @@ static ABI void as_hook(BbHookContext *ctx) {
     }
 }
 
+/* The pad thread: a thrown item's use was just sent (findings/39): its animation is sped up. */
+void vr_atkspeed_throw_begin(void) { atomic_fetch_add_explicit(&as.throw_req, 1, memory_order_relaxed); }
+
 void vr_atkspeed_register(void) {
+    as.throw_mult = 3.6f;
+    const char *te = getenv("BB_VR_THROW_ANIM_SPEED");
+    if (te && *te) {
+        const float x = strtof(te, NULL);
+        as.throw_mult = isfinite(x) ? x : 1.0f;
+    }
+    as.throw_mult = as.throw_mult > AS_THROW_MULT_MAX ? AS_THROW_MULT_MAX : as.throw_mult;
+    if (!(as.throw_mult > 1.0f)) as.throw_mult = 0.0f; /* 1 (or less) = off */
     const char *e = getenv("BB_VR_FP_LOG");
     as.log = e && e[0] == '1';
     e = getenv("BB_VR_ATK_SPEED");
@@ -235,4 +274,6 @@ void vr_atkspeed_register(void) {
     if (as.log)
         fprintf(stderr, "VR atk_speed: ready (multiplier %.2f, key atk_speed= in %s); needs the hook \"VR Attack Speed (chr dt)\"\n",
                 as.mult > 0.0f ? as.mult : 1.0f, as.control ? as.control : "no control file");
+    fprintf(stderr, "VR throw anim: thrown items' animation x%.2f (BB_VR_THROW_ANIM_SPEED, 1 = off); needs the hook \"VR Attack Speed (chr dt)\"\n",
+            as.throw_mult > 0.0f ? as.throw_mult : 1.0f);
 }

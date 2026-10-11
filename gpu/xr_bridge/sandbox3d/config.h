@@ -15,6 +15,8 @@
 #include "math3d.h"
 #include "physics_config.h"
 #include "consumables_config.h"
+#include "hands_config.h"
+#include "parry.h"
 #include "throw_config.h"
 
 namespace sb {
@@ -79,6 +81,8 @@ struct Config {
 
     PhysicsConfig physics; // solid weapons, props, haptics: the "physics" object (physics_config.h)
     ThrowConfig throwables; // hand-thrown goods: the rack, grab, throw (throw_config.h)
+    ParryConfig parry;         // the gun thrust, aim assist and the parry dummy (parry.h)
+    HandsConfig hands;         // custom hands or the hunter's own (hands_config.h)
     ConsumeConfig consumables; // the item wheel of 3D objects and its gestures (consumables_config.h)
 
     void Load(const json::Value& doc);

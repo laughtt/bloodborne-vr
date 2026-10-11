@@ -429,8 +429,28 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         std::array<float, 64> shadow{};
         const bool has_proj = frame->has_camera_view && motion.CurrentProjection(proj);
         const bool has_shadow = frame->has_camera_view && motion.CurrentShadow(shadow);
+        // The main camera first, then the frame's other G-buffer cameras (the main camera is not
+        // always the first G-buffer pass: e.g. 10 min of the Central Yharnam sewers were unmatched).
+        constexpr u32 kMax = CameraMotion::kMaxFrameCameras;
+        std::array<std::array<float, 12>, kMax> others{};
+        std::array<float, kMax> others_x{};
+        const u32 other_count = motion.FrameCameras(others, others_x);
+        std::array<const float*, kMax + 1> views{};
+        std::array<float, kMax + 1> views_x{};
+        size_t view_count = 0;
+        if (frame->has_camera_view) {
+            views[view_count] = frame->camera_view.data();
+            views_x[view_count++] = has_proj ? proj[0] : 0.0f;
+        }
+        for (u32 i = 0; i < other_count; ++i) {
+            if (frame->has_camera_view && others[i] == frame->camera_view) {
+                continue;
+            }
+            views[view_count] = others[i].data();
+            views_x[view_count++] = others_x[i];
+        }
         frame->stereo = XrStereo::Get().OnFrame(
-            frame->has_camera_view ? frame->camera_view.data() : nullptr, has_proj ? proj[0] : 0.0f,
+            views.data(), views_x.data(), std::min<size_t>(view_count, kMax),
             has_shadow ? shadow.data() : nullptr, BbStats::draws.load(std::memory_order_relaxed));
         if (frame_dump) {
             const auto& s = frame->stereo;
@@ -749,7 +769,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->hud_fullscreen = false;
     frame->stereo_on = XrStereo::Get().Enabled();
     if (frame->stereo_on) {
-        frame->stereo = XrStereo::Get().OnFrame(nullptr, 0.0f, nullptr,
+        frame->stereo = XrStereo::Get().OnFrame(nullptr, nullptr, 0, nullptr,
                                                 BbStats::draws.load(std::memory_order_relaxed));
     }
 
@@ -835,6 +855,34 @@ bool SameChannelOrder(vk::Format a, vk::Format b) {
     return (bgra(a) && bgra(b)) || (rgba(a) && rgba(b));
 }
 
+// Views of the headset swapchain images the alpha pass draws into, by image handle. A driver
+// reuses the handle of a destroyed image for the next one: after the bridge recreates a swapchain
+// (a new frame size) a stale entry named a freed image of the old size and the first draw into it
+// lost the device (live dlss -> fsr1 + 3840x2160, 2026-10-11). Dropped (after a GPU wait) whenever
+// a chain is about to be recreated, and checked against the image's size and format as well.
+struct FlatView {
+    vk::ImageView view;
+    vk::Extent2D extent;
+    vk::Format format;
+};
+std::unordered_map<VkImage, FlatView> flat_views;
+
+// Retired in two steps: a view just used may still be in the open command buffer of this very
+// present (the eye copy before the HUD chain's resize); it goes at the next call, which runs after
+// that command buffer was submitted and the queue waited on.
+std::vector<vk::ImageView> retired_flat_views;
+
+void ForgetFlatViews(vk::Device device) {
+    for (const vk::ImageView view : retired_flat_views) {
+        device.destroyImageView(view);
+    }
+    retired_flat_views.clear();
+    for (auto& [image, entry] : flat_views) {
+        retired_flat_views.push_back(entry.view);
+    }
+    flat_views.clear();
+}
+
 /// Sets alpha to 1 over the headset screen image (eColorAttachmentOptimal): an alpha-only write.
 void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D extent,
                     const Xr::FlatTarget& flat) {
@@ -842,7 +890,6 @@ void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D ex
     static vk::PipelineLayout layout;
     static vk::Pipeline pipeline;
     static vk::Format pipeline_format = vk::Format::eUndefined;
-    static std::unordered_map<VkImage, vk::ImageView> views;
     if (!pipeline || pipeline_format != flat.format) {
         const vk::UniqueShaderModule vs{CompileSPV(FS_TRI_VERT, device), device};
         const vk::UniqueShaderModule fs{CompileSPV(XR_OPAQUE_FRAG, device), device};
@@ -900,15 +947,22 @@ void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D ex
         pipeline = created;
         pipeline_format = flat.format;
     }
-    auto& view = views[VkImage(flat.image)];
-    if (!view) {
-        view = Check<"create xr flat view">(device.createImageView(vk::ImageViewCreateInfo{
+    auto& entry = flat_views[VkImage(flat.image)];
+    if (!entry.view || entry.extent != extent || entry.format != flat.format) {
+        // The images of a chain are idle here (see ForgetFlatViews); a changed entry is stale.
+        if (entry.view) {
+            retired_flat_views.push_back(entry.view);
+        }
+        entry.view = Check<"create xr flat view">(device.createImageView(vk::ImageViewCreateInfo{
             .image = flat.image,
             .viewType = vk::ImageViewType::e2D,
             .format = flat.format,
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         }));
+        entry.extent = extent;
+        entry.format = flat.format;
     }
+    const vk::ImageView view = entry.view;
     const vk::RenderingAttachmentInfo attachment{
         .imageView = view,
         .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -1394,6 +1448,9 @@ void Presenter::XrChainResize(int chain, u32 width, u32 height) {
     {
         std::scoped_lock lock{Scheduler::submit_mutex};
         (void)instance.GetGraphicsQueue().waitIdle();
+        // The bridge frees the chain's images next: no view of an old image may outlive them
+        // (the driver hands the freed handles to the new images).
+        ForgetFlatViews(instance.GetDevice());
     }
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

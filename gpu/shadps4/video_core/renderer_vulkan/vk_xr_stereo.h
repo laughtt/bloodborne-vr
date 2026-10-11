@@ -36,11 +36,16 @@ public:
     /// The camera hook set up a frame for an eye (game thread).
     void Add(const xrstereo::EyeView& view);
 
-    /// A finished frame at its flip (GPU thread): its scene camera (world to view 3x4 rows, null
-    /// when the frame had none), its projection x scale (0 unknown), the shadow cascade block of
-    /// its scene constants (null unknown) and the running draw counter.
-    xrstereo::Decision OnFrame(const float* camera_view, float proj_x, const float* shadow,
-                               u64 draws_total);
+    /// A finished frame at its flip (GPU thread): its scene cameras (`count` world to view 3x4
+    /// rows, the first one the frame's first main-pass camera; count 0 when the frame had none),
+    /// their projection x scales (0 unknown), the shadow cascade block of the first camera's scene
+    /// constants (null unknown) and the running draw counter.
+    xrstereo::Decision OnFrame(const float* const* camera_views, const float* proj_x, size_t count,
+                               const float* shadow, u64 draws_total);
+
+    /// The host reports a real-time cutscene (bbgpu_vr_set_cinema, game thread): every frame goes
+    /// to the mono path (the cinema screen) while on.
+    void SetCinema(bool on);
 
     /// What the frames went to so far, for the camera hook's eye schedule (any thread).
     struct Status {
@@ -63,6 +68,7 @@ private:
     double next_log = 0.0;
     xrstereo::Stats logged{};
     bool was_mono = false;
+    bool other_camera_logged = false;
     u64 last_draws = 0;
     u64 eye_draw_sum[2] = {}, eye_draw_frames[2] = {};
     u64 lr_draw_diff_sum = 0, lr_draw_pairs = 0;

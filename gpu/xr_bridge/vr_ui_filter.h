@@ -41,6 +41,58 @@ inline float StickMagnitude(uint8_t x, uint8_t y) {
     return std::sqrt(fx * fx + fy * fy);
 }
 
+/// The face buttons as the GAME sees them in the world (the menus and the filter keep reading the
+/// mapped pad: A circle, B cross, X square, Y triangle, so every "right_grip+b" style binding is
+/// unchanged):
+///   B (cross)   -> circle: roll / dodge / sprint
+///   A (circle)  -> d-pad right pulse: swap the right-hand weapon (once per press)
+///   X (square)  -> d-pad left pulse: swap the left-hand weapon (once per press)
+///   Y (triangle)-> cross (interact: doors, pickups, ladders; B left that job). The old Y = blood
+///                  vial / X = use the quick item heal buttons are gone (the quick wheel and the
+///                  vial held at the mouth do it); the vial GESTURE's triangle still passes
+/// Not applied in the game's own menus (MenuNav has its own A / B mapping).
+struct FaceRemap {
+    static constexpr double kSwapPulseS = 0.12;
+    bool a_prev = false, x_prev = false;
+    double right_until = -1.0, left_until = -1.0;
+
+    /// Only tracks the edges (menus have the buttons).
+    void Skip(uint32_t b) {
+        a_prev = (b & BBXR_BTN_CIRCLE) != 0;
+        x_prev = (b & BBXR_BTN_SQUARE) != 0;
+    }
+
+    /// `raw_y`: the Y button is down (its triangle is not sent); `y_cross`: and the game may have it.
+    uint32_t Apply(double now, uint32_t b, bool raw_y, bool y_cross) {
+        const bool a = (b & BBXR_BTN_CIRCLE) != 0, x = (b & BBXR_BTN_SQUARE) != 0;
+        uint32_t out = b & ~(BBXR_BTN_CIRCLE | BBXR_BTN_CROSS | BBXR_BTN_SQUARE);
+        if (raw_y) {
+            out &= ~BBXR_BTN_TRIANGLE;
+        }
+        if (b & BBXR_BTN_CROSS) {
+            out |= BBXR_BTN_CIRCLE;
+        }
+        if (y_cross) {
+            out |= BBXR_BTN_CROSS;
+        }
+        if (a && !a_prev) {
+            right_until = now + kSwapPulseS;
+        }
+        if (x && !x_prev) {
+            left_until = now + kSwapPulseS;
+        }
+        a_prev = a;
+        x_prev = x;
+        if (now < right_until) {
+            out |= BBXR_BTN_RIGHT;
+        }
+        if (now < left_until) {
+            out |= BBXR_BTN_LEFT;
+        }
+        return out;
+    }
+};
+
 class InputFilter {
 public:
     static constexpr float kMoving = 0.3f;     // the left stick moves the character (xr_input)
@@ -158,8 +210,10 @@ public:
         if ((b & BBXR_BTN_L3) && l3_class != L3Class::Game) {
             b &= ~BBXR_BTN_L3;
         }
+        bool world = false;
         if (game_menu && !menus_engaged) {
             b = MenuNav(now, in, b, trigger_confirm);
+            face.Skip(in.buttons);
         } else if (menus_engaged) {
             b = 0; // swings, weapon swaps, dodges, items: the menus have the hands
             if (stick_used[0]) {
@@ -169,6 +223,9 @@ public:
                 in.rx = in.ry = 128;
             }
             in.l2 = in.r2 = 0;
+            face.Skip(in.buttons);
+        } else {
+            world = true;
         }
         b &= ~hold_mask;
         // A combo's key pressed while its modifiers are held stays hidden until released.
@@ -176,6 +233,12 @@ public:
         last_applied = in.buttons;
         sticky &= in.buttons; // released buttons are the game's again
         b &= ~sticky;
+        if (world) {
+            // After the hiding above (a claimed A / B / X never counts as pressed), and the held
+            // item's mask again: it holds the d-pad swap bits the remap makes (A right, X left).
+            const bool raw_y = (in.reserved[0] & BBXR_RAW_Y) != 0;
+            b = face.Apply(now, b, raw_y, raw_y && (b & BBXR_BTN_TRIANGLE)) & ~hold_mask;
+        }
         if (!(b & BBXR_BTN_L2)) {
             in.l2 = 0;
         }
@@ -319,6 +382,7 @@ private:
     double nav_until = -1.0, nav_next = 0.0;
     bool stick_used[2] = {};
     uint32_t last_raw = 0, sticky = 0, claim = 0, last_applied = 0, hold_mask = 0;
+    FaceRemap face;
     bool r3_down = false, r3_held_fired = false;
     bool episode_ready = false, episode_hold = false;
     double episode_s = 0.0;

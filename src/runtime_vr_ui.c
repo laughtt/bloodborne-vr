@@ -25,6 +25,8 @@
  *                      path of the dashboard: 0x1f63e00 into a quick slot, d-pad down, square)
  *   BB_DEBUG_USE_FILE  a control file polled twice a second: write "goods:205" (or just 205) into it to
  *                      use that item mid-game; the file is emptied when taken (default out/debug_use.txt)
+ *   BB_ONLINE_BELL_DIRECT  0: the room auto-bell uses only the old quick-slot pad path (default: the direct item use, then
+ *                      one square press, then the pad path; see vu_online_bell)
  * Both debug features need the patch "VR FP Camera Heading (in-game step)" in BB_HOOKS.
  * Works with BB_VR=0 too (flat tests: the probe and the pad presses, no headset). */
 #define _GNU_SOURCE
@@ -34,7 +36,15 @@
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
 #include "vr_ui_game.h"
 #include "vr_hitbox.h"
+#include "vr_skin.h"
 #include "vr_gun.h"
+#include "vr_fp.h"
+#include "vr_free_bells.h"
+/* Public builds: only the room features run here (the auto-bell's press, a missing bell given, free bells). The
+ * general debug give / use tools stay out; the give plan is one bell at most. */
+#define VRDG_MAX_INSIGHT 99999
+typedef struct { uint32_t id; int32_t count; } VrDgItem;
+typedef struct { int n; VrDgItem items[1]; int32_t insight, insight_min; int bad; } VrDgPlan;
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +67,10 @@
 #define PGD_INSIGHT 0x84u                /* PlayerGameData +0x84: Insight (s32), of [[GameDataMan]+8] (findings/26): the shop price code
                                           * subtracts it (0x1f63c39), the Beckoning Bell predicate 0x1731d00 tests it <= 0, 0x1738670 returns it.
                                           * (+0x48 is a stat, +0x94 the Blood Echoes.) */
+#define VA_CAN_USE_ITEM 0x1ae38d0u      /* bool f(void): the game's "an item can be used now" predicate (the item menu calls it first) */
+#define PLAYER_USE_ITEM_ID 0x478u        /* PlayerIns +0x478: the use-item id GetUseItemId (0x18d1ef0) returned, stored at 0x1cf754c */
+#define PLAYER_USE_STATE 0x490u          /* PlayerIns +0x490: item-use state (0 idle; 2/3/5 while a use runs) */
+#define PGD_USE_REQUEST 0x458u           /* PGD +0x458: m_useRequestItemFromMenu (logged only, never written) */
 #define PGD_STAT48 0x48u                 /* PlayerGameData +0x48: a stat; logged only, to show what [PlayerIns+0x290] is */
 
 static struct {
@@ -74,8 +88,27 @@ static struct {
     int32_t probe_selected, probe_right, probe_left;
     int probe_ok;
     /* debug give / use */
-    int dbg;              /* BB_DEBUG_GIVE or BB_DEBUG_USE or BB_DEBUG_USE_FILE is set */
+    int dbg;              /* BB_DEBUG_GIVE or BB_DEBUG_USE or BB_DEBUG_USE_FILE is set, or a room feature is on */
+    VrDgPlan give;
+    int give_state;       /* 0 off, 1 waiting for a loaded character, 2 done */
+    int give_i;           /* next item to give (one per hook call) */
+    int give_stable;      /* consecutive hook calls with a living player and a readable inventory */
+    uint32_t use_pending; /* a use waiting for its item to be there */
+    double use_since, use_gate_at;
+    int32_t pend_before;  /* player+0x394 (the pending use-item id) at the debug press */
+    double pend_until;    /* watch it until then */
+    int pend_seen;
+    uint32_t chk_id;      /* debug use result check: the item used, */
+    double chk_at;        /* when to look, */
+    int32_t chk_count, chk_insight; /* and what they were at the press */
 } vu;
+static int vu_direct_enabled = 1; /* BB_ONLINE_BELL_DIRECT != 0 */
+static int vu_free_bells; /* Free co-op bells (src/vr_free_bells.h) */
+static VfbState vu_fb;
+/* A bell press is starting (any thread): arms the refund window. */
+static void vu_fb_arm(double now) {
+    if (vu_free_bells) vfb_arm(&vu_fb, now);
+}
 
 static double vu_now(void) {
     struct timespec t;
@@ -193,6 +226,20 @@ static void vu_init(void) {
     }
     vu.probe_selected = vu.probe_right = vu.probe_left = -99;
     vu.then_use = -1;
+    e = getenv("BB_ONLINE_BELL_DIRECT");
+    vu_direct_enabled = !(e && e[0] == '0');
+    if (runtime_online_bell_armed()) vu.dbg = 1; /* the auto-bell rings through the use path */
+    {
+        /* Free co-op bells: BB_ONLINE_FREE_BELLS=1, or on by default in a room (BB_ONLINE_ROLE set) unless it is 0. */
+        const char *fb = getenv("BB_ONLINE_FREE_BELLS"), *role = getenv("BB_ONLINE_ROLE");
+        vu_free_bells = fb && *fb ? fb[0] == '1' : (role && *role);
+        if (vu_free_bells) {
+            vu.dbg = 1;
+            vu_fb.floor_always = role && *role; /* in a room: Insight 0 -> 1 even before a press is seen */
+            fprintf(stderr, "Free bells: on (Insight kept at 1+, a bell's Insight cost given back; params carry no cost for rows 205/225)\n");
+            fflush(stderr);
+        }
+    }
     if (vu.on || vu.probe) {
         fprintf(stderr, "VR UI: game side %s (BB_VR_UI=%d), probe %d, presses %.2f s\n", vu.on ? "on" : "off", vu.on,
                 vu.probe, vu.press_s);
@@ -228,7 +275,304 @@ static int vu_hp(uint64_t player) {
     return hp;
 }
 
-#define vu_debug_give_step() ((void)0)
+/* ---- BB_DEBUG_GIVE (game thread; public builds: only a bell, from the auto-bell): the game's own add-item routine 0x1f5c8c0(const u32 *itemId, int count),
+ * the one the pickup code (0x20187d4) and the messenger gifts use, then Insight at [[GameDataMan]+8]+0x84.
+ * Waits until a living player, a valid PlayerGameData (three vtables) and no game menu have held for
+ * about two seconds of gameplay (120 hook calls), then runs once. */
+typedef unsigned char (ABI *VuAddItemFn)(const uint32_t *id, int32_t count);
+
+static int32_t vu_count_of(const VrUiGameData *g, uint32_t id) {
+    int32_t n = 0;
+    for (int i = 0; i < g->item_count; ++i)
+        if (g->items[i].id == id) n += g->items[i].count;
+    return n;
+}
+
+static void vu_debug_give_step(void) {
+    if (vu.give_state == 2) {
+        /* one item per hook call (the game's own add-item may queue UI/notifications) */
+        uint64_t gdm, pgd;
+        VrUiGameData g;
+        if (!vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) || !vu_ptr(gdm + 8, &pgd)) return;
+        if (vu.give_i >= vu.give.n) {
+            vu.give_state = 3;
+            fprintf(stderr, "Debug give: %d item(s) done\n", vu.give.n);
+            fflush(stderr);
+            return;
+        }
+        const int i = vu.give_i++;
+        const uint32_t id = vu.give.items[i].id;
+        const int32_t want = vu.give.items[i].count;
+        if (!vfb_is_bell(id) || want != 1) return; /* public builds give only a bell, once */
+        const int32_t before = vrui_read(vu_read, NULL, pgd, (uint64_t)(uintptr_t)vu.image, 1, &g) ? vu_count_of(&g, id) : -1;
+        _Alignas(16) uint32_t idv = id;
+        const unsigned char r = ((VuAddItemFn)(void *)vu_va(VA_ADD_ITEM))(&idv, want);
+        const int32_t after = vrui_read(vu_read, NULL, pgd, (uint64_t)(uintptr_t)vu.image, 1, &g) ? vu_count_of(&g, id) : -1;
+        fprintf(stderr, "Debug give: [%d/%d] item %#x x%d: add-item returned %d; held %d -> %d%s\n", i + 1, vu.give.n, id, want,
+                (int)r, before, after, after >= before + want ? "" : " (not all of it: the game refused, or the inventory is full)");
+        fflush(stderr);
+        return;
+    }
+    if (vu.give_state != 1) return;
+    uint64_t wcm, player, vt, gdm, pgd, mm;
+    VrUiGameData g;
+    int32_t page = 0;
+    if (!vu_ptr(vu_va(VA_WORLD_CHR_MAN), &wcm) || !vu_ptr(wcm + 0x60, &player) || !vu_read(NULL, player, &vt, 8) ||
+        vt != vu_va(VA_PLAYER_INS_VTABLE) || vu_hp(player) <= 0 || !vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) ||
+        !vu_ptr(gdm + 8, &pgd) || !vrui_read(vu_read, NULL, pgd, (uint64_t)(uintptr_t)vu.image, 1, &g) || g.tail < 0 ||
+        !vu_ptr(vu_va(VA_MENU_MAN), &mm) || !vu_read(NULL, mm + 0x3C, &page, 4) || page != 0) {
+        vu.give_stable = 0;
+        return;
+    }
+    if (++vu.give_stable < 120) return;
+    vu.give_state = 2;
+    fprintf(stderr, "Debug give: character loaded (PlayerGameData %#llx, %d items); giving with the game's add-item 0x%x\n",
+            (unsigned long long)pgd, g.item_count, VA_ADD_ITEM);
+    {
+        /* Insight lives in [[GameDataMan]+8] (= pgd, the object the game reads: shops, bells, HUD) at +0x84.
+         * [PlayerIns+0x290] is logged for comparison only; it is not written. */
+        uint64_t other = 0;
+        int32_t cur = 0, o_ins = -1, o_48 = -1, g_48 = -1;
+        const int have_other = vu_ptr(player + PLAYER_PGD_PTR, &other);
+        vu_read(NULL, pgd + PGD_STAT48, &g_48, 4);
+        if (have_other) {
+            vu_read(NULL, other + PGD_INSIGHT, &o_ins, 4);
+            vu_read(NULL, other + PGD_STAT48, &o_48, 4);
+        }
+        fprintf(stderr, "Debug give: before: [[GameDataMan]+8]=%#llx insight(+%#x)=%d stat(+%#x)=%d; [PlayerIns+%#x]=%#llx insight(+%#x)=%d stat(+%#x)=%d%s\n",
+                (unsigned long long)pgd, PGD_INSIGHT, vu_read(NULL, pgd + PGD_INSIGHT, &cur, 4) ? (int)cur : -1, PGD_STAT48, (int)g_48,
+                PLAYER_PGD_PTR, (unsigned long long)other, PGD_INSIGHT, (int)o_ins, PGD_STAT48, (int)o_48,
+                have_other ? (other == pgd ? " (same object)" : " (a different object)") : " (not a pointer)");
+    }
+    fflush(stderr);
+}
+
+
+/* Free co-op bells (src/vr_free_bells.h): game thread, every hook call. */
+static void vu_free_bells_step(void) {
+    if (!vu_free_bells) return;
+    uint64_t wcm, player, gdm, pgd;
+    int32_t pend = 0, ins = -1;
+    if (!vu_ptr(vu_va(VA_WORLD_CHR_MAN), &wcm) || !vu_ptr(wcm + 0x60, &player) || !vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) ||
+        !vu_ptr(gdm + 8, &pgd)) {
+        vfb_step(&vu_fb, vu_now(), -1, 0);
+        return;
+    }
+    vu_read(NULL, player + PLAYER_PENDING_USE, &pend, 4);
+    if (!vu_read(NULL, pgd + PGD_INSIGHT, &ins, 4) || ins > VRDG_MAX_INSIGHT) ins = -1;
+    const int refunds = vu_fb.refunds, floors = vu_fb.floors;
+    const int32_t w = vfb_step(&vu_fb, vu_now(), ins, (uint32_t)pend);
+    if (w >= 0) {
+        memcpy((void *)(uintptr_t)(pgd + PGD_INSIGHT), &w, 4);
+        fprintf(stderr, "Free bells: Insight %d -> %d (%s, pending use %#x, %d refund(s), %d floor(s))\n", (int)ins, (int)w,
+                vu_fb.refunds != refunds ? "bell cost given back" : vu_fb.floors != floors ? "kept at 1 for the bell test" : "?",
+                (unsigned)pend, vu_fb.refunds, vu_fb.floors);
+        fflush(stderr);
+    }
+}
+
+/* ---- The room auto-bell's direct item use ("selection swap", game thread, from the hook; docs in vu_online_bell) ----
+ * GetUseItemId (0x18d1ef0) returns the inventory entry at the quick selection PGD+0x418 (no quick slot needed) and the
+ * player's per-frame code (0x1cf74f2..0x1cf7553) calls it when the byte input+0x20 (input = [[PlayerIns+0x3B0]+0x80]) has
+ * bit 0x80 (the "use item" action input), storing the id in PlayerIns+0x478. So: check the game's own predicate 0x1ae38d0,
+ * point PGD+0x418 at the bell's inventory index, set that input bit, watch PlayerIns+0x478 / +0x490, restore the selection.
+ * The pad thread posts vd.req = 1; the game thread answers through vd.ans (VD_ANS_*). PGD+0x458 and MenuMan+0x1e8 (the item
+ * menu's own request) are not used. */
+typedef unsigned char (ABI *VuCanUseFn)(void);
+enum { VD_ANS_NONE = 0, VD_ANS_TAKEN = 1, VD_ANS_REFUSED = 2, VD_ANS_UNAVAIL = 3, VD_ANS_MISS = 4 };
+static struct {
+    int bytes_ok;                /* 0 unchecked, 1 the code is as expected, -1 differs (game thread) */
+    int unavail;                 /* the bytes differ: the pad thread stops asking */
+    int req;                     /* 0 idle, 1 requested (pad thread), 3 running (game thread) */
+    uint32_t id;
+    int32_t inv;
+    int setbit;                  /* set the input bit (else only swap the selection) */
+    double requested;
+    int ans;                     /* VD_ANS_*, set by the game thread, cleared by the pad thread */
+    int want_ans;                /* game thread: waiting to publish */
+    const char *why;             /* reason of a refusal / unavailable */
+    int32_t d478, d490, d458;    /* diagnostics at the answer */
+    uint32_t d818;
+    double refuse_log_at;
+    /* the swap in progress (game thread) */
+    int active, taken, miss_sent, setbit_s, taken_by_insight;
+    int32_t old_sel, inv_s, before478, ins0; /* ins0: Insight at the swap (a bell's use takes 1) */
+    int refunds0;                /* free-bells refunds at the swap (a refund = a bell's Insight cost was seen) */
+    uint32_t id_s;
+    double t0, taken_at;
+} vd;
+
+static int vd_check_bytes(void) {
+    static const struct { uint32_t va; uint8_t n; uint8_t b[24]; } chk[] = {
+        {0x18d1f09u, 10, {0x8b, 0x87, 0x88, 0x02, 0x00, 0x00, 0x85, 0xc0, 0x78, 0x27}},
+        {0x18d1f3au, 6, {0x8b, 0x87, 0x48, 0x02, 0x00, 0x00}},
+        {0x1cf7504u, 24, {0xf6, 0x81, 0x18, 0x08, 0x00, 0x00, 0x10, 0x74, 0x09, 0xf6, 0x80, 0xc0, 0x00, 0x00, 0x00, 0x80, 0x74, 0x4b,
+                          0xf6, 0x40, 0x20, 0x80, 0x74, 0x45}},
+        {0x1cf754cu, 7, {0x41, 0x89, 0x85, 0x78, 0x04, 0x00, 0x00}},
+        {VA_CAN_USE_ITEM, 17, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x8d, 0x05, 0x97, 0xaf, 0xe5, 0x03}},
+    };
+    for (size_t i = 0; i < sizeof chk / sizeof chk[0]; ++i) {
+        uint8_t got[24];
+        if (!vu_read(NULL, vu_va(chk[i].va), got, chk[i].n) || memcmp(got, chk[i].b, chk[i].n) != 0) {
+            fprintf(stderr, "Online bell: direct use unavailable: the code at %#x is not what was analysed\n", chk[i].va);
+            fflush(stderr);
+            return -1;
+        }
+    }
+    return 1;
+}
+
+/* The living player, its PlayerGameData and the menu manager; 0 when any is missing. */
+static int vd_world(uint64_t *player, uint64_t *pgd, uint64_t *mm) {
+    uint64_t wcm, vt, gdm;
+    return vu_ptr(vu_va(VA_WORLD_CHR_MAN), &wcm) && vu_ptr(wcm + 0x60, player) && vu_read(NULL, *player, &vt, 8) &&
+           vt == vu_va(VA_PLAYER_INS_VTABLE) && vu_hp(*player) > 0 && vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) &&
+           vu_ptr(gdm + 8, pgd) && vu_ptr(vu_va(VA_MENU_MAN), mm);
+}
+
+/* ChrCtrl = [player+0x3B0]; input = [ChrCtrl+0x80]: the address of the byte input+0x20 (0 if a pointer is bad).
+ * flags818 (optional): [[ChrCtrl+8]+0x818], for the log. */
+static uint64_t vd_input_byte(uint64_t player, uint32_t *flags818) {
+    uint64_t chr, input, x;
+    if (!vu_ptr(player + 0x3B0, &chr)) return 0;
+    if (flags818 && vu_ptr(chr + 8, &x)) vu_read(NULL, x + 0x818, flags818, 4);
+    if (!vu_ptr(chr + 0x80, &input) || !vu_readable(input + 0x20, 1)) return 0;
+    return input + 0x20;
+}
+
+static void vd_set_bit(uint64_t player) {
+    const uint64_t at = vd_input_byte(player, NULL);
+    if (at) *(volatile uint8_t *)(uintptr_t)at |= 0x80;
+}
+
+static void vd_diag(uint64_t player, uint64_t pgd) {
+    vd.d478 = vd.d490 = vd.d458 = -1;
+    vd.d818 = 0xFFFFFFFFu;
+    vu_read(NULL, player + PLAYER_USE_ITEM_ID, &vd.d478, 4);
+    vu_read(NULL, player + PLAYER_USE_STATE, &vd.d490, 4);
+    vu_read(NULL, pgd + PGD_USE_REQUEST, &vd.d458, 4);
+    vd_input_byte(player, &vd.d818);
+}
+
+static void vd_restore(uint64_t pgd, const char *how) {
+    int32_t sel = -2;
+    vu_read(NULL, pgd + VRUI_PGD_QUICK_SELECTED, &sel, 4);
+    if (sel == vd.inv_s) {
+        memcpy((void *)(uintptr_t)(pgd + VRUI_PGD_QUICK_SELECTED), &vd.old_sel, 4);
+        fprintf(stderr, "Online bell: selection swap ended (%s): quick selection %d restored\n", how, (int)vd.old_sel);
+    } else {
+        fprintf(stderr, "Online bell: selection swap ended (%s): the selection is %d now, left alone\n", how, (int)sel);
+    }
+    fflush(stderr);
+    vd.active = 0;
+}
+
+static void vd_publish(void) {
+    if (vd.want_ans && __atomic_load_n(&vd.ans, __ATOMIC_ACQUIRE) == VD_ANS_NONE) {
+        __atomic_store_n(&vd.ans, vd.want_ans, __ATOMIC_RELEASE);
+        vd.want_ans = 0;
+    }
+}
+
+/* Game thread, every hook call: publishes a waiting answer, follows the swap in progress, takes a new request. */
+static void vd_hook(double now) {
+    vd_publish();
+    uint64_t player, pgd, mm;
+    if (vd.active) {
+        if (!vd_world(&player, &pgd, &mm)) {
+            if (now - vd.t0 > 3.0) { /* no living player (death, a load): PlayerGameData lives on, put the selection back */
+                uint64_t gdm2 = 0, pgd2 = 0;
+                if (vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm2) && vu_ptr(gdm2 + 8, &pgd2)) vd_restore(pgd2, "no player");
+                else vd.active = 0;
+            }
+        } else {
+            int32_t p478 = 0, p490 = 0;
+            vu_read(NULL, player + PLAYER_USE_ITEM_ID, &p478, 4);
+            vu_read(NULL, player + PLAYER_USE_STATE, &p490, 4);
+            if (!vd.taken) {
+                /* +0x478 holds the used item's row (0x4b0 for goods 1200, no category bits); a bell's use also takes 1
+                 * Insight (given back by the free bells: their refund count), the surest sign seen live */
+                const uint32_t row = vd.id_s & 0x0FFFFFFFu;
+                int32_t ins = vd.ins0;
+                vu_read(NULL, pgd + PGD_INSIGHT, &ins, 4);
+                const int took = ((uint32_t)p478 & 0x0FFFFFFFu) == row && (((uint32_t)vd.before478 & 0x0FFFFFFFu) != row || p490 != 0);
+                const int paid = vu_fb.refunds != vd.refunds0 || (vd.ins0 > 0 && ins < vd.ins0);
+                if (paid) vd.taken_by_insight = 1;
+                if (took || paid || p490 != 0) {
+                    vd.taken = 1;
+                    vd.taken_at = now;
+                    vd.want_ans = VD_ANS_TAKEN;
+                    vd_diag(player, pgd);
+                } else if (now - vd.t0 < 0.25 && vd.setbit_s) {
+                    vd_set_bit(player);
+                } else if (!vd.miss_sent && now - vd.t0 >= 0.5) {
+                    vd.miss_sent = 1;
+                    vd.want_ans = VD_ANS_MISS;
+                    vd_diag(player, pgd);
+                }
+            }
+            /* the player's quick selection is never left on the bell: back after the use, or after the square press window */
+            if ((vd.taken && p490 == 0 && now - vd.taken_at >= 1.5) || (!vd.taken && now - vd.t0 >= 3.0) || now - vd.t0 >= 4.0)
+                vd_restore(pgd, vd.taken ? "use finished" : "not taken");
+            vd_publish();
+        }
+    }
+    int expected = 1;
+    if (!__atomic_compare_exchange_n(&vd.req, &expected, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    int code = 0;
+    const char *why = NULL;
+    VrUiGameData g;
+    uint32_t entry[4] = {0};
+    player = pgd = mm = 0;
+    if (vd.bytes_ok == 0) vd.bytes_ok = vd_check_bytes();
+    if (vd.bytes_ok < 0) {
+        code = VD_ANS_UNAVAIL;
+        why = "code bytes differ";
+        __atomic_store_n(&vd.unavail, 1, __ATOMIC_RELEASE);
+    } else if (!vfb_is_bell(vd.id) || !vd_world(&player, &pgd, &mm) ||
+               !vrui_read(vu_read, NULL, pgd, (uint64_t)(uintptr_t)vu.image, 0, &g)) {
+        code = VD_ANS_REFUSED;
+        why = "no living player / inventory unreadable";
+    } else {
+        int32_t page = 0, p490 = 0;
+        uint64_t key = 0, normal = 0;
+        vu_read(NULL, mm + 0x3C, &page, 4);
+        vu_read(NULL, pgd + VRUI_PGD_KEY_ARRAY, &key, 8);
+        vu_read(NULL, pgd + VRUI_PGD_NORMAL_ARRAY, &normal, 8);
+        vu_read(NULL, player + PLAYER_USE_STATE, &p490, 4);
+        if (page != 0) { code = VD_ANS_REFUSED; why = "a game menu is open"; }
+        else if (!vrui_entry(vu_read, NULL, &g, key, normal, vd.inv, entry) || entry[1] != vd.id) { code = VD_ANS_REFUSED; why = "the item is not at that index"; }
+        else if (p490 != 0) { code = VD_ANS_REFUSED; why = "an item use is running"; }
+        else if (!(((VuCanUseFn)(void *)vu_va(VA_CAN_USE_ITEM))() & 0xFF)) { code = VD_ANS_REFUSED; why = "busy character"; }
+        else if (!vd_input_byte(player, NULL)) { code = VD_ANS_UNAVAIL; why = "input pointers"; }
+    }
+    if (pgd && player) vd_diag(player, pgd);
+    if (!code) {
+        if (vd.active) vd_restore(pgd, "a new ring"); /* puts the old selection back first, so the next read is the real one */
+        int32_t old = -1;
+        vu_read(NULL, pgd + VRUI_PGD_QUICK_SELECTED, &old, 4);
+        vd.old_sel = old;
+        vd.inv_s = vd.inv;
+        vd.id_s = vd.id;
+        vd.before478 = vd.d478;
+        vd.ins0 = -1;
+        vu_read(NULL, pgd + PGD_INSIGHT, &vd.ins0, 4);
+        vd.refunds0 = vu_fb.refunds;
+        vd.taken_by_insight = 0;
+        vd.setbit_s = vd.setbit;
+        vd.taken = vd.miss_sent = 0;
+        vd.t0 = now;
+        vd.active = 1;
+        memcpy((void *)(uintptr_t)(pgd + VRUI_PGD_QUICK_SELECTED), &vd.inv, 4);
+        if (vd.setbit) vd_set_bit(player);
+        else { vd.miss_sent = 1; vd.want_ans = VD_ANS_MISS; } /* selection swapped; the pad thread presses square */
+    }
+    vd.why = why;
+    if (code) vd.want_ans = code;
+    __atomic_store_n(&vd.req, 0, __ATOMIC_RELEASE);
+    vd_publish();
+}
+
 #define vu_debug_speffect_step() ((void)0)
 
 static ABI void vu_hook_menu(BbHookContext *ctx) {
@@ -237,6 +581,8 @@ static ABI void vu_hook_menu(BbHookContext *ctx) {
     __atomic_store_n(&vu_hook_us, (uint64_t)(vu_now() * 1e6) + 1u, __ATOMIC_RELEASE);
     vu_debug_give_step();
     vu_debug_speffect_step();
+    vu_free_bells_step();
+    if (vu_direct_enabled) vd_hook(vu_now());
     /* Taken once (1 -> 3), whichever of the two sites runs it first. */
     int expected = 1;
     if (!__atomic_compare_exchange_n(&vq.state, &expected, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
@@ -452,7 +798,283 @@ static void vu_request_equip(const BbXrUiAction *a, double now) {
 
 /* Every pad read: the state to the bridge, the actions from it; returns the buttons to press.
  * `buttons`: what the game gets so far this read (the swap check). */
-#define vu_debug_use(now, player) ((void)0)
+/* BB_DEBUG_USE / the control file (pad thread; public builds: no file, only the auto-bell's request): uses a goods item through the dashboard's own path.
+ * In a quick slot already: d-pad down to it, square. Else the equip command puts it into the first
+ * empty quick slot (the last, 5, when all are taken) and then uses it. Waits (up to 15 s) for the item
+ * to be in the inventory, for the character to have been in the world 3 s, and for BB_DEBUG_GIVE. */
+static void vu_debug_use(double now, int player) {
+    const VrUiGameData *g = &vu.game;
+    if (!player || !g->ok) {
+        vu.use_gate_at = 0.0;
+        return;
+    }
+    if (vu.use_gate_at == 0.0) vu.use_gate_at = now + 3.0;
+    if (vu.pend_until > now) { /* the pending use-item id shows for a moment when the game takes the press */
+        uint64_t wcm, p;
+        int32_t pend = 0;
+        if (vu_ptr(vu_va(VA_WORLD_CHR_MAN), &wcm) && vu_ptr(wcm + 0x60, &p) && vu_read(NULL, p + PLAYER_PENDING_USE, &pend, 4) &&
+            pend != vu.pend_before && !vu.pend_seen) {
+            vu.pend_seen = 1;
+            fprintf(stderr, "Debug use: player+0x394 (pending use-item id) changed %#x -> %#x: the press reached the game\n",
+                    (unsigned)vu.pend_before, (unsigned)pend);
+            fflush(stderr);
+        }
+    } else if (vu.pend_until > 0.0) {
+        vu.pend_until = 0.0;
+        if (!vu.pend_seen) {
+            fprintf(stderr, "Debug use: player+0x394 never changed from %#x during the press (sampled each pad poll)\n",
+                    (unsigned)vu.pend_before);
+            fflush(stderr);
+        }
+    }
+    if (vu.chk_id && now >= vu.chk_at) {
+        /* The result of a debug use: did the press start the item? Its count drops for a consumed item (the
+         * bells are not consumed: look for the summon request in the net log), and 0x1731d00 is the game's
+         * "Insight <= 0" test. */
+        uint64_t gdm = 0, pgd = 0;
+        int32_t ins = -1;
+        if (vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) && vu_ptr(gdm + 8, &pgd)) vu_read(NULL, pgd + PGD_INSIGHT, &ins, 4);
+        const int32_t cnt = vu_count_of(g, vu.chk_id);
+        fprintf(stderr, "Debug use: result for %#x: count %d -> %d, insight %d -> %d (game's no-insight test 0x1731d00: %s); exec %s\n",
+                vu.chk_id, (int)vu.chk_count, (int)cnt, (int)vu.chk_insight, (int)ins, ins <= 0 ? "TRUE, bell refused" : "false",
+                vu.exec.kind ? (vu.exec.finished > 0 ? "done" : vu.exec.finished < 0 ? "gave up" : "still running") : "finished");
+        fflush(stderr);
+        vu.chk_id = 0;
+    }
+    if (!vu.use_pending || now < vu.use_gate_at || vu.give_state == 1) return;
+    if (vu.use_since == 0.0) vu.use_since = now;
+    if (vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) || !g->items_read) return;
+    const uint32_t id = vu.use_pending;
+    if (!vfb_is_bell(id)) { /* public builds press only the bells */
+        vu.use_pending = 0;
+        return;
+    }
+    int32_t inv = -1;
+    for (int i = 0; i < g->item_count && inv < 0; ++i)
+        if (g->items[i].id == id) inv = g->items[i].index;
+    if (inv < 0) {
+        if (now - vu.use_since > 15.0) {
+            fprintf(stderr, "Debug use: item %#x is not in the inventory (it must be given first); dropped\n", id);
+            fflush(stderr);
+            vu.use_pending = 0;
+        }
+        return;
+    }
+    vu.use_pending = 0;
+    vu.use_since = 0.0;
+    {
+        uint64_t gdm = 0, pgd = 0;
+        int32_t ins = -1;
+        if (vu_ptr(vu_va(VRUI_VA_GAME_DATA_MAN), &gdm) && vu_ptr(gdm + 8, &pgd)) vu_read(NULL, pgd + PGD_INSIGHT, &ins, 4);
+        vu.chk_id = id;
+        if (vfb_is_bell(id)) vu_fb_arm(now); /* our own press of a bell (auto-bell / BB_DEBUG_USE) */
+        vu.chk_at = now + 6.0;
+        vu.chk_count = vu_count_of(g, id);
+        vu.chk_insight = ins;
+        {
+            uint64_t wcm, p;
+            int32_t pend = 0;
+            if (vu_ptr(vu_va(VA_WORLD_CHR_MAN), &wcm) && vu_ptr(wcm + 0x60, &p)) vu_read(NULL, p + PLAYER_PENDING_USE, &pend, 4);
+            vu.pend_before = pend;
+            vu.pend_seen = 0;
+            vu.pend_until = now + 5.0;
+        }
+        fprintf(stderr, "Debug use: pressing %#x (count %d, insight %d); result in 6 s\n", id, (int)vu.chk_count, (int)ins);
+    }
+    int slot = -1;
+    for (int k = 0; k < g->quick_count && slot < 0; ++k)
+        if (g->quick_id[k] == id) slot = k;
+    if (slot >= 0) {
+        fprintf(stderr, "Debug use: item %#x is in quick slot %d: d-pad down to it, square\n", id, slot);
+        fflush(stderr);
+        vrui_exec_start(&vu.exec, VRUI_ACT_USE_QUICK, slot, id, now);
+        vu.exec_reported = 0;
+        return;
+    }
+    int target = VRUI_QUICK_SLOTS - 1;
+    for (int k = 0; k < g->quick_count; ++k)
+        if (g->quick_index[k] < 0) {
+            target = k;
+            break;
+        }
+    BbXrUiAction a = {BBXR_UI_ASSIGN_QUICK, target, (int32_t)id, 1};
+    fprintf(stderr, "Debug use: item %#x into quick slot %d, then use it\n", id, target);
+    vu_request_equip(&a, now);
+}
+
+/* The auto-bell (src/runtime_online_bell.c): the machine decides (when, the retry state), this rings. Three paths, in order:
+ *  1. direct (default; BB_ONLINE_BELL_DIRECT=0 turns it off): the game thread (vd_hook) swaps the quick selection PGD+0x418 to
+ *     the bell's inventory index, checks the game's own "an item can be used now" predicate 0x1ae38d0 and sets the "use item"
+ *     input bit (byte input+0x20 |= 0x80, input = [[PlayerIns+0x3B0]+0x80]) for 0.25 s; the game's per-frame code then calls
+ *     GetUseItemId and stores the bell in PlayerIns+0x478. No pad press, no quick slot; the selection is put back later.
+ *     Answers: taken -> reached; the predicate false (attacking, rolling...) -> "refused", the machine retries in ~1 s; the
+ *     code bytes differ / pointers bad -> "unavailable", this ring goes the old way (3).
+ *  2. tap: the bit was not taken within 0.5 s (3 misses in a row: the bit is no longer set, swap + tap at once): the selection
+ *     stays swapped and ONE square press (VRUI_ACT_PRESS) is sent through the pad; GetUseItemId now returns the bell. Watched
+ *     for 1.5 s: taken -> reached, else not reached. "Taken" = PlayerIns+0x478 shows the bell's row (it holds rows, no category
+ *     bits), the use state +0x490 starts, or the bell's Insight cost was seen (Insight dropped / a free-bells refund): live, the
+ *     cost was the only sign of a working ring. 2 rings in a row with neither direct nor the press taken: path 3 for the rest
+ *     of the session. The quick selection goes back after the use, or 3 s after an untaken swap.
+ *  3. pad: the old quick-slot path (BB_DEBUG_USE's): the bell into a quick slot, d-pad down to it, square. A ring is "done"
+ *     once the use was taken, its executor finished and the 6 s result check ran; it "reached" the game when player+0x394
+ *     (the pending use-item id) changed during the press (vu.pend_seen) or the press sequence ran to its end. */
+static struct {
+    int ringing;      /* a pad-path (3) ring is running */
+    double since;
+    int phase;        /* direct / tap: 0 none, 1 waiting for the game thread, 2 the square press is out */
+    double tap_until;
+    int misses;       /* consecutive direct rings that took no effect */
+    int tap_fails;    /* consecutive rings where direct + the square press both took no effect */
+    int off;          /* direct given up for this session (tap_fails reached 2): the pad path */
+    int bit_off_logged;
+    uint32_t id;
+    int32_t inv;
+} vb;
+
+/* The pad path for this ring (the old way). */
+static void vu_online_bell_pad(double now, uint32_t id) {
+    vu.use_pending = id;
+    vu.use_since = now;
+    vu.pend_seen = 0;
+    vb.ringing = 1;
+    vb.since = now;
+}
+
+static void vu_online_bell_answer(double now, int a) {
+    const uint32_t id = vb.id;
+    if (a == VD_ANS_TAKEN) {
+        fprintf(stderr, "Online bell: direct use of %#x (inventory index %d): taken%s, seen by %s (PlayerIns+0x478 %#x, +0x490 %d, [[ChrCtrl+8]+0x818] %#x)\n",
+                id, (int)vb.inv, vb.phase == 2 ? " by the square press" : "", vd.taken_by_insight ? "the Insight cost" : "the use id / state",
+                (unsigned)vd.d478, (int)vd.d490, (unsigned)vd.d818);
+        if (vb.phase == 1) vb.misses = 0;
+        vb.tap_fails = 0;
+        runtime_online_bell_result(now, 1, vb.phase == 2 ? "tap" : "direct");
+        vb.phase = 0;
+    } else if (a == VD_ANS_REFUSED) {
+        if (now - vd.refuse_log_at >= 5.0) {
+            vd.refuse_log_at = now;
+            fprintf(stderr, "Online bell: direct use of %#x (inventory index %d): refused (busy character): %s (PlayerIns+0x478 %#x, +0x490 %d, [[ChrCtrl+8]+0x818] %#x, PGD+0x458 %d)\n",
+                    id, (int)vb.inv, vd.why ? vd.why : "?", (unsigned)vd.d478, (int)vd.d490, (unsigned)vd.d818, (int)vd.d458);
+        }
+        runtime_online_bell_result(now, -1, "direct");
+        vb.phase = 0;
+    } else if (a == VD_ANS_UNAVAIL) {
+        fprintf(stderr, "Online bell: direct use of %#x (inventory index %d): unavailable (%s); using the pad path for this ring\n", id,
+                (int)vb.inv, vd.why ? vd.why : "?");
+        vb.phase = 0;
+        vu_online_bell_pad(now, id);
+    } else if (a == VD_ANS_MISS && vb.phase == 1) {
+        ++vb.misses;
+        fprintf(stderr, "Online bell: direct use of %#x (inventory index %d): not taken in 0.5 s, trying one square press (PlayerIns+0x478 %#x, +0x490 %d, [[ChrCtrl+8]+0x818] %#x, %d miss(es) in a row)\n",
+                id, (int)vb.inv, (unsigned)vd.d478, (int)vd.d490, (unsigned)vd.d818, vb.misses);
+        if (vb.misses >= 3 && !vb.bit_off_logged) {
+            vb.bit_off_logged = 1;
+            fprintf(stderr, "Online bell: direct input bit never taken; using selection swap + one square press\n");
+        }
+        fflush(stderr);
+        if (vrui_exec_busy(&vu.exec)) { /* the player's own action is running: not now */
+            runtime_online_bell_result(now, -1, "direct");
+            vb.phase = 0;
+        } else {
+            vrui_exec_start(&vu.exec, VRUI_ACT_PRESS, 0, VRUI_BTN_SQUARE, now);
+            vu.exec_reported = 0;
+            vb.phase = 2;
+            vb.tap_until = now + 1.5;
+        }
+    }
+    fflush(stderr);
+}
+
+static void vu_online_bell(double now, int player, int hp, uint32_t buttons_in) {
+    if (!runtime_online_bell_armed()) return;
+    const VrUiGameData *g = &vu.game;
+    const uint32_t id = runtime_online_bell_item();
+    if (vb.phase) { /* direct / tap in progress */
+        const int a = __atomic_load_n(&vd.ans, __ATOMIC_ACQUIRE);
+        if (a) {
+            __atomic_store_n(&vd.ans, VD_ANS_NONE, __ATOMIC_RELEASE);
+            vu_online_bell_answer(now, a);
+        } else if (vb.phase == 1 && __atomic_load_n(&vd.req, __ATOMIC_ACQUIRE) == 1 && now - vd.requested > 2.0) {
+            int expected = 1; /* the game thread never took it: the pad path */
+            if (__atomic_compare_exchange_n(&vd.req, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                fprintf(stderr, "Online bell: direct use of %#x: unavailable (the game-thread hook did not run in 2 s); using the pad path for this ring\n", id);
+                fflush(stderr);
+                vb.phase = 0;
+                vu_online_bell_pad(now, id);
+            }
+        }
+        if (vb.phase == 2 && now >= vb.tap_until) {
+            fprintf(stderr, "Online bell: direct use of %#x (inventory index %d): one square press, not taken in 1.5 s (PlayerIns+0x478 %#x)\n", id,
+                    (int)vb.inv, (unsigned)vd.d478);
+            fflush(stderr);
+            runtime_online_bell_result(now, 0, "tap");
+            vb.phase = 0;
+            if (++vb.tap_fails >= 2 && !vb.off) {
+                vb.off = 1;
+                fprintf(stderr, "Online bell: direct use and the square press took no effect %d rings in a row; the old quick-slot path (pad) for the rest of the session\n",
+                        vb.tap_fails);
+                fflush(stderr);
+            }
+        }
+    }
+    const int busy = vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) || vu.use_pending ||
+                     vu.give_state == 1 || vu.give_state == 2 || vb.phase || __atomic_load_n(&vd.req, __ATOMIC_ACQUIRE) ||
+                     __atomic_load_n(&vd.ans, __ATOMIC_ACQUIRE) || __atomic_load_n(&vd.active, __ATOMIC_ACQUIRE); /* a swap still on */
+    if (vb.ringing && !busy && !vu.chk_id && now - vb.since > 1.0) {
+        vb.ringing = 0;
+        /* "Reached" = the pending use-item id (player+0x394) changed, or the whole press sequence ran to its end (the
+         * bell was selected and square was pressed). The id often stays at the bell's own id after an earlier ring,
+         * so a later, working ring never shows a change: the id alone made those read as "did not reach the game". */
+        const int ran = vu.exec.kind == VRUI_ACT_USE_QUICK && vu.exec.item == id && vu.exec.finished > 0;
+        const int reached = vu.pend_seen || ran;
+        if (!reached) {
+            const int flags = (int)vu.state.flags;
+            fprintf(stderr, "Online bell: press not seen: exec kind %d %s (reason %d, %d d-pad press(es)), quick_active %d (bell slot %d), game menu %d, busy %d, pending id before %#x%s\n",
+                    vu.exec.kind, vu.exec.finished > 0 ? "done" : vu.exec.finished < 0 ? "gave up" : "not finished", vu.exec.reason,
+                    vu.exec.presses, (int)vu.game.quick_active, vu.exec.slot, (flags & BBXR_GAME_MENU_OPEN) != 0,
+                    (flags & BBXR_GAME_BUSY) != 0, (unsigned)vu.pend_before, vu.exec.kind ? "" : " (no press was started)");
+            fflush(stderr);
+        }
+        runtime_online_bell_result(now, reached, "pad");
+    }
+    const int count = g->ok && g->items_read ? (int)vu_count_of(g, id) : -1;
+    const int menu = (vu.state.flags & BBXR_GAME_MENU_OPEN) != 0;
+    /* acting: the player's own press in the last 1.5 s (buttons_in is the pad before this module's presses are added) */
+    static uint32_t prev_buttons;
+    static double last_press = -100.0;
+    if (buttons_in & ~prev_buttons) last_press = now;
+    prev_buttons = buttons_in;
+    const int acting = now - last_press < 1.5;
+    const int direct_ok = vu_direct_enabled && !vb.off && !__atomic_load_n(&vd.unavail, __ATOMIC_ACQUIRE);
+    const int act = runtime_online_bell_tick(now, player != 0, player == 2 && hp > 0, menu, busy, acting, count, direct_ok);
+    if (act == 1) {
+        vu_fb_arm(now); /* the refund window opens at each attempt */
+        int32_t inv = -1;
+        for (int i = 0; i < g->item_count && inv < 0; ++i)
+            if (g->items[i].id == id) inv = g->items[i].index;
+        if (direct_ok && inv >= 0 && vfb_is_bell(id)) {
+            vb.id = id;
+            vb.inv = inv;
+            vb.phase = 1;
+            vd.id = id;
+            vd.inv = inv;
+            vd.setbit = vb.misses < 3;
+            vd.why = NULL;
+            vd.requested = now;
+            __atomic_store_n(&vd.req, 1, __ATOMIC_RELEASE);
+        } else {
+            vu_online_bell_pad(now, id);
+        }
+    } else if (act == 2 && vu.give_state != 1 && vu.give_state != 2) {
+        memset(&vu.give, 0, sizeof(vu.give));
+        vu.give.items[0].id = id;
+        vu.give.items[0].count = 1;
+        vu.give.n = 1;
+        vu.give_i = 0;
+        vu.give_stable = 0;
+        vu.give_state = 1;
+    }
+}
 
 static double vu_no_player_since; /* when vu_player() first returned 0 (0: there is a player) */
 
@@ -530,7 +1152,7 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
             ((vu_menu_mask(f) | vu_menu_mask_globals(f)) & (0x7ffff77fu | 0x80u)))
             s->flags |= BBXR_GAME_MENU_OPEN;
     }
-    if (vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE)) s->flags |= BBXR_GAME_BUSY;
+    if (vrui_exec_busy(&vu.exec) || __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) || vb.phase) s->flags |= BBXR_GAME_BUSY;
     {
         const uint64_t seen_us = __atomic_load_n(&vu_hook_us, __ATOMIC_ACQUIRE);
         const double seen = seen_us ? (double)(seen_us - 1u) * 1e-6 : -1.0;
@@ -538,12 +1160,23 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
     }
     if (vu.probe) vu_probe_log(now, player);
     vu_swap_log(now, buttons_in);
+    {
+        /* the player's own ring: square (use item) while a bell is the selected quick item */
+        static uint32_t fb_prev;
+        const uint32_t edge = buttons_in & ~fb_prev;
+        fb_prev = buttons_in;
+        if ((edge & VRUI_BTN_SQUARE) && g->ok && g->quick_active >= 0 && g->quick_active < VRUI_QUICK_SLOTS &&
+            vfb_is_bell(g->quick_id[g->quick_active]))
+            vu_fb_arm(now);
+    }
     if (!vu.on && !vu.dbg) return 0;
     if (vu.on) {
         vr_hitbox_fill(&s->debug, vu.image); /* the hitbox overlay (findings/29) */
+        vr_skin_fill(&s->skin, vu.image); /* custom character model override */
         bbgpu_vr_ui_state(s, (uint32_t)sizeof(*s));
     }
     if (vu.dbg) vu_debug_use(now, player);
+    if (vu.dbg) vu_online_bell(now, player, hp, buttons_in);
 
     /* An equip request the game thread finished (or never picked up). */
     const int qstate = __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE);
@@ -586,6 +1219,28 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
                 else vr_gun_throw_dir(v);
                 continue;
             }
+            if (a.kind == BBXR_UI_HELD) {
+                /* the bridge holds an item in a hand (a = hand or -1, b = item): handled at once, never the executor */
+                static int held_hand = -1;
+                static uint32_t held_item;
+                if (a.a != held_hand || (a.a >= 0 && (uint32_t)a.b != held_item)) {
+                    fprintf(stderr, "VR UI: held item %s (hand %d, item %#x)\n", a.a >= 0 ? "in hand" : "released", (int)a.a, (unsigned)a.b);
+                    fflush(stderr);
+                    held_hand = (int)a.a;
+                    held_item = (uint32_t)a.b;
+                }
+                vr_fp_held_item((int)a.a, (uint32_t)a.b);
+                continue;
+            }
+            if (a.kind == BBXR_UI_USE_QUICK && a.c > 0) {
+                vr_gun_throw_speed(a.c); /* the thrown hand speed, cm/s (findings/39 1A ii) */
+                vr_atkspeed_throw_begin(); /* ... and its animation runs faster (BB_VR_THROW_ANIM_SPEED) */
+            }
+            if ((a.kind == BBXR_UI_USE_QUICK && a.a >= 0 && a.a < vu.game.quick_count && a.a < VRUI_QUICK_SLOTS &&
+                 vfb_is_bell(vu.game.quick_id[a.a])) ||
+                ((a.kind == BBXR_UI_USE_ITEM || a.kind == BBXR_UI_PRESS) && vfb_is_bell((uint32_t)a.a)) ||
+                (a.kind == BBXR_UI_ASSIGN_QUICK && a.c && vfb_is_bell((uint32_t)a.b)))
+                vu_fb_arm(now); /* the dashboard uses a bell */
             if (a.kind == BBXR_UI_EQUIP_ITEM || a.kind == BBXR_UI_ASSIGN_QUICK || a.kind == BBXR_UI_CLEAR_QUICK)
                 vu_request_equip(&a, now);
             else {

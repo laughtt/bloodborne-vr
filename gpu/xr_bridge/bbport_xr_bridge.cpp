@@ -1103,6 +1103,16 @@ void FrameLoop() {
     const xrscreen::Follow follow = xrscreen::ParseFollow(std::getenv("BB_XR_SCREEN_FOLLOW"));
     bool saw_3d = false;
     double flat_since = 0.0;
+    // The cinema screen while the flat image shows (menus, loading, summon, bell): put in front of
+    // the head's current yaw each time it appears after the 3D view (BB_XR_CINEMA_RECENTER, default
+    // 1), world-locked while it stays, and glided to the front when the head faces more than
+    // BB_XR_CINEMA_FOLLOW_DEG (default 60, 0 = never) away for 1 s. Head-locked: unchanged.
+    xrscreen::CinemaFollow cinema;
+    xrscreen::CinemaFollow::Config cinema_cfg;
+    cinema_cfg.recenter_on_show = EnvFlag("BB_XR_CINEMA_RECENTER", true);
+    cinema_cfg.follow_deg = EnvFloat("BB_XR_CINEMA_FOLLOW_DEG", xrscreen::kFollowDegrees);
+    bool cinema_active = false;
+    bool no_layer_logged = false; // one log line per black episode
     if (!g->head_locked) {
         placer.Arm(0.0, false);
     }
@@ -1461,9 +1471,19 @@ void FrameLoop() {
         const bool flat_shown = game && !used.mono && !used.alt && !stereo_used;
         if (!flat_shown) {
             flat_since = t;
+            if (cinema_active) {
+                cinema_active = false;
+                cinema.Hide();
+            }
         } else if (saw_3d && t - flat_since >= 0.5) {
             saw_3d = false;
-            if (!g->head_locked && !placer.Waiting() &&
+            cinema_active = true;
+            if (!g->head_locked && !placer.Waiting() && cinema.Show(cinema_cfg, sample, distance,
+                                                                    &screen)) {
+                ever_placed = true;
+                Log(0, "cinema screen in front of the head: yaw %.0f deg, head %s",
+                    xrscreen::Yaw(screen.orientation) * 57.29578f, sources.Describe().c_str());
+            } else if (!g->head_locked && !placer.Waiting() && !cinema_cfg.recenter_on_show &&
                 xrscreen::ShouldFollowOnReappear(follow, sample, screen)) {
                 char why[112];
                 std::snprintf(why, sizeof(why),
@@ -1471,6 +1491,15 @@ void FrameLoop() {
                               "away from it",
                               xrscreen::HeadAngleToScreen(sample, screen));
                 arm(true, why, "flat screen back");
+            }
+        }
+        if (flat_shown && t - flat_since >= 0.5 && !g->head_locked && !placer.Waiting() &&
+            ever_placed) {
+            cinema_active = true;
+            if (cinema.Tick(t, cinema_cfg, sample, distance, &screen)) {
+                Log(0, "cinema screen: the head faced > %.0f deg away for 1 s, gliding it back "
+                       "in front; head %s",
+                    cinema_cfg.follow_deg, sources.Describe().c_str());
             }
         }
         if (game && !used.mono && !used.alt) {
@@ -1495,6 +1524,51 @@ void FrameLoop() {
                 quad.size = {width, width / aspect};
                 add(quad);
             }
+        }
+
+        // 2a. Black guard: no 3D image fresh enough, no cinema frame, no background: the
+        // compositor would show black. Keep the last eye images (alt or stereo) instead.
+        if (state.shouldRender &&
+            !(stereo_used || used.alt || used.mono || used.background || game)) {
+            const char* stale = nullptr;
+            if (g->alt && g->alt_eyes.released[0] && g->alt_eyes.released[1] &&
+                g->alt_chain[0].handle && g->alt_chain[1].handle) {
+                for (int eye = 0; eye < 2; ++eye) {
+                    eyes[eye].pose = g->alt_pose[eye];
+                    eyes[eye].fov = g->alt_fov[eye];
+                    eyes[eye].subImage.swapchain = g->alt_chain[eye].handle;
+                    eyes[eye].subImage.imageRect = FullRect(g->alt_chain[eye]);
+                }
+                stale = "last alt eye images";
+            } else if (g->stereo_shown && g->stereo_color[0].handle && g->stereo_color[1].handle) {
+                for (int eye = 0; eye < 2; ++eye) {
+                    eyes[eye].pose = g->stereo_views[eye].pose;
+                    eyes[eye].fov = g->stereo_views[eye].fov;
+                    eyes[eye].subImage.swapchain = g->stereo_color[eye].handle;
+                    eyes[eye].subImage.imageRect = FullRect(g->stereo_color[eye]);
+                }
+                stale = "last stereo eye images";
+            }
+            if (stale) {
+                projection.space = g->world;
+                projection.viewCount = 2;
+                projection.views = eyes;
+                add(projection);
+            }
+            if (!no_layer_logged) {
+                no_layer_logged = true;
+                Log(1, "VR: no layer to show (no fresh eye image: stereo %d, alt showing %d "
+                       "(eyes released %llu/%llu); no flat image: handle %d released %d; "
+                       "background %d): %s",
+                    int(stereo_fresh), int(g->alt && g->alt_eyes.Showing(Steady(now), 1.0)),
+                    static_cast<unsigned long long>(g->alt_eyes.released[0]),
+                    static_cast<unsigned long long>(g->alt_eyes.released[1]),
+                    int(g->flat.handle != nullptr), int(g->flat.released),
+                    int(g->background && have_views),
+                    stale ? stale : "nothing older to keep either");
+            }
+        } else {
+            no_layer_logged = false;
         }
 
         // 2b. The HUD layer (ABI 7): the game's UI image, the same in both eyes, in front of the
@@ -1639,6 +1713,10 @@ void FrameLoop() {
             for (int hand = 0; hand < 2; ++hand) {
                 const BbXrPose& grip = input.grip[hand];
                 if (!grip.valid || !input.head.valid) {
+                    continue;
+                }
+                // The 5 cm marker is drawn after the UI layer, on the grip: it would hide the held item's mesh.
+                if (g->game_ui && g->game_ui->HeldHandForMarker() == hand) {
                     continue;
                 }
                 const int color = XrInput::MsSinceGesture(hand) < 300.0 ? 2

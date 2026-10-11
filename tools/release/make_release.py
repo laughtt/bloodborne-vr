@@ -5,8 +5,10 @@
     python tools/release/make_release.py [--exe out/gpu-public/bb-probe.exe] [--bridge out/bbport_xr.dll]
         [--python-embed PATH_OR_URL] [--version 0.1.0-alpha1] [--out out/release]
 
-Nothing is compiled here. Inputs: the game host exe (installed as bin/bb-probe.exe; it must be the public
-variant built with -DBBPORT_ONLINE=OFF in out/gpu-public, checked below for online / co-op strings), bbport_xr.dll,
+Nothing is compiled here. Inputs: the game host exe (installed as bin/bb-probe.exe; the public build WITH the online
+client: -DBBPORT_ONLINE=ON -DBBPORT_PUBLIC=ON in out/gpu-public-online, see docs/vr/public-online-build.md; checked by
+online_checks.py: it must hold the online client and the room bells, and no server code, address, test account or dev
+tool), bbport_xr.dll,
 bb-gpu-capabilities.exe, the OpenXR loader, and the MSYS2 CLANG64 runtime DLLs they need (found by
 walking the PE import tables; no ldd needed). Scripts, patches and run.py come from the export tree
 (run tools/release/export_public.py first), so only cleared files are packaged.
@@ -14,7 +16,7 @@ walking the PE import tables; no ldd needed). Scripts, patches and run.py come f
 Layout of BloodborneVR-<version>/ in the zip:
     BloodborneVR.exe (the native dashboard, built here: ImGui + SDL3 linked in, one file; `--web` = the web menu),
     BloodborneVR-console.bat (fallback), README.txt, VERSION.txt, LICENSE, THIRD_PARTY_NOTICES.md, SOURCE.txt
-    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli,bbvr_update}.py (settings, web menu, the dashboard's helper,
+    launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli,bbvr_update,bbvr_online}.py (settings, web menu, the dashboard's helper,
     update check), defaults/{fp,stereo}.txt + release.json (update-check address),
     python/ (embeddable Python, optional)
     run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/
@@ -41,6 +43,7 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_dashboard  # noqa: E402
 import build_stub  # noqa: E402
+import online_checks  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 ZIPSRC = REPO / 'tools' / 'release' / 'zip'
@@ -292,7 +295,7 @@ def commit_id():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--exe', type=Path, default=REPO / 'out' / 'gpu-public' / 'bb-probe.exe')
+    ap.add_argument('--exe', type=Path, default=REPO / 'out' / 'gpu-public-online' / 'bb-probe.exe')
     ap.add_argument('--bridge', type=Path, default=REPO / 'out' / 'bbport_xr.dll')
     ap.add_argument('--dlss-dir', type=Path, default=REPO / 'out', help='folder with bbport_dlss.dll and nvngx_dlss.dll '
                     '(packaging/windows/build_dlss.sh); both are shipped (NVIDIA RTX SDKs LICENSE, licenses/NVIDIA-DLSS-*.txt)')
@@ -305,7 +308,11 @@ def main():
     ap.add_argument('--ffmpeg-dir', type=Path, help='folder with a slim LGPL FFmpeg DLL set (avcodec-63.dll ...); '
                     'searched before the MSYS2 tree (whose FFmpeg is GPLv3 and drags in ~100 codec DLLs)')
     ap.add_argument('--no-python', action='store_true', help='do not bundle Python (testers need Python 3.10+)')
-    ap.add_argument('--allow-online', action='store_true', help='skip the online-strings check of the host exe (never for a public build)')
+    ap.add_argument('--variant', choices=('online', 'offline'), default='online',
+                    help='online (default): the exe must hold the online client and room bells; offline: it must hold none of it '
+                    '(-DBBPORT_ONLINE=OFF). Either way no server code / address / test account / dev tool may be in it')
+    ap.add_argument('--check-only', action='store_true', help='only run the checks on --exe (online_checks.py) and exit; builds nothing')
+    ap.add_argument('--allow-online', action='store_true', help=argparse.SUPPRESS)  # old name; the checks are never skipped now
     ap.add_argument('--version', default='0.1.0-alpha5')
     ap.add_argument('--no-installer', action='store_true', help='do not build Setup.exe (Inno Setup)')
     ap.add_argument('--iscc', type=Path, help='path of Inno Setup 6 ISCC.exe (default: $ISCC, PATH, standard folders)')
@@ -316,6 +323,15 @@ def main():
     ap.add_argument('--strip', default=None, help='llvm-strip to drop debug info (default: clang64/bin/llvm-strip.exe if present)')
     args = ap.parse_args()
 
+    if args.allow_online:
+        sys.exit('--allow-online is gone: the checks (online_checks.py) are never skipped; build the public online exe instead')
+    if args.check_only:
+        if not args.exe.is_file():
+            sys.exit(f'missing input: {args.exe}')
+        errors, warnings, passes = online_checks.check_exe(args.exe.read_bytes(), args.variant)
+        ok = online_checks.report(args.exe.name, errors, warnings, passes)
+        print('CHECK ' + ('PASSED' if ok else 'FAILED') + f' ({args.exe}, variant {args.variant})')
+        return 0 if ok else 1
     dlss_dlls = [args.dlss_dir / n for n in DLSS_DLLS]
     for path in (args.exe, args.bridge, args.openxr, args.export / 'run.py') + (() if args.no_dlss else tuple(dlss_dlls)):
         if not path.is_file():
@@ -329,15 +345,12 @@ def main():
     (stage / 'bin').mkdir(parents=True)
     (stage / 'licenses').mkdir()
 
-    # The public alpha is single player: refuse a host exe that has the online / co-op code in it.
-    blob = args.exe.read_bytes().lower()
-    needles = (b'shad' + b'net', b'thehunters' + b'dream', b'scej-' + b'network', b'summon_' + b'messenger',
-               b'bb_' + b'online', b'bb_debug_' + b'give', b'bb_net_' + b'trace', b'mini' + b'upnp')
-    leaked = [m.decode() for m in needles if m in blob]
-    if leaked and not args.allow_online:
+    # The public host exe ships the online client but nothing of the server and no dev tool (online_checks.py).
+    errors, warnings, passes = online_checks.check_exe(args.exe.read_bytes(), args.variant)
+    if not online_checks.report(args.exe.name, errors, warnings, passes):
         shutil.rmtree(stage)
-        sys.exit(f'{args.exe} contains online / co-op strings {leaked}: build the public variant '
-                 '(cmake -DBBPORT_ONLINE=OFF, out/gpu-public) or pass --allow-online')
+        sys.exit(f'{args.exe} failed the public build checks above: build it with -DBBPORT_ONLINE=ON -DBBPORT_PUBLIC=ON '
+                 '(docs/vr/public-online-build.md)')
 
     # Executables.
     bin_dir = stage / 'bin'
@@ -414,8 +427,16 @@ def main():
     if controls.is_file():  # the labelled controller map README.txt points to
         shutil.copyfile(controls, stage / 'controls.png')
     (stage / 'launcher').mkdir()
-    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py', 'bbvr_cli.py', 'bbvr_update.py'):  # the start-up menu is standard library only
+    for module in ('bbvr_launcher.py', 'bbvr_menu.py', 'bbvr_settings.py', 'bbvr_cli.py', 'bbvr_update.py', 'bbvr_online.py'):  # the start-up menu is standard library only
         shutil.copyfile(ZIPSRC / module, stage / 'launcher' / module)
+    # The shipped settings module is the public one: dev options (flagged online=True) stay hidden (same rewrite as export_public.py).
+    settings_file = stage / 'launcher' / 'bbvr_settings.py'
+    settings_text = settings_file.read_bytes().decode('utf-8')
+    public_text, hits = re.subn(r'(?m)^PUBLIC_BUILD = False', 'PUBLIC_BUILD = True', settings_text)
+    if hits != 1:
+        shutil.rmtree(stage)
+        sys.exit('bbvr_settings.py: PUBLIC_BUILD = False line not found (the public rewrite)')
+    settings_file.write_bytes(public_text.encode('utf-8'))
     shutil.copytree(ZIPSRC / 'defaults', stage / 'defaults')
     if args.update_repo:
         release_json = stage / 'defaults' / 'release.json'
@@ -441,6 +462,10 @@ def main():
         "is NVIDIA's own binary. Exact versions, source links and a written offer of source for the bundled MSYS2\n"
         'libraries (FFmpeg, x264, x265, xvidcore and the rest of bin/): SOURCES-THIRD-PARTY.txt.\n', encoding='utf-8')
     (stage / 'COMMIT.txt').write_text(commit_id() + '\n', encoding='utf-8')
+    errors, warnings, passes = online_checks.check_tree(stage, args.variant)  # the package as a whole (python/ and licenses/ excluded)
+    if not online_checks.report('package', errors, warnings, passes):
+        shutil.rmtree(stage)
+        sys.exit('the package failed the checks above; nothing was zipped')
     (stage / 'VERSION.txt').write_text(args.version + '\n', encoding='utf-8')
 
     if not args.no_python:

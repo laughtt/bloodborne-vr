@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "ui.h"
+#include "ui_drag.h"
 
 #include <algorithm>
 #include <cctype>
@@ -282,12 +283,15 @@ struct UiSystem::Impl {
         std::map<int, DashInfo> dash; // per element id, from the last draw
         bool use_mode = true;         // a quick slot click: use it (else only make it current)
         bool remove_mode = false;     // one-shot: the next quick item pointed at leaves the quick slots
+        float drag_u = 0.0f, drag_v = 0.0f; // where the dragged card is drawn (panel units): the dragging hand's ray
+        bool drag_on_panel = false;
         // stick focus (m.hover is the focus the highlight is drawn on)
         int ray_hover = -1;           // what the rays pointed at last frame
         bool stick_focus = false;     // the stick moved the focus after the rays last changed
         int nav_dir = 0;              // 1 up 2 right 3 down 4 left (the stick, 0 centered)
         double nav_next = 0.0;
     };
+    UiDrag drag; // squeeze the grip on a card or quick slot, move, let go (ui_drag.h)
     // Dashboard element ids (Element::id).
     static constexpr int kDashWeapon = 1000, kDashQuick = 1100, kDashTab = 1200,
                          kDashButton = 1300, kDashPrev = 1400, kDashNext = 1401,
@@ -872,6 +876,9 @@ struct UiSystem::Impl {
         }
         m.open = false;
         m.remove_mode = false;
+        if (drag.Active()) {
+            drag.Cancel();
+        }
         if (std::string(reason) == "cancel") {
             ++StatsOf(&m).cancels;
         }
@@ -1460,6 +1467,121 @@ struct UiSystem::Impl {
         }
     }
 
+    /// The quick slots of the live state (item keys, "" empty).
+    std::vector<std::string> QuickItems() const {
+        const auto it = live.lists.find("quick");
+        return it == live.lists.end() ? std::vector<std::string>() : it->second.items;
+    }
+
+    /// Drag and drop on the dashboard (ui_drag.h). Squeeze a hand's grip with its ray on an inventory card
+    /// (or an occupied quick slot) to pick it up; it follows the ray; the quick slot under it lights up;
+    /// letting go of the grip assigns it (a card on a quick slot: assign_slot, replacing what was there) or
+    /// takes it out (a quick slot's item dropped on the inventory: clear_quick); anywhere else cancels.
+    /// Returns true when the drag owns this frame (no clicks meanwhile).
+    bool DragStep(Menu& m, UiEvents& events, const int ray_id[2], const float ray_u[2], const float ray_v[2],
+                  const bool ray_on[2]) {
+        const std::vector<std::string> quick = QuickItems();
+        const int nq = int(quick.size());
+        const auto slot_of = [&](int id) {
+            return id >= kDashQuick && id < kDashQuick + nq && id < kDashQuick + 16 ? id - kDashQuick : -1;
+        };
+        if (drag.Active()) {
+            const int h = drag.Hand();
+            if (ray_on[h]) {
+                m.drag_u = ray_u[h];
+                m.drag_v = ray_v[h];
+            }
+            m.drag_on_panel = ray_on[h];
+            const int id = ray_on[h] ? ray_id[h] : -1;
+            if (drag.Hover(slot_of(id), id >= kDashItem) && slot_of(id) >= 0) {
+                Haptic(events, h, layout.style.haptic_hover);
+            }
+            if (!Held(h ? UiInputId::RightGrip : UiInputId::LeftGrip)) {
+                const UiDrag::Drop d = drag.Release(quick);
+                const std::string shown = Display(d.item);
+                if (d.result == UiDrag::Result::Assign || d.result == UiDrag::Result::Replace) {
+                    Haptic(events, h, layout.style.haptic_select);
+                    Emit(events, m, "assign_slot", d.item, "inventory", d.slot, h);
+                    if (d.result == UiDrag::Result::Replace) {
+                        Toast("Quick slot " + std::to_string(d.slot + 1),
+                              shown + " replaces " + Display(d.replaced) + " (it stays in the inventory)", 3.0);
+                    }
+                } else if (d.result == UiDrag::Result::Unassign) {
+                    Haptic(events, h, layout.style.haptic_select);
+                    Emit(events, m, "clear_quick", d.item, "quick", d.slot, h);
+                } else {
+                    Haptic(events, h, layout.style.haptic_empty);
+                    if (!d.reason.empty()) {
+                        Toast("Not moved", shown + ": " + d.reason, 3.0);
+                    }
+                }
+                Write(Event("drag_drop", &m)
+                          .Add("item", shown)
+                          .Add("result", d.result == UiDrag::Result::Assign     ? "assign"
+                                         : d.result == UiDrag::Result::Replace  ? "replace"
+                                         : d.result == UiDrag::Result::Unassign ? "unassign"
+                                                                                : "cancel")
+                          .Add("slot", d.slot));
+            }
+            return true;
+        }
+        for (int h = 1; h >= 0; --h) {
+            const UiInputId grip = h ? UiInputId::RightGrip : UiInputId::LeftGrip;
+            if (!PressedKey(grip) || !ray_on[h] || ray_id[h] < 0) {
+                continue;
+            }
+            const int id = ray_id[h];
+            std::string key;
+            UiDrag::Source from = UiDrag::Source::None;
+            int index = -1;
+            if (slot_of(id) >= 0) {
+                key = quick[size_t(slot_of(id))];
+                from = UiDrag::Source::Quick;
+                index = slot_of(id);
+            } else if (id >= kDashItem) {
+                std::vector<int> idx;
+                const std::vector<std::string> items = Items(m, &idx);
+                const size_t k = size_t(id - kDashItem);
+                if (k >= items.size()) {
+                    continue;
+                }
+                key = Resolve(items[k]);
+                const UiItem* card = Item(key);
+                const bool weapons_tab =
+                    !m.spec->tabs.empty() && m.spec->tabs[size_t(m.tab) % m.spec->tabs.size()] == "weapons";
+                if (weapons_tab || (card && card->kind == "weapon")) {
+                    continue; // weapons go into hands through equip_item (a click), not into quick slots
+                }
+                const int in_slot = QuickSlotOf(key);
+                if (in_slot >= 0) {
+                    from = UiDrag::Source::Quick; // in a slot already: dragging it takes it out of that slot
+                    index = in_slot;
+                } else {
+                    const std::string why = Disabled("assign_quick");
+                    if (!why.empty()) {
+                        Haptic(events, h, layout.style.haptic_empty);
+                        Toast("Not available", why, 4.0);
+                        continue;
+                    }
+                    from = UiDrag::Source::Grid;
+                    index = int(k);
+                }
+            }
+            if (drag.Pick(h, key, from, index)) {
+                m.drag_on_panel = true;
+                m.drag_u = ray_u[h];
+                m.drag_v = ray_v[h];
+                Haptic(events, h, layout.style.haptic_grab);
+                Write(Event("drag_pick", &m)
+                          .Add("item", Display(key))
+                          .Add("hand", HandName(h))
+                          .Add("from", from == UiDrag::Source::Quick ? "quick" : "inventory"));
+                return true;
+            }
+        }
+        return false;
+    }
+
     void UpdateDashboard(Menu& m, UiWorld&, UiEvents& events) {
         const UiMenuSpec& s = *m.spec;
         if (m.open ? Pressed(s.open) : PressedExact(s.open)) {
@@ -1485,6 +1607,9 @@ struct UiSystem::Impl {
         // Both hands point; the hand whose ray is on the panel clicks with its trigger.
         int hovered = -1, by = 1;
         bool clicked = false;
+        int ray_id[2] = {-1, -1};
+        float ray_u[2] = {0.0f, 0.0f}, ray_v[2] = {0.0f, 0.0f};
+        bool ray_on[2] = {false, false};
         for (int h = 1; h >= 0; --h) {
             Vec3 from, dir;
             if (!Ray(h, from, dir)) {
@@ -1495,6 +1620,10 @@ struct UiSystem::Impl {
                 std::fabs(v) < m.half_h) {
                 ShowPointer(h, from, from + dir * dist, true, dist);
                 const Element* e = ElementAt(m, u, v);
+                ray_id[h] = e ? e->id : -1;
+                ray_u[h] = u;
+                ray_v[h] = v;
+                ray_on[h] = true;
                 const bool pulled =
                     PressedKey(h ? UiInputId::RightTrigger : UiInputId::LeftTrigger);
                 // The hand that pulls wins; else the right hand's hover shows.
@@ -1506,6 +1635,10 @@ struct UiSystem::Impl {
             } else {
                 ShowPointer(h, from, from + dir * 1.2f, false, 1e9f);
             }
+        }
+        // Drag and drop: the grip picks up, the grip's release drops (it owns the hands meanwhile).
+        if (DragStep(m, events, ray_id, ray_u, ray_v, ray_on)) {
+            return;
         }
         // Focus (m.hover): the rays move it when they change target, the sticks after that.
         if (hovered != m.ray_hover) {
@@ -1976,6 +2109,11 @@ struct UiSystem::Impl {
         {
             const float cy = y - title_h * 0.5f;
             c.Text(p, left + 0.004f * u, Baseline(cy, 0.026f * u), 0.026f * u, s.label, st.text);
+            if (!live.room.empty()) { // the co-op room code, to read out to a friend (read only)
+                const float lx = left + 0.016f * u + c.TextWidth(s.label, 0.026f * u);
+                c.Text(p, lx, Baseline(cy, 0.02f * u), 0.02f * u, live.room, st.accent, UiAlign::Left,
+                       std::max(0.05f, right - 0.43f * u - lx));
+            }
             button(kDashClose, right - 0.018f * u, cy, 0.036f * u, 0.03f * u, "x", false, true,
                    "Close the dashboard", "");
             button(kDashRemove, right - 0.325f * u, cy, 0.2f * u, 0.03f * u,
@@ -1987,7 +2125,7 @@ struct UiSystem::Impl {
             button(kDashMode, right - 0.13f * u, cy, 0.17f * u, 0.03f * u,
                    m.use_mode ? "Quick click: USE" : "Quick click: SELECT", true, true,
                    m.use_mode ? "A quick item you point at is used at once (d-pad to it, square)"
-                              : "A quick item you point at only becomes the current one (X uses it)",
+                              : "A quick item you point at only becomes the current one (use it from the wheel)",
                    "");
             y -= title_h + gap;
         }
@@ -2056,7 +2194,8 @@ struct UiSystem::Impl {
             for (int k = 0; k < nq && 4 + k < cols; ++k) {
                 const float cx = left + cell * 0.5f + float(4 + k) * (cell + gap) + gap;
                 const std::string& key = quick->second.items[size_t(k)];
-                const bool hot = m.hover == kDashQuick + k, now_current = k == current;
+                const bool drop = drag.Active() && drag.HoverSlot() == k;
+                const bool hot = m.hover == kDashQuick + k || drop, now_current = k == current;
                 c.Frame(p, cx, cy, cell, cell, hot ? st.highlight : st.slot,
                         hot || now_current ? st.highlight_border : st.slot_border,
                         now_current ? 0.0022f * u : 0.0012f * u, cell * 0.08f);
@@ -2174,7 +2313,22 @@ struct UiSystem::Impl {
         {
             const float cy = y - footer_h * 0.5f;
             const auto it = m.dash.find(m.hover);
-            if (it != m.dash.end()) {
+            if (drag.Active()) {
+                const std::vector<std::string> q = QuickItems();
+                const UiDrag::Result r = drag.Preview(q);
+                const std::string what =
+                    r == UiDrag::Result::Assign   ? "Let go: put it in quick slot " + std::to_string(drag.HoverSlot() + 1)
+                    : r == UiDrag::Result::Replace ? "Let go: replace " + Display(q[size_t(drag.HoverSlot())]) +
+                                                         " in quick slot " + std::to_string(drag.HoverSlot() + 1)
+                    : r == UiDrag::Result::Unassign ? "Let go over the inventory: take it out of quick slot " +
+                                                          std::to_string(drag.SourceIndex() + 1)
+                    : drag.From() == UiDrag::Source::Grid ? "Move it onto a quick slot and let go (anywhere else cancels)"
+                                                          : "Let go over the inventory to take it out of its quick slot";
+                c.Text(p, left + 0.004f * u, Baseline(cy + 0.013f * u, 0.02f * u), 0.02f * u, Display(drag.Item()),
+                       st.text, UiAlign::Left, W - 2.0f * pad);
+                c.Text(p, left + 0.004f * u, Baseline(cy - 0.012f * u, 0.015f * u), 0.015f * u, what, st.accent,
+                       UiAlign::Left, W - 2.0f * pad);
+            } else if (it != m.dash.end()) {
                 c.Text(p, left + 0.004f * u, Baseline(cy + 0.013f * u, 0.02f * u), 0.02f * u,
                        it->second.title, st.text, UiAlign::Left, W - 2.0f * pad);
                 const std::string line = it->second.enabled ? it->second.detail
@@ -2183,9 +2337,16 @@ struct UiSystem::Impl {
                        it->second.enabled ? st.text_dim : st.accent, UiAlign::Left, W - 2.0f * pad);
             } else {
                 c.Text(p, left + 0.004f * u, Baseline(cy, 0.015f * u), 0.015f * u,
-                       "Point with either controller and pull its trigger. Left stick click closes.",
-                       st.text_dim);
+                       "Point and pull the trigger; squeeze the grip on an item to drag it onto a quick slot. "
+                       "Left stick click closes.",
+                       st.text_dim, UiAlign::Left, W - 2.0f * pad);
             }
+        }
+        // The dragged card follows the pointer, over everything.
+        if (drag.Active() && m.drag_on_panel) {
+            c.alpha = 0.95f * Ease(m.anim);
+            ItemCard(c, p, m.drag_u, m.drag_v, cell * 1.15f, drag.Item(), true, true);
+            c.alpha = Ease(m.anim);
         }
     }
 
@@ -2618,6 +2779,10 @@ bool UiSystem::UsesStick(int hand) const {
     }
     return false;
 }
+
+bool UiSystem::Dragging() const { return impl->drag.Active(); }
+std::string UiSystem::DragItem() const { return impl->drag.Item(); }
+int UiSystem::DragHand() const { return impl->drag.Hand(); }
 
 bool UiSystem::ElementCenter(const std::string& menu, int id, Vec3& world) const {
     for (const Impl::Menu& m : impl->menus) {

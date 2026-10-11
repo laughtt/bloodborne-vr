@@ -492,7 +492,7 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
-        (void)serial; (void)title; (void)version;
+        bbnet_configure(app0,serial,title,version);
     }
     bbgpu_register_kernel();
 #ifdef _WIN32
@@ -682,6 +682,7 @@ int main(int argc, char **argv) {
     runtime_vr_ui_register(image); /* the VR UI's game reads and presses (findings/26, BB_VR_UI) */
     runtime_vr_netstate_register(image); /* BB_NET_STATE_LOG=1: the network flags monitor */
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    runtime_redzone_guard_install(image); /* ribbon vertex builder red zone fix, always on */
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif

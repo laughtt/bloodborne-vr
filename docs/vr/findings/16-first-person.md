@@ -130,8 +130,17 @@ there: an equipment change in between wins).
 | `none` (default) | nothing (the near plane still cuts) | everything |
 | `head` | slots 0, 2, 6, 17-23 + the skin's head and neck | coat, legs, arms, hands, weapons (`fp_head_down`) |
 | `body` | head + slots 3, 5, base + the skin's torso and feet | **arms, hands, weapons** (`fp_body_down`: one bare arm) |
+| `hands` (**untested in game**) | `body` + the skin's arms (group 43, new bit 27) | hands (skin group 44), armour in slot 4 (sleeves and gloves stay), weapons |
+| `hands_skin` (**untested in game**) | `hands` + slot 4 (arm armour) | bare skin hands and weapons only; **gloves are hidden too** |
+| `nohands` (**untested in game**) | `hands_skin` + the skin's hands (group 44, new bit 28) | weapons only: for the custom VR hands of the bridge (`custom_hands`, findings/40) |
 | `all` | every slot and the base | nothing |
-| `weapons`, `skin`, `arms`, `base`, `skinhead`, `skinbody`, `sN`, numbers | one part or group, combined with `+` | for tests |
+| `weapons`, `skin`, `arms`, `base`, `skinhead`, `skinbody`, `skinarms`, `skinhands`, `sN`, numbers | one part or group, combined with `+` | for tests |
+
+Gloves: no separate glove slot or mesh group is known; gloves and sleeves are both slot 4 (AM), so hiding slot 4 hides
+the gloves with the sleeves. Hence `hands` (the better default of the two) keeps slot 4: a bare-armed outfit shows hands
+only, an armoured one keeps its sleeves; `hands_skin` gives hands only at the cost of the gloves. Tokens combine with
+`+`, `,` or `|` (`hide=body+skinarms`). To check in game: forearm and upper arm fully gone, no floating sleeve cuffs,
+gloves visible (`hands`), weapons visible, shadow (expected lost with the hidden parts, as for `body`).
 
 Edge: a bare-handed outfit draws its hands with the skin (kept). Other outfits differ only in which groups the
 skin shows; hats with their own meshes are slot 2 either way.

@@ -10,6 +10,7 @@
 
 #include "bbport_xr_bridge.h"
 #include "hit_scale.h"
+#include "parry_view.h"
 #include "wire_shapes.h"
 
 namespace sb {
@@ -187,6 +188,9 @@ bool Scene::Load(const std::filesystem::path& assets, Renderer& renderer, std::s
     std::string consume_log;
     consumables.Load(assets, Config{}.consumables, throwables.Defs(), consume_log);
     log += "\n" + consume_log;
+    std::string hands_log;
+    custom_hands.Load(assets / "hands", renderer, hands_log);
+    log += "\n" + hands_log;
     return true;
 }
 
@@ -372,6 +376,39 @@ bool Scene::RackVisible(const Config& config) const {
     return config.throwables.rack_grab && !(config.consumables.Objects() && config.consumables.hide_rack);
 }
 
+/// The finger pose of a hand: what it holds (the sandbox's tuned grips first, then the hold
+/// category), else the analog grip and trigger.
+vrui::hand::Pose Scene::HandTarget(int side, const SceneInput& input, const Config& config) const {
+    using namespace vrui::hand;
+    const float trigger = input.trigger[side], squeeze = input.squeeze[side];
+    uint32_t id = BBXR_ITEM_NONE;
+    GripDef tuned;
+    const int thrown = throwables.HeldItem(side);
+    if (thrown >= 0) {
+        const ThrowItemDef& d = throwables.Defs()[size_t(throwables.Items()[size_t(thrown)].def)];
+        id = BBXR_ITEM_GOODS | uint32_t(d.goods);
+        tuned.pos = d.grip.position;
+        tuned.rot_deg = d.grip.rotation_deg;
+    } else if (consumables.HeldBy(side).entry >= 0) {
+        const ConsumableDef& d = consumables.DefOf(consumables.HeldBy(side).entry);
+        id = BBXR_ITEM_GOODS | uint32_t(d.goods);
+        tuned.pos = d.hold;
+        tuned.rot_deg = d.hold_rot_deg;
+    }
+    if (id != BBXR_ITEM_NONE) {
+        return HoldPose(GripFor(id, &tuned), trigger);
+    }
+    const int slot = weapon_slot[side];
+    if (slot >= 0 && weapons[size_t(slot)].loaded && !consumables.WeaponStowed(side, config.consumables)) {
+        GripDef g = CategoryGrip(HoldCategory::Weapon);
+        if (weapons[size_t(slot)].gun) { // the index rests along the frame until the trigger
+            return CurlPose(g.thumb, 0.3f + 0.7f * std::clamp(trigger, 0.0f, 1.0f), g.others);
+        }
+        return HoldPose(g, 0.0f);
+    }
+    return ControllerPose(squeeze, trigger);
+}
+
 void Scene::Update(const SceneInput& input, Config& config, ConfigFile* file,
                    SceneEvents& events, Renderer& renderer) {
     floor_y = input.stage ? 0.0f : config.floor_y;
@@ -491,7 +528,14 @@ void Scene::Update(const SceneInput& input, Config& config, ConfigFile* file,
             }
         }
         PhysicsEvents physics_events;
-        physics.Step(step, config.physics, physics_events);
+        // The parry dummy is the physics enemy, moved straight ahead of the calibration pose.
+        PhysicsConfig physics_config = config.physics;
+        if (config.parry.enabled && config.parry.dummy) {
+            physics_config.enemy_pos[0] = config.parry.x_m;
+            physics_config.enemy_pos[1] = -config.parry.distance_m;
+            physics_config.enemy_face_user = true;
+        }
+        physics.Step(step, physics_config, physics_events);
         physics_view.Sync(physics, renderer);
         events.log += physics_events.log;
         for (int side = 0; side < 2; ++side) {
@@ -556,6 +600,69 @@ void Scene::Update(const SceneInput& input, Config& config, ConfigFile* file,
             events.haptic_seconds[side] = std::max({events.haptic_seconds[side],
                                                     consume_events.haptic_seconds[side],
                                                     grab_events.haptic_seconds[side]});
+        }
+    }
+    {
+        // The left-hand gun thrust and the parry dummy (parry.h).
+        ParryInput pi;
+        pi.time = input.time;
+        pi.head_valid = input.head.valid;
+        pi.head_position = input.head.position;
+        pi.head_rotation = input.head.rotation;
+        pi.hand_valid = input.grip[0].valid && input.aim[0].valid;
+        pi.hand_position = input.grip[0].position;
+        pi.aim_position = input.aim[0].position;
+        pi.aim_rotation = input.aim[0].rotation;
+        pi.trigger = input.trigger[0];
+        pi.hand_free = throwables.HeldItem(0) < 0 && !consumables.HandBusy(0);
+        pi.rhand_valid = input.grip[1].valid && input.aim[1].valid;
+        pi.rhand_position = input.grip[1].position;
+        pi.rhand_rotation = input.aim[1].rotation;
+        pi.floor_y = floor_y;
+        const int gun_slot = weapon_slot[0];
+        if (gun_slot >= 0 && weapons[size_t(gun_slot)].loaded && pi.hand_free &&
+            !consumables.WeaponStowed(0, config.consumables)) {
+            const Weapon& w = weapons[size_t(gun_slot)];
+            const Mat4 world = physics.WeaponPose(0, WeaponWorld(0, config));
+            pi.muzzle = TransformPoint(world, w.long_axis * w.reach);
+            pi.muzzle_valid = true;
+        }
+        const WeaponPhysics::Enemy& enemy = physics.GetEnemy();
+        if (enemy.placed) {
+            for (const col::Capsule& c : enemy.parts) {
+                pi.parts.push_back({TransformPoint(enemy.world, c.a), TransformPoint(enemy.world, c.b), c.r});
+            }
+        }
+        for (const WeaponPhysics::Marker& m : physics.Markers()) {
+            if (m.side == 1 && m.part >= 0) {
+                pi.melee_hit_time = std::max(pi.melee_hit_time, m.time);
+            }
+        }
+        ParryEvents pe;
+        parry.Step(pi, config.parry, pe);
+        events.log += pe.log;
+        for (int side = 0; side < 2; ++side) {
+            if (pe.haptic_amplitude[side] > events.haptic_amplitude[side]) {
+                events.haptic_amplitude[side] = pe.haptic_amplitude[side];
+                events.haptic_seconds[side] = pe.haptic_seconds[side];
+            }
+        }
+        if (!pe.toast_title.empty()) {
+            events.toast_title = pe.toast_title;
+            events.toast_body = pe.toast_body;
+        }
+        events.beep_hz = pe.beep_hz;
+        events.beep_ms = pe.beep_ms;
+    }
+    {
+        // The custom hands: the controller poses as the rig ended up with them, the fingers from
+        // grip and trigger or from what the hand holds.
+        const double dt = hands_time > 0.0 ? input.time - hands_time : 0.0;
+        hands_time = input.time;
+        for (int side = 0; side < 2; ++side) {
+            const HandInput& hand = rig_input.hands[side];
+            custom_hands.Set(side, hand.valid, hand.position, hand.rotation,
+                             HandTarget(side, input, config), dt, config.hands);
         }
     }
     if (!mirror_placed) {
@@ -789,12 +896,19 @@ void Scene::Build(const Config& config, FrameData& out) const {
             }
         }
     }
+    const bool custom_hands_on = config.hands.Custom() && custom_hands.Ready();
+    if (custom_hands_on) {
+        custom_hands.Append(config.hands, show_mirror ? &mirror : nullptr, out);
+    }
     if (config.show_body) {
         for (int copy = 0; copy < (show_mirror ? 2 : 1); ++copy) {
             for (size_t i = 0; i < body.meshes.size(); ++i) {
                 const MeshRange& mesh = body.meshes[i];
                 if (mesh.hidden && !config.show_masked) {
                     continue;
+                }
+                if (custom_hands_on && mesh.slot == "skin" && mesh.mask == 44) {
+                    continue; // the generic hands replace the hunter's own
                 }
                 if (copy == 0 && config.fp_hide.empty() && !config.show_head && IsHeadMesh(mesh)) {
                     continue; // first person: no head in front of the eyes
@@ -965,6 +1079,7 @@ void Scene::Build(const Config& config, FrameData& out) const {
             }
         }
     }
+    DrawParry(parry, config.parry, last_input.time, last_input.head.position, out);
     physics_view.Draw(physics, config.physics, out); // props, enemy, colliders, ghost hands, hits
     if (config.throwables.enabled && config.throwables.show && throwables.Placed()) {
         const auto line = [&](Vec3 a, Vec3 b, const uint8_t* rgb) {

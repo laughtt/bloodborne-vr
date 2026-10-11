@@ -511,7 +511,7 @@ Take an item by closing the grip (`grab_squeeze` 0.6) with the hand's grab point
 |---|---|---|
 | Throwables | throw | Handed to the throwables (`mode` hand / game as in the section above); the throw uses one up |
 | Weapon buffs: Fire Paper, Bolt Paper, Empty Phantasm Shell (arcane), Bone Marrow Ash (gun buff) | rub | Take with either hand; it is rubbed onto the weapon the **other** hand holds: the paper (or the hand) stays within `contact_radius_m` (10 cm) of the blade and covers `coverage` (50 %) of the blade (the weapon minus its first `blade_start` 25 %), in any direction, within `window_s` (2.5 s); haptics, a glowing covered range and a progress gauge along the blade while rubbing; the log (`rub ...` lines, every `diag_interval_s`) says why a rub is not counted (no weapon, too far, past the tip). The weapon then glows and sparks in the element's colour (fire orange, bolt blue, arcane purple) for the SpEffect's duration (60 s; `buff_default_s`) with a bar in the corner HUD |
-| Healing: Blood Vial, Iosefka's Blood Vial, Blood of Adeline | head | Bring within `mouth_radius_m` (12 cm) of the mouth (`mouth` offset from the head), below the eyes, for `head_hold_s` (0.3 s; the log prints `head ... cm from the mouth` near the head): toast and HP bar (HUD, flashes), the dump's heal % |
+| Healing: Blood Vial, Iosefka's Blood Vial, Blood of Adeline | head | Bring within `mouth_radius_m` (24 cm) of the mouth (`mouth` offset from the head), below the eyes, for `head_hold_s` (0.3 s; the log prints `head ... cm from the mouth` near the head): toast and HP bar (HUD, flashes), the dump's heal % |
 | Cures: Antidote, Sedative | head | Remove the ailment (poison, frenzy) |
 | Body buffs: Beast Blood Pellet (60 s), Blue Elixir (30 s), Lead Elixir, Madman's Knowledge (+1 insight), Old Hunter Bone (16 s) | head | Timed status bar in the HUD |
 | Bells (Beckoning, Small / Sinister Resonant, Choir) | head | Rung next to the ear; not used up |
@@ -525,6 +525,38 @@ Meshes: `python scripts/vr_assets/extract.py --consumables` writes `out/vr_asset
 (vials, flask, bells; the rest are procedural paper, pellet, packet, bone, tablet, flask, syringe). Every
 wheel open, pick, put back, use, throw, buff and expiry prints a line and appends JSON to
 `sandbox3d_consumables.jsonl`. Keys: see `ConsumeConfig` (`consumables_config.h`).
+
+## Gun parry and custom hands: the `parry` and `hands` objects of `sandbox3d.json` (docs/vr/findings/41-parry.md, 40-custom-hands.md)
+
+The left hand's gun is shot like in the game: `ShootGate` (`../xr_input_logic.h`) fires on a jab of the left controller along its barrel (thrust >= 1.5 m/s relative to the head, alignment >= 0.8, rising, 250 ms debounce, re-arm below 0.5 m/s). A bullet leaves the gun's muzzle (flash, tracer, recoil pulse), pulled toward the dummy's chest by the game's aim assist (`vg_assist_dir`: cone clamp(atan(0.6/d), 4, 18) deg, strength 0.8, range 12 m). Every jab is logged once: `parry: SHOT #n ...` or `parry: jab rejected: speed|alignment|falling|debounce|disarmed (best frame ...)`. The defaults come from the same `BB_XR_SHOOT_*` and `BB_VR_PARRY_*` environment variables as the game.
+
+The parry dummy is the sandbox enemy (Central Yharnam Huntsman) straight ahead (`dummy.distance_m`, default 2.2 m; moved at the T-pose calibration like the other props). Loop: idle (`idle_s` 1.2) -> wind-up (`windup_s` 0.7: amber, the weapon rises, a ring closes over its head, a soft beep and a tick in the left hand) -> PARRY WINDOW (`window_s` 0.15: green, a high beep) -> swing (`swing_s` 0.35, red) -> recover (`recover_s` 0.4). A bullet that lands in the window is `PARRY!` (toast, console, big haptic): the dummy is staggered (blue) for `stagger_s` 2.0, and a right-hand swing that connects then is a `VISCERAL!` (it goes down for `down_s`). A bullet in the wind-up is `TOO EARLY by N ms`, after the window `TOO LATE by N ms`, one that hits nothing `MISS` (with its closest approach), one at the idle dummy is not graded. The score (parries green, early yellow, late orange, misses grey, visceral blue) is drawn as digits beside the dummy and printed with every event.
+
+```json
+"parry": {"enabled": true, "trigger_fire": false, "sound": true,
+  "shoot":  {"speed_mps": 1.5, "align": 0.8, "rearm_mps": 0.5, "debounce_ms": 250},
+  "assist": {"enabled": true, "strength": 0.8, "radius_m": 0.6, "cone_min_deg": 4, "cone_max_deg": 18, "range_m": 12},
+  "bullet": {"speed_mps": 60, "range_m": 40},
+  "dummy":  {"enabled": true, "attack_loop": true, "distance_m": 2.2, "x_m": 0, "idle_s": 1.2, "windup_s": 0.7,
+             "window_s": 0.15, "swing_s": 0.35, "recover_s": 0.4, "stagger_s": 2.0, "down_s": 1.0},
+  "visceral": {"mode": "thrust", "speed_mps": 1.5, "align": 0.7, "reach_m": 1.2, "debounce_ms": 300}}
+```
+
+`trigger_fire` also lets the left trigger shoot (aim practice); `dummy.attack_loop: false` makes it stand still.
+
+The visceral (`parry.visceral`, live-polled) finishes the staggered dummy. `mode`: `thrust` (default) = a forward thrust of the right hand at the dummy (hand velocity relative to the head along the hand's aim >= `speed_mps`, the stroke within `align` (cosine) of the direction to the chest, thrust still rising, `debounce_ms` since the last one, re-armed below the shoot `rearm_mps`, and the hand within `reach_m` of the chest) or the right-hand melee hit; `swing` = only the melee hit (thrusts are ignored); `auto` = after a parry it fires by itself once the right hand or the head is within `reach_m` of the chest (the melee hit works too). Outside the stagger nothing special happens. Log: `parry: VISCERAL! (thrust|swing|auto) ...`, and during the stagger `parry: visceral thrust rejected: speed|alignment|falling|debounce|disarmed|reach (best frame ...)` once per thrust.
+
+Hands: `"hands": {"model": "custom" | "current", "scale", "position", "rotation_deg", "blend_rate"}`. `custom` (default) draws the WebXR generic hand (`out/vr_assets/hands/{left,right}.glb`, `../vr_hand_model.h`) at each controller, GPU skinned, fingers blended from the analog grip and trigger (open / index-curled / point / fist), the hunter's own hands hidden; also in the mirror. While a hand holds an item the pose is that item's (the sandbox's tuned grips of the throwables and consumables first, then the category defaults: bottle, small, paper, bell, tool); a held weapon closes the hand, a gun keeps the index off the frame until the trigger. `current` draws the hunter's hands. `position` / `rotation_deg` shift the hand in the grip frame (the left mirrors it) to tune the fit.
+
+### Testing it in the headset
+
+1. Launch (below), press A for 1.5 s in a T-pose: the dummy appears 2.2 m ahead, props around you. The left weapon is the Hunter Pistol, the right one the Saw Cleaver.
+2. Hands: open, fist (grip), point (grip + trigger off), trigger only; grab a vial or knife from the rack (grip) and see the item's pose; drink, throw: still work.
+3. Thrust the left gun at the dummy along the barrel, fast (2-3 m/s): `SHOT`, a flash and a tracer. A slow poke, a sideways swing and a quick second jab are logged as rejected with the reason.
+4. Watch the amber wind-up and the ring; shoot as it closes: `PARRY!` and a long buzz; `TOO EARLY` / `TOO LATE` show the error in ms. Widen `window_s` while it is hard.
+5. After a parry thrust the right hand at the blue dummy (or swing it into it): `VISCERAL!`; try `visceral.mode` `auto` and `swing`. Compare `assist.enabled` on and off with the gun a few degrees off.
+
+Tests: `bbport_xr_sandbox3d_parry_test.exe` (window timing, visceral by swing / thrust / auto and its rejections, the gate's rejections, the assist, the config).
 
 ## How it works
 
@@ -569,6 +601,7 @@ wheel open, pick, put back, use, throw, buff and expiry prints a line and append
 - `--offline` also renders the swing HUD after scripted swings through the scene and its physics: `combat_hit` (a heavy into the Huntsman), `combat_tired` (no stamina, the wrist bar) and `combat_charge`.png, with their log in `combat_swing.jsonl`.
 - `bbport_xr_sandbox3d_throw_test.exe out/vr_assets` drives the throwables with a scripted hand at 90 Hz: the built-in rows against the dump's Bullet values and the extracted table, the hand velocity estimator (constant, ramp-and-stop, noise), grab (radius, squeeze, nearest, riding the hand), flat throws of every item against an independent fine integration of the Bullet rules (range within 3 %), speed scaling and the max-velocity cap, straight knives, the fan of three, the Delayed Molotov and its fuse, back throws and weak flicks (drops), the enemy (burst, or pierced), the post and wall, Tiny Tonitrus' life, the game-style throw, the buttons, the log, the extracted meshes and the procedural stand-ins.
 - `bbport_xr_sandbox3d_consume_test.exe out/vr_assets` drives the item wheel with scripted hands and R3: layout below eye level, empty items hidden, the card-wheel switch, picking and putting back, the vial at the mouth (a fly-by or the eyes do not count), cures, timed buffs and their expiry, insight, bells, bullet costs, the paper rub (full, back-and-forth, too short, too slow, beside or across the blade, wrong hand, no weapon, gun buff), a throwable from the wheel thrown by hand velocity and used up when thrown, crush, the wheel reopening after every outcome, weapons stowed and returned, the jsonl log.
+- `bbport_xr_sandbox3d_parry_test.exe` drives the parry trainer with a scripted player (no headset): the window timing (parry, early and late by N ms, idle, miss, a tunable window), the visceral, the thrust gate (fire, speed, alignment and debounce rejections, walking), the aim assist and the config.
 - `python scripts/vr_assets/test_ui_assets.py` tests the TPF/BC7/PS4-tiling decoder and the font reader.
 - `python scripts/vr_assets/test_vr_assets.py` tests the asset pipeline.
 

@@ -119,6 +119,8 @@ struct UiLiveData {
     /// (a weapon from the inventory into a hand slot), "clear_quick" (empty a quick slot), or a
     /// button's action.
     std::map<std::string, std::string> disabled;
+    /// The co-op room line for the dashboard title ("Room K7Q-M4X  2/3"), "" in a solo game. Read only.
+    std::string room;
 };
 
 class UiSystem {
@@ -177,6 +179,10 @@ public:
     static int DashRemove() { return 1404; }
     /// Where element `id` of a panel menu was drawn by the last Build (world), false if not.
     bool ElementCenter(const std::string& menu, int id, m3::Vec3& world) const;
+    /// The dashboard's drag and drop (ui_drag.h): an item is being dragged, and which (item key), with what hand.
+    bool Dragging() const;
+    std::string DragItem() const;
+    int DragHand() const;
 
     /// One line per preset and its bindings, for the console.
     std::string Controls() const;

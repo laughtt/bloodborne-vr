@@ -10,6 +10,13 @@ cmake_minimum_required(VERSION 3.20)
 project(bbport_xr LANGUAGES CXX)
 
 # BBPORT_ONLINE=OFF (public alpha): no co-op pose sync (vr_pose_net.h, sandbox3d/coop_*).
+# BBPORT_PUBLIC (public release bridge): no builder folder names in __FILE__, assert strings or debug info.
+option(BBPORT_PUBLIC "Public build: strip the builder's paths" OFF)
+if (BBPORT_PUBLIC)
+    get_filename_component(BB_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    add_compile_options("-ffile-prefix-map=${BB_REPO_ROOT}=/src" "-ffile-prefix-map=${CMAKE_BINARY_DIR}=/build"
+                        "-fmacro-prefix-map=${BB_REPO_ROOT}=/src" "-fdebug-prefix-map=${BB_REPO_ROOT}=/src")
+endif()
     add_compile_definitions(BB_PUBLIC_ALPHA=1)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,7 +48,9 @@ set(BB_GAME_UI_SOURCES vr_game_ui.cpp vr_game_ui.h vr_game_hitbox.cpp vr_game_hi
     sandbox3d/wire_shapes.h vr_ui_filter.h sandbox3d/ui.cpp sandbox3d/ui.h
     sandbox3d/ui_layout.cpp sandbox3d/ui_layout.h sandbox3d/ui_render.cpp sandbox3d/ui_render.h
     sandbox3d/combat_hud.cpp sandbox3d/combat_hud.h sandbox3d/model.cpp sandbox3d/model.h
-    sandbox3d/png_read.h sandbox3d/json.h sandbox3d/math3d.h swing_logic.h)
+    sandbox3d/png_read.h sandbox3d/json.h sandbox3d/math3d.h swing_logic.h
+    vr_held_mesh.h vr_hand_model.h vr_skin_model.h sandbox3d/throw_config.cpp sandbox3d/throw_config.h
+    sandbox3d/consumables_config.cpp sandbox3d/consumables_config.h)
 target_sources(bbport_xr PRIVATE ${BB_GAME_UI_SOURCES} vr_ui_layer.cpp vr_ui_layer.h)
 target_include_directories(bbport_xr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/sandbox3d ${CMAKE_CURRENT_BINARY_DIR}/sandbox3d/shaders)

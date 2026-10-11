@@ -80,6 +80,7 @@ public:
     std::vector<UiItem> items;
 
 private:
+    void AppendItemSheet(const std::filesystem::path& assets, std::string& log);
     std::unordered_map<int, std::pair<int, int>> icons;
 };
 

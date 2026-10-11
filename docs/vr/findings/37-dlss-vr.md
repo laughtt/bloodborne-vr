@@ -326,3 +326,10 @@ Added:
   vector / mask passes, and restarts the histories. Logged as `VR IQ (control file): ... jitter
   OFF (diagnostic)` and `VR DLSS: jitter OFF/on`. Use it to see whether a shimmer or blur comes from
   the jitter. Tests: `xr-dlss-test` (recreate reasons, guard, per-eye Halton, jitter off).
+
+**Follow-up (2026-10-11): live dlss -> fsr1 + 3840x2160, device lost.** `MakeFlatOpaque` (the alpha
+pass over the headset image) cached image views by `VkImage` handle and never freed them. After the
+bridge recreated the eye swapchain at the new size the driver gave a new image the handle of a freed
+one, the stale view of the old 2880x1620 image was drawn into, and the next submit lost the device.
+Fix: the cache holds extent and format too, and is dropped (views retired in two steps) after the
+queue wait in `XrChainResize`, just before the bridge recreates a chain.

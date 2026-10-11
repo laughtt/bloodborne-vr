@@ -550,6 +550,9 @@ int RunXr(const fs::path& assets, const fs::path& config_path, double seconds,
         if (!events.toast_title.empty()) {
             ui.ShowMessage(events.toast_title, events.toast_body, 3.0);
         }
+        if (events.beep_hz > 0.0f) { // the parry cues
+            std::thread([hz = DWORD(events.beep_hz), ms = DWORD(events.beep_ms)] { Beep(hz, ms); }).detach();
+        }
         for (int side = 0; side < 2; ++side) {
             if (events.haptic[side] && events.haptic_amplitude[side] < 0.4f) {
                 xr->Haptic(side, 0.4f, 0.05f); // a control's tick

@@ -102,6 +102,7 @@ bool LoadModel(const std::filesystem::path& json_path, Model& out, std::string& 
         mesh.part = m["part"].Str();
         mesh.slot = m["slot"].Str();
         mesh.material = m["material"].Str();
+        mesh.texture = m["texture"].Str();
         mesh.mask = m["mask"].Int(-1);
         mesh.hidden = m["hidden"].Bool(false);
         mesh.dominant_bone = m["dominant_bone"].Int(-1);

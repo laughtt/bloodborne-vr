@@ -15,6 +15,15 @@ void vr_gun_view(const float rows[4][4]);
  * direction. Both are turned into the world with the latest first-person camera. */
 void vr_gun_throw_origin(const int32_t mm[3]);
 void vr_gun_throw_dir(const int32_t dir_1e4[3]);
+/* The pad thread, right after the DIR call, for a thrown item's use action: the hand's speed at the
+ * release relative to the head, cm/s. The projectile's speed is scaled by it (BB_VR_THROW_SPEED). */
+void vr_gun_throw_speed(int32_t cm_s);
+/* The visceral module (src/runtime_vr_visceral.c, pad thread): the latest first-person camera rows
+ * (right, up, forward, position) and its age; 0 when there is none or it is older than 300 ms. */
+int vr_gun_view_latest(float rows[4][4], uint64_t *age_us);
+/* The lock-on candidates' world points (the enemies the game would let the player lock onto); returns
+ * how many were read (0 before the first launch hook call). */
+int vr_gun_candidate_points(float (*out)[3], int max);
 /* Reads the environment and registers the bullet launch hook's handler ("bb_hook_vr_gun_aim"). */
 void vr_gun_register(void);
 

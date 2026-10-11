@@ -20,7 +20,9 @@
 
 #include "config.h"
 #include "consumables.h"
+#include "custom_hands.h"
 #include "model.h"
+#include "parry.h"
 #include "physics_view.h"
 #include "physics_weapon.h"
 #include "renderer.h"
@@ -48,7 +50,8 @@ struct SceneEvents {
     bool haptic[2] = {};
     float haptic_amplitude[2] = {}, haptic_seconds[2] = {}; // weapon contacts (physics_weapon.h)
     std::string log;
-    std::string toast_title, toast_body; // what the app shows the player (consumables)
+    std::string toast_title, toast_body; // what the app shows the player (consumables, parry)
+    float beep_hz = 0.0f, beep_ms = 0.0f; // a cue sound to play (parry), 0: none
 };
 
 class Scene {
@@ -63,6 +66,9 @@ public:
     WeaponPhysics& Physics() { return physics; } // solid weapons, props, haptics
     Throwables& Throw() { return throwables; }   // the rack and the hand-thrown goods
     Consumables& Consume() { return consumables; } // the item wheel and the inventory
+    const ParryTrainer& Parry() const { return parry; } // the gun thrust and the dummy
+    ParryTrainer& Parry() { return parry; }
+    const CustomHands& Hands() const { return custom_hands; }
 
 private:
     struct Weapon {
@@ -125,6 +131,10 @@ private:
     Consumables consumables;              // the item wheel of 3D objects (consumables.h)
     std::vector<ThrowModel> consume_models; // per consumables entry (throwables use throw_models)
     PhysicsView physics_view; // ... and how they are drawn
+    ParryTrainer parry;       // the left-hand gun thrust and the parry dummy (parry.h)
+    double hands_time = 0.0;
+    CustomHands custom_hands; // the generic hands, skinned on the GPU (custom_hands.h)
+    vrui::hand::Pose HandTarget(int side, const SceneInput& input, const Config& config) const;
 };
 
 } // namespace sb

@@ -16,6 +16,12 @@
 //   Config::fallback_frames held frames in a row (menus, loading screens, a camera the hook did
 //   not set) frames go to the mono path until an eye matches again.
 //
+//   A frame may carry several scene cameras (FrameCamera[]): the first G-buffer pass of a frame is
+//   not always the main view (in the Central Yharnam sewers every frame was "unmatched" and stayed
+//   mono for the whole area, most likely another view drawn first); each is tried in order. While
+//   the host reports a cutscene (SetCinema, bbgpu_vr_set_cinema) every frame goes to the mono path
+//   at once, which the presenter shows on the flat cinema screen.
+//
 //   AltEyes (the bridge): when the projection layer shows the two eye images, each with the view
 //   it was rendered with, and the per-eye image ages of the pacing log.
 
@@ -128,6 +134,9 @@ struct Decision {
     EyeView view{};        // Kind::Eye: the matched view
     uint32_t lag = 0;      // Kind::Eye: views published after the matched one (game frames)
     int side = 0;          // Kind::Eye: Side() of the frame's camera (-1 left, +1 right, 0 none)
+    uint32_t camera = 0;   // Kind::Eye: which of the frame's scene cameras matched (0 the first)
+    // The closest published view to any of the frame's cameras (diagnostics of "unmatched").
+    float best_rotation = 1e9f, best_position = 1e9f;
     uint64_t frame = 0;    // the finished frame's number (Stats::frames after it)
     const char* reason = "";
 };
@@ -137,6 +146,8 @@ struct Stats {
     uint64_t eye[2] = {};
     uint64_t held_no_camera = 0, held_repeat = 0, held_unmatched = 0;
     uint64_t mono = 0;
+    uint64_t cinema = 0;        // frames sent to the mono path because the host reported a cutscene
+    uint64_t other_camera = 0;  // matched by a scene camera other than the frame's first
     uint64_t tag_rejects = 0;   // pose matched but the eye tag did not: a swap the tag prevented
     uint64_t side_failures = 0; // given to an eye whose side the camera is not on: a real swap
     uint64_t transposed = 0;    // matched with the rotation as columns
@@ -157,20 +168,55 @@ public:
         ++count_;
     }
 
+    /// The host reports a cutscene (true) or its end: while on, every frame takes the mono path.
+    void SetCinema(bool on) {
+        cinema_ = on;
+    }
+    bool Cinema() const {
+        return cinema_;
+    }
+
     Decision OnFrame(const FrameCamera& frame) {
+        return OnFrame(&frame, 1);
+    }
+
+    /// A finished frame with `count` scene cameras (the first is the frame's first main-pass
+    /// camera; count 0 or no has_view in any: no camera).
+    Decision OnFrame(const FrameCamera* frames, size_t count) {
         ++stats_.frames;
         Decision d;
         d.frame = stats_.frames;
+        if (cinema_) {
+            d.kind = Kind::Mono;
+            d.reason = "cinema";
+            mono_ = true;
+            streak_ = 0;
+            ++stats_.cinema;
+            ++stats_.mono;
+            return d;
+        }
         const uint64_t size = std::min<uint64_t>(count_, kRing);
         int match = -1;
         bool repeat = false;
+        bool has_view = false;
         int tag_rejected_eyes = 0; // bit e: a newer view of eye e had the pose but not the tag
         Error match_error;
-        if (frame.has_view) {
+        const FrameCamera* matched_frame = nullptr;
+        for (size_t c = 0; c < count && match < 0; ++c) {
+            const FrameCamera& frame = frames[c];
+            if (!frame.has_view) {
+                continue;
+            }
+            has_view = true;
             // Oldest first: frames are presented in the order they were set up.
             for (uint64_t back = size; back-- > 0;) {
                 const EyeView& v = ring_[(count_ - 1 - back) % kRing];
                 const Error e = Compare(frame, v);
+                if (e.rotation < d.best_rotation ||
+                    (e.rotation == d.best_rotation && e.position < d.best_position)) {
+                    d.best_rotation = e.rotation;
+                    d.best_position = e.position;
+                }
                 if (e.rotation > config_.rotation_tolerance ||
                     e.position > config_.position_tolerance) {
                     continue;
@@ -188,7 +234,9 @@ public:
                 }
                 match = int((count_ - 1 - back) % kRing);
                 match_error = e;
+                matched_frame = &frame;
                 d.lag = uint32_t(back);
+                d.camera = uint32_t(c);
                 break;
             }
         }
@@ -205,9 +253,10 @@ public:
             ++stats_.eye[v.eye & 1];
             stats_.lag_sum += d.lag;
             stats_.transposed += match_error.transposed;
+            stats_.other_camera += d.camera != 0;
             // Only the other eye's view counts: without the tag this frame could have gone there.
             stats_.tag_rejects += (tag_rejected_eyes >> (1 - (v.eye & 1))) & 1;
-            d.side = Side(frame, v, match_error.transposed);
+            d.side = Side(*matched_frame, v, match_error.transposed);
             if (d.side != 0 && d.side != (v.eye ? 1 : -1)) {
                 ++stats_.side_failures;
             }
@@ -221,8 +270,8 @@ public:
             stats_.max_run = std::max(stats_.max_run, run_);
             return d;
         }
-        d.reason = !frame.has_view ? "no camera" : repeat ? "repeat" : "unmatched";
-        if (!frame.has_view) {
+        d.reason = !has_view ? "no camera" : repeat ? "repeat" : "unmatched";
+        if (!has_view) {
             ++stats_.held_no_camera;
         } else if (repeat) {
             ++stats_.held_repeat;
@@ -257,6 +306,7 @@ public:
 
 private:
     Config config_;
+    bool cinema_ = false;
     std::array<EyeView, kRing> ring_{};
     uint64_t count_ = 0;
     uint64_t last_seq_ = 0;

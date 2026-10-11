@@ -484,8 +484,246 @@ static const RuntimeExport exports[]={
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
-/* Public alpha: single player only. The sceNet*, sceNp*, sceHttp* and sceSsl* imports resolve to the
- * offline answers in the exports table above (not signed in, network down). */
+/* Co-op (BB_ONLINE=1): network and PSN calls go to the shadNet libraries in bbgpu when they
+ * implement them. Trophies, voice and the store/profile dialogs stay here. */
+static int online_symbol(const char *symbol) {
+    static const char *const online[]={"sceNet","sceNp","sceHttp","sceSsl"};
+    static const char *const local[]={"sceNpTrophy","sceNpCommerce","sceNpProfileDialog"};
+    int match=0;
+    for (size_t i=0;i<sizeof(online)/sizeof(*online);++i)
+        if (!strncmp(symbol,online[i],strlen(online[i]))) match=1;
+    for (size_t i=0;i<sizeof(local)/sizeof(*local);++i)
+        if (!strncmp(symbol,local[i],strlen(local[i]))) match=0;
+    return match;
+}
+#ifndef BB_PUBLIC_ALPHA /* the network trace is a dev tool: not in public builds */
+/* ---- BB_NET_TRACE=1: log every sceNet*, sceNp*, sceHttp*, sceSsl* import call (co-op research P0a) ----
+ * Each such import resolves to a tiny thunk (mov r10,entry; mov r11,tramp; jmp r11). The trampoline
+ * keeps the six register arguments and eight stack words, calls the real function with them, then
+ * logs name, key arguments, return value and the guest return address to out/net_trace.log
+ * (BB_NET_TRACE_FILE overrides the path). Append, line-buffered, plus a per function call count
+ * summary every 10 s. At BB_NET_TRACE_CAP_MB (default 200, accepted 10..4096) the file is rotated:
+ * renamed to "<path>.1" (a previous .1 is replaced) and a fresh "<path>" is started; only when that
+ * cannot be reopened does the trace stop logging (calls are still counted). Secrets are masked (src/net_trace_fmt.h). The call
+ * itself is unchanged. With the variable unset none of this runs. */
+#define TRACE_CAP_DEFAULT_MB 200
+#define TRACE_SUMMARY_SECONDS 10.0
+typedef struct TraceEntry {
+    uintptr_t target;           /* first: the trampoline reads it at offset 0 */
+    const char *name;
+    uintptr_t thunk;
+    uint64_t calls, reported;
+    struct TraceEntry *next;
+} TraceEntry;
+extern char bb_net_trace_tramp[];
+void *bb_net_trace_log_fn;
+
+__asm__(
+    ".text\n.p2align 4\n.globl bb_net_trace_tramp\nbb_net_trace_tramp:\n"
+    "pushq %rbp\n movq %rsp,%rbp\n pushq %r10\n subq $120,%rsp\n"
+    "movq %rdi,-56(%rbp)\n movq %rsi,-48(%rbp)\n movq %rdx,-40(%rbp)\n"
+    "movq %rcx,-32(%rbp)\n movq %r8,-24(%rbp)\n movq %r9,-16(%rbp)\n"
+    "movq 16(%rbp),%rax\n movq %rax,0(%rsp)\n movq 24(%rbp),%rax\n movq %rax,8(%rsp)\n"
+    "movq 32(%rbp),%rax\n movq %rax,16(%rsp)\n movq 40(%rbp),%rax\n movq %rax,24(%rsp)\n"
+    "movq 48(%rbp),%rax\n movq %rax,32(%rsp)\n movq 56(%rbp),%rax\n movq %rax,40(%rsp)\n"
+    "movq 64(%rbp),%rax\n movq %rax,48(%rsp)\n movq 72(%rbp),%rax\n movq %rax,56(%rsp)\n"
+    "movq -8(%rbp),%r10\n movq (%r10),%r11\n xorl %eax,%eax\n call *%r11\n"
+    "movq %rax,-64(%rbp)\n"
+    "movq -8(%rbp),%rdi\n leaq -56(%rbp),%rsi\n movq %rax,%rdx\n movq 8(%rbp),%rcx\n"
+    "movq bb_net_trace_log_fn(%rip),%r11\n call *%r11\n"
+    "movq -64(%rbp),%rax\n leave\n ret\n");
+
+static pthread_mutex_t trace_lock=PTHREAD_MUTEX_INITIALIZER;
+static FILE *trace_file;
+static TraceEntry *trace_head,*trace_tail;
+static unsigned char *trace_code;
+static size_t trace_code_used;
+static uint64_t trace_seq,trace_bytes;
+static double trace_t0,trace_last_summary;
+static int trace_capped;
+static char trace_path[1024];
+static uint64_t trace_cap_bytes=(uint64_t)TRACE_CAP_DEFAULT_MB*1024*1024;
+#define TRACE_CODE_SIZE 65536
+#define TRACE_SLOT 32
+
+static double trace_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9;
+}
+/* A guest string at addr, or NULL when it is not readable text. Windows only; elsewhere pointers are not followed. */
+static const char *trace_read(uint64_t addr,char *buf,size_t cap) {
+#ifdef _WIN32
+    size_t n=0;
+    while (n+1<cap) {
+        uintptr_t p=(uintptr_t)(addr+n);
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void*)p,&mi,sizeof mi)) return NULL;
+        if (mi.State!=MEM_COMMIT || !(mi.Protect&0xCE) || (mi.Protect&0x100)) return NULL;
+        size_t avail=(size_t)((uintptr_t)mi.BaseAddress+mi.RegionSize-p);
+        for (size_t k=0;k<avail && n+1<cap;++k,++n) {
+            unsigned char c=((const unsigned char*)p)[k];
+            if (c<32 || c>126) { buf[n]=0; return n ? buf : NULL; }
+            buf[n]=(char)c;
+        }
+    }
+    buf[n]=0; return buf;
+#else
+    (void)addr; (void)buf; (void)cap; return NULL;
+#endif
+}
+static void trace_write(const char *line) {   /* trace_lock held */
+    if (!trace_file || trace_capped) return;
+    size_t n=strlen(line)+1;
+    if (trace_bytes+n>trace_cap_bytes) {
+        char old[sizeof trace_path+4];
+        fputs("# net_trace.log reached its file cap; rotating to <path>.1\n",trace_file);
+        fflush(trace_file); fclose(trace_file); trace_file=NULL;
+        snprintf(old,sizeof old,"%s.1",trace_path);
+        remove(old);                              /* Windows rename fails when the target exists */
+        if (rename(trace_path,old)!=0) trace_file=fopen(trace_path,"w");
+        else trace_file=fopen(trace_path,"a");
+        if (!trace_file) { trace_capped=1; return; }
+        setvbuf(trace_file,NULL,_IOLBF,4096);
+        trace_bytes=0;
+        fprintf(trace_file,"# net_trace.log rotated: the previous part is in %s\n",old);
+    }
+    fputs(line,trace_file); fputc('\n',trace_file); fflush(trace_file);
+    trace_bytes+=n;
+}
+static void trace_summary(double t) {         /* trace_lock held */
+    char line[256];
+    trace_last_summary=t;
+    snprintf(line,sizeof line,"[%12.6f] --- summary (calls so far, +since last summary) ---",t-trace_t0);
+    trace_write(line);
+    for (TraceEntry *e=trace_head;e;e=e->next) {
+        if (e->calls==e->reported) continue;
+        snprintf(line,sizeof line,"[%12.6f] SUMMARY %s calls=%llu (+%llu)",t-trace_t0,e->name,
+                 (unsigned long long)e->calls,(unsigned long long)(e->calls-e->reported));
+        trace_write(line);
+        e->reported=e->calls;
+    }
+}
+static int trace_rd32(uint64_t addr,int32_t *out) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mi;
+    if (addr<0x10000 || !VirtualQuery((void*)(uintptr_t)addr,&mi,sizeof mi)) return 0;
+    if (mi.State!=MEM_COMMIT || !(mi.Protect&0xCE) || (mi.Protect&0x100)) return 0;
+    if ((uintptr_t)mi.BaseAddress+mi.RegionSize<(uintptr_t)addr+4) return 0;
+    memcpy(out,(const void*)(uintptr_t)addr,4);
+    return 1;
+#else
+    (void)addr; (void)out; return 0;
+#endif
+}
+static ABI void trace_log(TraceEntry *e,const uint64_t *regs,uint64_t ret,uint64_t caller) {
+    int saved_errno=errno;
+#ifdef _WIN32
+    DWORD saved_error=GetLastError();
+#endif
+    char extra[800],line[1200];
+    BbntOut o; bbnt_out_init(&o,extra,sizeof extra);
+    bbnt_extra(e->name,regs,trace_read,&o);
+    {   /* the state written through the out-pointer, read after the call (co-op research: why np+0x79 stays 0) */
+        int idx=-1;
+        if (!strcmp(e->name,"sceNetCtlGetState")) idx=0;
+        else if (!strcmp(e->name,"sceNpGetState") || !strcmp(e->name,"sceNpGetNpReachabilityState") ||
+                 !strcmp(e->name,"sceNpGetGamePresenceStatus") || !strcmp(e->name,"sceNpGetGamePresenceStatusA")) idx=1;
+        int32_t v;
+        if (idx>=0 && trace_rd32(regs[idx],&v) && o.len+32<sizeof extra) {
+            char add[32];
+            snprintf(add,sizeof add," out=%d",(int)v);
+            bbnt_puts(&o,add);
+        }
+    }
+    double t=trace_now();
+    pthread_mutex_lock(&trace_lock);
+    ++e->calls;
+    bbnt_fmt_line(line,sizeof line,t-trace_t0,++trace_seq,e->name,regs,extra,ret,caller);
+    trace_write(line);
+    if (t-trace_last_summary>=TRACE_SUMMARY_SECONDS) trace_summary(t);
+    pthread_mutex_unlock(&trace_lock);
+#ifdef _WIN32
+    SetLastError(saved_error);
+#endif
+    errno=saved_errno;
+}
+static void trace_open(int online) {
+    const char *path=getenv("BB_NET_TRACE_FILE");
+    if (!path || !path[0]) {
+        path="out/net_trace.log";
+#ifdef _WIN32
+        CreateDirectoryA("out",NULL);
+#else
+        mkdir("out",0755);
+#endif
+    }
+    snprintf(trace_path,sizeof trace_path,"%s",path);
+    {
+        const char *cap=getenv("BB_NET_TRACE_CAP_MB");
+        long mb=cap ? atol(cap) : 0;
+        if (mb>=10 && mb<=4096) trace_cap_bytes=(uint64_t)mb*1024*1024;
+    }
+    trace_file=fopen(path,"a");
+    trace_t0=trace_last_summary=trace_now();
+    bb_net_trace_log_fn=(void*)trace_log;
+    if (!trace_file) { printf("Net trace: cannot open %s; tracing is off\n",path); return; }
+    setvbuf(trace_file,NULL,_IOLBF,4096);
+    if (fseek(trace_file,0,SEEK_END)==0) { long sz=ftell(trace_file); if (sz>0) trace_bytes=(uint64_t)sz; } /* earlier runs appended: rotate on the real size */
+    char line[200];
+    snprintf(line,sizeof line,"# BB_NET_TRACE start, mode=%s, unix time %lld, secrets masked, file cap %llu MB (rotates to .1)",
+             online ? "BB_ONLINE=1" : "offline", (long long)time(NULL),
+             (unsigned long long)(trace_cap_bytes>>20));
+    trace_write(line);
+    printf("Net trace: logging network/PSN calls to %s\n",path);
+}
+/* The thunk the guest calls instead of target; the real function is reached through the trampoline. */
+static uintptr_t trace_wrap(const char *symbol,uintptr_t target) {
+    uintptr_t result=target;
+    if (!trace_file) return target;
+    pthread_mutex_lock(&trace_lock);
+    TraceEntry *e;
+    for (e=trace_head;e;e=e->next) if (e->target==target && !strcmp(e->name,symbol)) { result=e->thunk; break; }
+    if (!e) {
+        if (!trace_code) {
+#ifdef _WIN32
+            trace_code=VirtualAlloc(NULL,TRACE_CODE_SIZE,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+#else
+            void *m=mmap(NULL,TRACE_CODE_SIZE,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            trace_code=m==MAP_FAILED ? NULL : m;
+#endif
+        }
+        e=calloc(1,sizeof *e);
+        if (e && trace_code && trace_code_used+TRACE_SLOT<=TRACE_CODE_SIZE) {
+            unsigned char *c=trace_code+trace_code_used;
+            uint64_t entry=(uint64_t)(uintptr_t)e,tramp=(uint64_t)(uintptr_t)bb_net_trace_tramp;
+            trace_code_used+=TRACE_SLOT;
+            c[0]=0x49; c[1]=0xBA; memcpy(c+2,&entry,8);          /* mov r10, entry */
+            c[10]=0x49; c[11]=0xBB; memcpy(c+12,&tramp,8);       /* mov r11, tramp */
+            c[20]=0x41; c[21]=0xFF; c[22]=0xE3;                  /* jmp r11 */
+            e->target=target; e->name=symbol; e->thunk=(uintptr_t)c;
+            if (trace_tail) trace_tail->next=e; else trace_head=e;
+            trace_tail=e;
+            result=e->thunk;
+        } else free(e);
+    }
+    pthread_mutex_unlock(&trace_lock);
+    return result;
+}
+
+#endif /* !BB_PUBLIC_ALPHA: net trace */
+
 uintptr_t runtime_services_resolve(const char *name) {
-    return RUNTIME_LOOKUP(exports,name);
+    static int online=-1;
+    if (online<0) { const char *v=getenv("BB_ONLINE"); online=v && v[0]=='1'; }
+#define BB_TRACE_WRAP(symbol,address) (address)
+    if (online) {
+        const char *symbol=runtime_symbol(name);
+        if (symbol && online_symbol(symbol)) {
+            uintptr_t address=bbgpu_resolve(name);
+            if (address) return BB_TRACE_WRAP(symbol,address);
+            printf("Co-op: %s has no online version; using the offline one\n",symbol);
+        }
+    }
+    uintptr_t address=RUNTIME_LOOKUP(exports,name);
+    return address;
 }

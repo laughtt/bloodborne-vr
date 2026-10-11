@@ -275,6 +275,24 @@ typedef struct BbXrGameDebug {
     BbXrHitScale hit_scale;  /* appended after the bones: an older host sends none (valid 0) */
 } BbXrGameDebug;
 
+/* The custom character model override (BB_VR_SKIN, gpu/xr_bridge/vr_skin_model.h): other characters
+ * the host found (src/runtime_vr_skin.c) that the bridge draws a user-supplied mesh over, in the
+ * headset's space. Filled only in first person (the hitbox overlay's view); zero from an older host. */
+#define BBXR_SKIN_MAX 4u
+
+typedef struct BbXrSkinTarget {
+    float pos[3];      /* the character's feet, headset space */
+    float forward[3];  /* the way it faces (unit), headset space */
+    float up[3];       /* world up (unit), headset space */
+    float speed_mps;   /* horizontal ground speed, for the walk bob */
+    uint32_t id;       /* stable while the character exists (its slot in the host's list) */
+} BbXrSkinTarget;
+
+typedef struct BbXrSkinState {
+    uint32_t count;
+    BbXrSkinTarget targets[BBXR_SKIN_MAX];
+} BbXrSkinState;
+
 typedef struct BbXrGameState {
     uint32_t size;     /* sizeof(BbXrGameState): the bridge reads only what it knows */
     uint32_t flags;    /* BBXR_GAME_* */
@@ -288,6 +306,7 @@ typedef struct BbXrGameState {
     uint32_t item_count;
     BbXrGameItem items[BBXR_GAME_MAX_ITEMS];
     BbXrGameDebug debug;            /* the hitbox overlay (appended; an older host sends none) */
+    BbXrSkinState skin;             /* the character model override (appended; an older host sends none) */
 } BbXrGameState;
 
 /* Game events (GameEvent). */
@@ -335,10 +354,26 @@ typedef struct BbXrGameEvent {
  * release speed in cm/s (0 otherwise). */
 #define BBXR_UI_THROW_ORIGIN 9u /* the hand's position relative to the head: a, b, c = x, y, z in mm */
 #define BBXR_UI_THROW_DIR 10u   /* the release direction, unit: a, b, c = x, y, z times 10000 */
-/* The BulletParam rows the throw mode may redirect (flying thrown goods only: never the cures
- * Antidote 200, Sedative 230, Lead Elixir 320 or the rope molotovs 110/114, which spawn at the
- * player). From the dump's throwables with a range and a launch speed; override: BB_VR_THROW_IDS. */
-#define BBXR_THROW_BULLET_IDS "100,105,120,121,150,170,180,410,460,470"
+/* The bridge draws an item (its extracted mesh) in a VR hand: a = the hand (0 left, 1 right; -1: none
+ * any more), b = the item id. Sent when the grip closes on it, again every ~2 s while it is held, and
+ * with a = -1 when it leaves the hand (used, thrown or put back). The host hides that hand's weapon
+ * models meanwhile (src/runtime_vr_fp.c held_hide; it lapses on its own without a refresh). Not an
+ * executor action: handled at once, like THROW_ORIGIN / THROW_DIR. */
+#define BBXR_UI_HELD 11u
+/* The BulletParam rows the throw mode redirects: the bullet of every throwable goods the held-item code
+ * classifies as Throw (vr_held_items.h kThrow): molotov 100, delayed 105, throwing knife 120, poison knife
+ * 121, oil urn 150, pungent blood 160, pebble 170, numbing mist 180, shining coins 300, executioner's gloves
+ * 350, tiny tonitrus 410, blacksky eye 460, accursed brew 470. The rope molotovs' own bullets 110 / 114 are
+ * speed-0 spawners the game points straight down; turning one turned its child (111 / 115, the bullet that
+ * flies) by an arbitrary amount, so the child is the one aimed and the spawner is left alone.
+ * Never the cures (Antidote 200, Sedative 230, Lead Elixir 320: not thrown) nor the impact children
+ * (101, 106, 151...). Override: BB_VR_THROW_IDS. */
+#define BBXR_THROW_BULLET_IDS "100,105,111,115,120,121,150,160,170,180,300,350,410,460,470"
+/* Later bullets of a throw with another id (within a second of the first), turned with it: none by default
+ * (the rope molotovs' 112 / 116 are placed by the game from the body's facing, which the throw turns to the
+ * aim). A further bullet with the throw's own id (the gloves' fan) is always turned with the first.
+ * Override: BB_VR_THROW_FOLLOW_IDS. */
+#define BBXR_THROW_FOLLOW_IDS ""
 
 typedef struct BbXrUiAction {
     uint32_t kind;

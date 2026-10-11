@@ -79,15 +79,16 @@ open.
 | Left stick click | moving: **L3, the jump**. Standing: **opens/closes the DASHBOARD** (`BB_VR_UI=1`; sent on release). Held 1 s alone: recenter |
 | Right stick | camera / turn |
 | Right stick click | tap opens the **item wheel** (`quick_wheel`; pick with the right hand touch/point or the stick). Lock-on is off in the `game` layout (`lock_on: false`), so R3 never reaches the game |
-| A | circle: dodge, sprint (the dodge is this button, not a stick gesture) |
-| B | cross: interact |
-| X | square: use the current quick item (weak tick) |
-| Y | triangle: blood vial |
+| A (right controller, lower) | **swap the right-hand weapon**: ONE d-pad-right pulse per press (`FaceRemap` in `vr_ui_filter.h`). Blocked while the right hand holds an item |
+| B (right controller, upper) | **roll / dodge / sprint** (the game's circle; the dodge is this button, not a stick gesture) |
+| X (left controller, lower) | **swap the left-hand weapon**: ONE d-pad-left pulse per press. Blocked while the left hand holds an item. The old square (use the quick item) heal button is gone: use the quick wheel |
+| Y (left controller, upper) | **interact** (the game's cross; B gave that job up). The old triangle (blood vial) heal button is gone: use the quick wheel, or the vial held at the mouth (left hand, left grip, 0.3 s) |
 | Left trigger | **hold the gun (L2)**; a left-hand thrust shoots (`BB_XR_TRIGGERS=switch`: swap the left weapon, one d-pad-left pulse, and no shooting). While the dashboard is open: the left ray's click |
 | Right trigger | **nothing in the world** (BB_XR_TRIGGERS=attack: R1). While the dashboard is open: the right ray's click; in the game's own menu: cross |
 | Right grip tap | **swap the right weapon** (squeeze and release within 0.35 s, BB_XR_GRIP_TAP_MS, no swing during the press: one d-pad-right pulse, a tick). Held grip + swing is the heavy attack (R2) and never swaps |
 | Left grip | L1, transform |
 | Right grip | heavy/charge modifier for swings (see the tap row above) |
+| Mapping note | the dashboard and wheel bindings ("right_grip+b", "left_grip+x") still read the controller's A/B/X/Y; the table above is what the GAME gets in the world (`FaceRemap`, applied in `InputFilter::Apply`). `xr_input.cpp` itself still maps A circle, B cross, X square, Y triangle |
 | In the game's own menu (Options, pause) | either stick = d-pad (hold to repeat), A or either trigger = cross, B = circle, menu button closes (`vr_ui_filter.h`, host reports `BBXR_GAME_MENU_OPEN`) |
 | Swing at a staggered enemy | visceral attack (stagger: gun parry, or a charged heavy from behind) |
 | Left ☰ (menu) | Options (pause), sent on release; held 1 s = recenter. Pimax keeps this button for itself, so the dashboard has Options and Recenter buttons |
@@ -312,6 +313,14 @@ GetItemNum 0x18cf450.
   index.
 - D-pad down (0x18df170, action 0x286) steps to the next non-empty slot and wraps. Square uses the
   selection (GetUseItemId 0x18d1ef0).
+- **GetUseItemId 0x18d1ef0** [C] (rdi = EquipGameData, PGD+0x1D0): returns the item at inventory index
+  PGD+0x458 (`m_useRequestItemFromMenu`) when that is >= 0, else the item at the selection PGD+0x418. No
+  quick-slot check. The player's frame code calls it at 0x1cf7530 when the "use item" action input is set
+  (bit 0x80 of `[[PlayerIns+0x3B0]+0x80]+0x20`, 0x1cf7516) and stores the id in PlayerIns+0x478.
+  PlayerIns+0x490 is the item-use state (0 idle). bool 0x1ae38d0(void) is the item menu's "an item can be
+  used now" check. The auto-bell's direct use is built on these (docs/vr/online-lobby-plan.md).
+- Address note: `llvm-objdump` on out/eboot.elf shows addresses 0x400000 lower than the VAs used here (its
+  first PT_LOAD is at 0): disassemble runtime VA X at X - 0x400000.
 
 **Weapons** [C]:
 - ChrAsm at PGD+0x240. Ids are u32[16] at PGD+0x2A4: 0 left 1, 1 right 1, 2 left 2, 3 right 2.
@@ -322,8 +331,12 @@ GetItemNum 0x18cf450.
 **Not used:**
 - "Menu open / input blocked": a bitmask built by 0x1b6b7e0 from `[0x5962878]`. It is [L], not read
   yet; see the probe.
-- PGD+0x458 `m_useRequestItemFromMenu`: the game's menu-use path [C]. **Not written.** Nothing shows
-  who resets it, and a stale value would make every square use that item.
+- PGD+0x458 `m_useRequestItemFromMenu`: the game's menu-use path [C] (the name is the debug menu's label,
+  0x18d36b7). The item menu's Use (0x1ae251f) checks 0x1ae38d0(), then writes `[MenuMan]+0x1e8 = 1` and
+  PGD+0x458 = the inventory index; the input code (0x1927b52) turns 0x1e8 into the use action only while a
+  menu holds the input (sets `[MenuMan]+0x1c0 = 1`), and the player's frame code (0x1cf8182) resets 0x458
+  to -1. **Not written**: outside a menu the request is dropped and a left-over 0x1e8 would use the
+  selected quick item.
 
 ## Actions (design point 3)
 
@@ -399,7 +412,7 @@ Steps:
 2. **Swap.** Pull a trigger outside the dashboard: `d-pad right reached the game … slots …` and `0.6 s
    later … swapped / NOT swapped`.
 3. **Quick items.** In the All tab, point at the bullets or any goods: they go into a quick slot and are
-   used (USE mode). The quick row shows it and X uses it.
+   used (USE mode). The quick row shows it (use it from the wheel).
 4. **Buttons.** Options, Gestures, Tool / bullet and Recenter.
 5. **Messages.** Without the hook the cards say "needs the equip hook", and a click tells why. Nothing
    stays pending.

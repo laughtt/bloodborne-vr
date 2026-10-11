@@ -11,10 +11,34 @@ endif()
 # Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
 add_compile_options(-fno-omit-frame-pointer)
 
-# bbport: BBPORT_ONLINE=OFF builds the public single-player variant: no shadNet client, no NP /
-# network / HTTP / SSL implementations (the runtime's offline answers stay), no net diagnostics,
-# no debug give/use, no co-op code. BB_PUBLIC_ALPHA=1 is defined for the C and C++ sources.
+# bbport build flavours. Two independent switches (docs/vr/public-online-build.md):
+#   BBPORT_ONLINE (default ON): the online CLIENT: shadNet login, NP / Matching2 / signaling, HTTP and SSL
+#       libraries, the room bells. OFF defines BB_NO_ONLINE=1 and builds the single-player-only variant.
+#   BBPORT_PUBLIC (default OFF): a public build. Defines BB_PUBLIC_ALPHA=1: the dev tools are compiled out
+#       (BB_DEBUG_GIVE / BB_DEBUG_USE, speffect, BB_NET_TRACE, BB_NET_BREAK / net state monitor, arbitrary
+#       item or insight changes); only the room features that need them stay, restricted to the bells.
+# Public release: -DBBPORT_ONLINE=ON -DBBPORT_PUBLIC=ON. Private dev build: both defaults.
+# No server address, port or account is compiled in: the player's settings supply them.
+# BBPORT_ONLINE=OFF alone (the older single-player public variant) still implies a public build.
+set(BBPORT_ONLINE ON)
+set(BBPORT_PUBLIC ON)
+set(BB_PUBLIC_BUILD OFF)
+if (BBPORT_PUBLIC OR NOT BBPORT_ONLINE)
+    set(BB_PUBLIC_BUILD ON)
     add_compile_definitions(BB_PUBLIC_ALPHA=1)
+endif()
+if (NOT BBPORT_ONLINE)
+    add_compile_definitions(BB_NO_ONLINE=1)
+endif()
+if (BB_PUBLIC_BUILD)
+    # A public exe must not carry the builder's folder names (__FILE__, assert and panic strings, debug info).
+    # The sources are rewritten to /src, the build tree to /build, in every translation unit of this tree.
+    get_filename_component(BB_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+    add_compile_options("-ffile-prefix-map=${BB_REPO_ROOT}=/src"
+                        "-ffile-prefix-map=${CMAKE_BINARY_DIR}=/build"
+                        "-fmacro-prefix-map=${BB_REPO_ROOT}=/src"
+                        "-fdebug-prefix-map=${BB_REPO_ROOT}=/src")
+endif()
 
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
 # (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
@@ -163,6 +187,54 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+if (BBPORT_ONLINE)
+    # bbport co-op: PS4 network and PSN libraries with the shadNet client, from shadp2p
+    # (github.com/Wozzardman/shadp2p, GPL-2.0), for private Bloodborne co-op servers.
+    find_package(Protobuf CONFIG REQUIRED)
+    set(SHADNET_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/shadnet_proto_gen")
+    file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT}")
+    add_custom_command(
+        OUTPUT "${SHADNET_PROTO_OUT}/shadnet.pb.cc" "${SHADNET_PROTO_OUT}/shadnet.pb.h"
+        COMMAND protobuf::protoc "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet"
+                "--cpp_out=${SHADNET_PROTO_OUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet/shadnet.proto"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shadps4/shadnet/shadnet.proto")
+    file(GLOB_RECURSE BBNET_SOURCES CONFIGURE_DEPENDS shadps4/core/libraries/network/*.cpp
+        shadps4/core/libraries/np/*.cpp shadps4/shadnet/*.cpp)
+    # Trophies and the system dialogs stay in the C runtime; their shadPS4 versions need the
+    # emulator's UI layers.
+    list(FILTER BBNET_SOURCES EXCLUDE REGEX
+        "np_trophy|trophy_ui|np_sns_facebook_dialog|np_profile_dialog/|np_commerce/")
+    find_package(nlohmann_json CONFIG REQUIRED)
+    add_library(bbnet STATIC ${BBNET_SOURCES} "${SHADNET_PROTO_OUT}/shadnet.pb.cc" bbnet/bbnet_glue.cpp)
+    target_include_directories(bbnet PRIVATE shim shadps4 shadps4/shadnet "${SHADNET_PROTO_OUT}"
+        third_party/imgui third_party/httplib)
+    target_link_libraries(bbnet PRIVATE nlohmann_json::nlohmann_json)
+    # HTTPS (the community game server only speaks TLS) and gzip replies in cpp-httplib.
+    find_package(OpenSSL REQUIRED)
+    find_package(ZLIB REQUIRED)
+    target_compile_definitions(bbnet PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_ZLIB_SUPPORT)
+    target_link_libraries(bbnet PRIVATE OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+    if (WIN32)
+        target_sources(bbnet PRIVATE third_party/wepoll/wepoll.c)
+        target_include_directories(bbnet PRIVATE third_party/wepoll)
+        find_path(MINIUPNPC_INCLUDE miniupnpc.h PATH_SUFFIXES miniupnpc REQUIRED)
+        find_library(MINIUPNPC_LIBRARY NAMES libminiupnpc.a miniupnpc REQUIRED)
+        target_include_directories(bbnet PRIVATE "${MINIUPNPC_INCLUDE}")
+        target_compile_definitions(bbnet PRIVATE MINIUPNP_STATICLIB)
+        target_link_libraries(bbnet PRIVATE "${MINIUPNPC_LIBRARY}")
+    endif()
+    target_compile_definitions(bbnet PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+    target_compile_options(bbnet PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+    target_link_libraries(bbnet PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+        protobuf::libprotobuf)
+    if (WIN32)
+        target_compile_definitions(bbnet PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_compile_options(bbnet PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h>)
+        target_link_libraries(bbnet PUBLIC ws2_32 iphlpapi bcrypt crypt32)
+    endif()
+    target_link_libraries(bbgpu PUBLIC bbnet)
+endif()
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
@@ -199,7 +271,9 @@ endif()
 if (WIN32)
     enable_language(RC)
     file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
+    if (BB_PUBLIC_BUILD)
         list(FILTER BB_RUNTIME EXCLUDE REGEX "runtime_vr_netstate\\.c$")
+    endif()
     file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
     add_library(atrac9 STATIC ${BB_ATRAC9})
     target_compile_options(atrac9 PRIVATE -w)
@@ -208,7 +282,12 @@ if (WIN32)
         ../packaging/windows/bb-probe.rc)
     set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
+    if (BB_PUBLIC_BUILD)
         target_compile_definitions(bb-probe PRIVATE BB_PUBLIC_ALPHA=1)
+    endif()
+    if (NOT BBPORT_ONLINE)
+        target_compile_definitions(bb-probe PRIVATE BB_NO_ONLINE=1)
+    endif()
     target_include_directories(bb-probe PRIVATE .. ../src)
     target_link_libraries(bb-probe PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 -pthread)
     # Crash reports (src/runtime_crash.c): the build id is the git revision at configure time; the
@@ -219,8 +298,13 @@ if (WIN32)
         set(BB_BUILD_ID unknown)
     endif()
     set_property(SOURCE ../src/runtime_crash.c APPEND PROPERTY COMPILE_DEFINITIONS BB_BUILD_ID="${BB_BUILD_ID}")
-    target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-gcodeview>)
-    target_link_options(bb-probe PRIVATE -fuse-ld=lld -Wl,--pdb=$<TARGET_FILE_DIR:bb-probe>/bb-probe.pdb)
+    if (BB_PUBLIC_BUILD)
+        # No .pdb: the linker would write its absolute build path into the exe (public builds carry no builder paths).
+        target_link_options(bb-probe PRIVATE -fuse-ld=lld)
+    else()
+        target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-gcodeview>)
+        target_link_options(bb-probe PRIVATE -fuse-ld=lld -Wl,--pdb=$<TARGET_FILE_DIR:bb-probe>/bb-probe.pdb)
+    endif()
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
@@ -271,6 +355,20 @@ set_target_properties(hooks-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(hooks-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(hooks-test PRIVATE ../src)
 
+# Red zone guard equivalence test (src/runtime_redzone_guard.c): original vs relocated eboot functions.
+add_executable(redzone-guard-test EXCLUDE_FROM_ALL ../tests/test_redzone_guard.c)
+set_target_properties(redzone-guard-test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_compile_options(redzone-guard-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(redzone-guard-test PRIVATE ../src)
+
+if (NOT BB_PUBLIC_BUILD)
+# BB_NET_TRACE masking/formatting helpers (src/net_trace_fmt.h).
+add_executable(net-trace-test EXCLUDE_FROM_ALL ../tests/test_net_trace.c)
+set_target_properties(net-trace-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(net-trace-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(net-trace-test PRIVATE ../src)
+
+endif()
 # VR head tracking math (src/vr_head_math.h): camera composition, reference, FOV, fake head.
 add_executable(vr-head-test EXCLUDE_FROM_ALL ../tests/test_vr_head.c)
 set_target_properties(vr-head-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -294,6 +392,14 @@ target_include_directories(vr-arms-test PRIVATE ../src)
 add_executable(vr-arms-test-cpp EXCLUDE_FROM_ALL ../tests/test_vr_arms_cpp.cpp)
 target_compile_options(vr-arms-test-cpp PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-arms-test-cpp PRIVATE ../src)
+# NP signaling reuse decision (np_signaling_reuse.h): retire a lingering connection instead of reviving it.
+add_executable(np-signaling-reuse-test EXCLUDE_FROM_ALL ../tests/test_np_signaling_reuse.cpp)
+target_compile_options(np-signaling-reuse-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(np-signaling-reuse-test PRIVATE shadps4)
+# P2P <-> matching server STUN framing (p2p_server_frame.h): 6-byte server header, echo, advertised address.
+add_executable(p2p-server-frame-test EXCLUDE_FROM_ALL ../tests/test_p2p_server_frame.cpp)
+target_compile_options(p2p-server-frame-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(p2p-server-frame-test PRIVATE shadps4)
 # VR hit shape scaling (src/vr_hit_scale.h): radius x scale and extra reach, shared with the sandbox; findings/32.
 add_executable(vr-hit-scale-test EXCLUDE_FROM_ALL ../tests/test_vr_hit_scale.c)
 set_target_properties(vr-hit-scale-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -307,11 +413,36 @@ add_executable(vr-gun-test EXCLUDE_FROM_ALL ../tests/test_vr_gun.c)
 set_target_properties(vr-gun-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-gun-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-gun-test PRIVATE ../src)
+# VR throw animation speed-up state machine (src/vr_throw_anim.h, src/runtime_vr_atkspeed.c): findings/39.
+add_executable(vr-throw-anim-test EXCLUDE_FROM_ALL ../tests/test_vr_throw_anim.c)
+set_target_properties(vr-throw-anim-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-throw-anim-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-throw-anim-test PRIVATE ../src)
+# VR held-item fire block (gpu/xr_bridge/vr_held_fire.h): which attack inputs a hand holding an item loses.
+add_executable(vr-held-fire-test EXCLUDE_FROM_ALL ../tests/test_vr_held_fire.c)
+set_target_properties(vr-held-fire-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-held-fire-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-held-fire-test PRIVATE ..)
+# Auto-bell state machine for rooms (src/vr_online_bell.h, src/runtime_online_bell.c).
+add_executable(vr-online-bell-test EXCLUDE_FROM_ALL ../tests/test_vr_online_bell.c)
+set_target_properties(vr-online-bell-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-online-bell-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-online-bell-test PRIVATE ../src)
+# VR visceral window and thrust gate (src/vr_visceral_math.h, src/runtime_vr_visceral.c): findings/41 section 7.
+add_executable(vr-visceral-test EXCLUDE_FROM_ALL ../tests/test_vr_visceral.c)
+set_target_properties(vr-visceral-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-visceral-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-visceral-test PRIVATE ../src)
 # VR hitbox overlay placement (src/vr_hitbox_math.h, src/runtime_vr_hitbox.c): findings/29.
 add_executable(vr-hitbox-test EXCLUDE_FROM_ALL ../tests/test_vr_hitbox.c)
 set_target_properties(vr-hitbox-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-hitbox-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-hitbox-test PRIVATE ../src)
+# Custom character model override math (src/vr_skin_math.h, src/runtime_vr_skin.c).
+add_executable(vr-skin-test EXCLUDE_FROM_ALL ../tests/test_vr_skin.c)
+set_target_properties(vr-skin-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-skin-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-skin-test PRIVATE ../src)
 # Replays a first-person trace (BB_VR_FP_TRACE) through the same turn model: findings/16 9.6.
 add_executable(vr-turn-replay EXCLUDE_FROM_ALL ../tools/vr_turn_replay.c)
 set_target_properties(vr-turn-replay PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -332,6 +463,27 @@ add_executable(vr-ui-test EXCLUDE_FROM_ALL ../tests/test_vr_ui.c)
 set_target_properties(vr-ui-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-ui-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-ui-test PRIVATE ../src)
+if (NOT BB_PUBLIC_BUILD)
+# Debug give / use for co-op tests (src/vr_debug_give.h): the BB_DEBUG_GIVE and BB_DEBUG_USE parsers.
+add_executable(vr-debug-give-test EXCLUDE_FROM_ALL ../tests/test_vr_debug_give.c)
+set_target_properties(vr-debug-give-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-debug-give-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-debug-give-test PRIVATE ../src)
+endif()
+if (BBPORT_ONLINE)
+# Free co-op bells (src/vr_free_bells.h)
+add_executable(vr-free-bells-test EXCLUDE_FROM_ALL ../tests/test_vr_free_bells.c)
+set_target_properties(vr-free-bells-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-free-bells-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-free-bells-test PRIVATE ../src)
+endif()
+if (NOT BB_PUBLIC_BUILD)
+# BB_NET_BREAK dump spec parser (src/vr_netstate_spec.h)
+add_executable(vr-netstate-spec-test EXCLUDE_FROM_ALL ../tests/test_vr_netstate_spec.c)
+set_target_properties(vr-netstate-spec-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-netstate-spec-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-netstate-spec-test PRIVATE ../src)
+endif()
 add_executable(vr-stamina-test EXCLUDE_FROM_ALL ../tests/test_vr_stamina.c)
 set_target_properties(vr-stamina-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-stamina-test PRIVATE -Wall -Wextra -Werror)

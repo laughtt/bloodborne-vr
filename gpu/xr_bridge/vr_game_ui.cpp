@@ -31,6 +31,7 @@ constexpr double kActivityS = 3.0;     // bar "action": shown this long after a 
 constexpr float kBodyDeadzone = 30.0f * kDeg;
 constexpr uint32_t kBareFists = 1000000;   // the game's empty hand slot (EquipParamWeapon row)
 constexpr uint32_t kFirstWeapon = 1000000; // lower weapon-category ids are not weapons one holds
+constexpr double kHeldSignalS = 2.0;       // BBXR_UI_HELD is re-sent this often while an item is gripped
 constexpr double kPendingActionS = 8.0;    // an action the host never finished: given up
 
 std::string Fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
@@ -240,6 +241,9 @@ GameUi::~GameUi() {
 bool GameUi::Load(const std::filesystem::path& assets_dir, const sb::Renderer::Device* device,
                   std::string& log) {
     assets = assets_dir;
+    if (const char* e = std::getenv("BB_XR_CUSTOM_HANDS"); e && *e) {
+        custom_hands_env = std::atoi(e) != 0 ? 1 : 0;
+    }
     AddGameObject(assets / "ui_layouts.json", log);
     const bool gpu_ok = menus.LoadGame(assets, device, log);
     hitboxes.Load(assets, log);
@@ -358,6 +362,7 @@ void GameUi::ApplyState(const BbXrGameState& s, std::string&) {
         live.selected["weapons_right"] = int(s.weapon_active[0] & 1);
         live.selected["weapons_left"] = 2 + int(s.weapon_active[1] & 1);
     }
+    live.room = room_line.Poll(now);
     menus.SetLiveData(live);
 }
 
@@ -582,6 +587,7 @@ uint32_t PressBit(const std::string& name) {
 
 void GameUi::Act(const sb::UiAction& a, std::string& log) {
     BbXrUiAction out{};
+    int start_held_slot = -1; // assign_use of a gesture item: held after the assignment
     const uint32_t id = ItemId(a.item);
     if (a.action == "recenter") {
         if (recenter) {
@@ -635,6 +641,34 @@ void GameUi::Act(const sb::UiAction& a, std::string& log) {
             return;
         }
         out = {BBXR_UI_ASSIGN_QUICK, slot, int32_t(id), a.action == "assign_use" ? 1 : 0};
+        if (a.action == "assign_use" && menus.Layout().game.held_items && held::Classify(id).kind != held::Kind::None &&
+            !(current.flags & BBXR_GAME_MENU_OPEN)) {
+            // A gesture item (paper, vial, throwable, bell...): into the slot, then into the hand; the gesture
+            // uses it. Not used at once.
+            if (held_item.Active()) {
+                log += "game UI: held item: already holding goods " + std::to_string(held_item.Info().goods) + "; " +
+                       a.item + " ignored\n";
+                return;
+            }
+            out.b = 0;
+            start_held_slot = slot;
+        }
+    } else if (a.action == "assign_slot") {
+        // Drag and drop: into the quick slot the card was dropped on (an occupied slot is replaced; the old item
+        // stays in the inventory, it only leaves the slot).
+        const int slot = a.index;
+        if (slot < 0 || uint32_t(slot) >= current.quick_count || id == BBXR_ITEM_NONE) {
+            Refuse("Cannot add " + a.item, "that quick slot is not available", log);
+            return;
+        }
+        if (current.quick[slot] == id) {
+            return;
+        }
+        if (current.quick[slot] != BBXR_ITEM_NONE) {
+            log += Fmt("game UI: drag and drop: quick slot %d: %s replaces item 0x%x\n", slot + 1, a.item.c_str(),
+                       unsigned(current.quick[slot]));
+        }
+        out = {BBXR_UI_ASSIGN_QUICK, slot, int32_t(id), 0};
     } else if (a.action == "clear_quick") {
         const int slot = a.source == "quick" ? a.index : -1;
         if (slot < 0 || uint32_t(slot) >= current.quick_count ||
@@ -689,9 +723,18 @@ void GameUi::Act(const sb::UiAction& a, std::string& log) {
     }
     pending = a.action + (a.item.empty() ? std::string() : " " + a.item);
     pending_at = now;
-    std::scoped_lock lock{mutex};
-    if (actions.size() < 32) {
-        actions.push_back(out);
+    {
+        std::scoped_lock lock{mutex};
+        if (actions.size() < 32) {
+            actions.push_back(out);
+        }
+    }
+    if (start_held_slot >= 0 && !StartHeld(a, start_held_slot, id, log)) {
+        // Could not be held after all (none left): the old behaviour, used at once.
+        std::scoped_lock lock{mutex};
+        if (!actions.empty() && actions.back().kind == BBXR_UI_ASSIGN_QUICK) {
+            actions.back().b = 1;
+        }
     }
 }
 
@@ -717,10 +760,13 @@ bool GameUi::StartHeld(const sb::UiAction& a, int slot, uint32_t id, std::string
         return false; // bells, marks, the bone blade...: used at once as before
     }
     const held::ItemInfo& info = held_item.Info();
-    const char* gesture = info.kind == held::Kind::Mouth   ? "bring it to the mouth"
+    const char* gesture = info.kind == held::Kind::Mouth   ? (info.bell ? "bring it to the head" : "bring it to the mouth")
                           : info.kind == held::Kind::Blade ? "touch it to the blade"
-                                                           : "throw it";
-    log += Fmt("game UI: held item: %s (goods %d, quick slot %d) in the %s hand: squeeze the grip, then %s%s\n",
+                          : info.kind == held::Kind::Crush ? "squeeze the grip hard to crush it"
+                          : held::HeldItem::ThrowMode(menus.Layout().game.held) == "aim"
+                              ? "hold the grip to aim (arc and ring), let go to throw"
+                              : "throw it";
+    log += Fmt("game UI: held item: %s (goods %d, quick slot %d) in the %s hand (the selection is the grip): %s%s; a trigger press or opening a menu puts it back\n",
                a.item.c_str(), info.goods, slot, held_item.Hand() ? "right" : "left", gesture,
                info.kind == held::Kind::Throw
                    ? (info.aimed ? " (the game's bullet is aimed from the hand)"
@@ -736,6 +782,7 @@ void GameUi::StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::s
     const sb::UiGameLayout& g = menus.Layout().game;
     if (!held_item.Active()) {
         filter.SetHoldMask(held_item.BlockMask(now, g.held));
+        SyncHeldSignal();
         return;
     }
     held::Frame f;
@@ -748,6 +795,10 @@ void GameUi::StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::s
         f.grip_pos[h] = in.grip[h].position;
         f.grip_rot[h] = in.grip[h].rotation;
         f.squeeze[h] = in.squeeze[h];
+        f.trigger[h] = in.trigger[h];
+    }
+    if (in.grip[held_item.Hand()].valid) {
+        held_grip_rot = in.grip[held_item.Hand()].rotation; // the mesh follows the grip's orientation
     }
     if (held_item.Info().kind == held::Kind::Blade) {
         const int side = held_item.Info().target_side;
@@ -764,7 +815,11 @@ void GameUi::StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::s
         }
     }
     f.blocked = (open && in.time >= held_menu_ignore_until) || (current.flags & BBXR_GAME_MENU_OPEN) != 0;
+    const bool was_aiming = held_item.Aiming();
     const held::Result r = held_item.Step(f, g.held);
+    if (!was_aiming && held_item.Aiming()) {
+        log += Fmt("game UI: held item: goods %d aiming (hold grip, release to throw)\n", held_item.Info().goods);
+    }
     for (const held::Pulse& p : r.pulses) {
         haptics.push_back({p.hand, p.amplitude, p.seconds});
     }
@@ -774,6 +829,39 @@ void GameUi::StepHeld(const FrameInput& in, std::vector<Haptic>& haptics, std::s
         FireHeld(r, in, log);
     }
     filter.SetHoldMask(held_item.BlockMask(now, g.held));
+    SyncHeldSignal();
+}
+
+void GameUi::SyncHeldSignal() {
+    held_marker_hand.store(held_item.Active() ? held_item.Hand() : -1, std::memory_order_relaxed);
+    const bool want = held_item.Gripped() && menus.Layout().game.held.hide_weapon;
+    if (!want && held_sig_id == 0) {
+        return; // nothing to say (the common case: no lock)
+    }
+    if (want && held_sig_id == int32_t(held_item.Id()) && now - held_sig_at < kHeldSignalS) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    SyncHeldSignalLocked();
+}
+
+void GameUi::SyncHeldSignalLocked() {
+    const bool want = held_item.Gripped() && menus.Layout().game.held.hide_weapon;
+    if (want) {
+        if (held_sig_id != int32_t(held_item.Id()) || now - held_sig_at >= kHeldSignalS) {
+            held_sig_id = int32_t(held_item.Id());
+            held_sig_hand = held_item.Hand();
+            held_sig_at = now;
+            if (actions.size() < 32) {
+                actions.push_back({BBXR_UI_HELD, held_sig_hand, held_sig_id, 0});
+            }
+        }
+    } else if (held_sig_id != 0) {
+        if (actions.size() < 32) {
+            actions.push_back({BBXR_UI_HELD, -1, held_sig_id, 0});
+        }
+        held_sig_id = 0;
+    }
 }
 
 void GameUi::FireHeld(const held::Result& r, const FrameInput& in, std::string& log) {
@@ -793,6 +881,8 @@ void GameUi::FireHeld(const held::Result& r, const FrameInput& in, std::string& 
     }
     held_fired_at = in.time;
     std::scoped_lock lock{mutex};
+    SyncHeldSignalLocked(); // the item left the hand: the weapon is back before the use goes out
+    const bool aimed_throw = r.thrown && r.has_marker;
     if (r.thrown && r.item.aimed && in.head.valid) {
         // Where and along what the hand let go, in the head's frame (the host turns the game's bullet).
         const Quat inv = Conjugate(in.head.rotation);
@@ -803,26 +893,39 @@ void GameUi::FireHeld(const held::Result& r, const FrameInput& in, std::string& 
         actions.push_back({BBXR_UI_THROW_DIR, int32_t(std::lround(d.x)), int32_t(std::lround(d.y)),
                            int32_t(std::lround(d.z))});
     }
-    const int32_t speed_cms = r.thrown ? int32_t(std::lround(r.throw_speed * 100.0f)) : 0;
+    const int32_t speed_cms = r.thrown && !aimed_throw ? int32_t(std::lround(r.throw_speed * 100.0f)) : 0;
     if (actions.size() < 32) {
         actions.push_back({BBXR_UI_USE_QUICK, slot, int32_t(id), speed_cms});
     }
     pending = std::string("use goods:") + std::to_string(r.item.goods) + " (" + r.why + ")";
     pending_at = in.time;
-    if (r.thrown) {
-        log += Fmt("game UI: held item: goods %d thrown (bullet %d%s) at %.1f m/s, direction (%.2f %.2f %.2f) -> use quick slot %d\n",
+    if (aimed_throw) {
+        const float yaw = std::atan2(-r.throw_dir.x, -r.throw_dir.z) * 57.29578f;
+        const float pitch = std::asin(std::clamp(r.throw_dir.y, -1.0f, 1.0f)) * 57.29578f;
+        log += Fmt("game UI: held item: goods %d thrown (bullet %d, aimed%s): origin (%.2f %.2f %.2f), direction (%.2f %.2f %.2f) yaw %.0f pitch %.0f deg (headset space), marker (%.2f %.2f %.2f) %s, flight %.2f s, speed %.1f m/s (game's) -> use quick slot %d\n",
+                   r.item.goods, r.item.aim_bullet, r.item.aimed ? "" : ", not redirected by the host", double(r.throw_origin.x),
+                   double(r.throw_origin.y), double(r.throw_origin.z), double(r.throw_dir.x), double(r.throw_dir.y),
+                   double(r.throw_dir.z), double(yaw), double(pitch), double(r.throw_marker.x),
+                   double(r.throw_marker.y), double(r.throw_marker.z), r.marker_on_floor ? "on the floor" : "in the air",
+                   double(r.flight_s), double(r.item.speed), slot);
+    } else if (r.thrown) {
+        log += Fmt("game UI: held item: goods %d thrown (bullet %d%s) at %.1f m/s, direction (%.2f %.2f %.2f) [raw velocity (%.2f %.2f %.2f), forward %.2f m/s: %s] -> use quick slot %d\n",
                    r.item.goods, r.item.bullet, r.item.aimed ? ", aimed" : ", game direction",
                    double(r.throw_speed), double(r.throw_dir.x), double(r.throw_dir.y),
-                   double(r.throw_dir.z), slot);
+                   double(r.throw_dir.z), double(r.throw_raw_velocity.x), double(r.throw_raw_velocity.y),
+                   double(r.throw_raw_velocity.z), double(r.throw_forward), r.throw_note.c_str(), slot);
     } else {
-        log += Fmt("game UI: held item: goods %d used by gesture (%s) -> use quick slot %d\n", r.item.goods,
-                   r.why.c_str(), slot);
+        log += Fmt("game UI: held item: goods %d used by gesture (%s%s) -> use quick slot %d\n", r.item.goods,
+                   r.why.c_str(),
+                   r.blade_frac >= 0.0f ? Fmt(", touched %.2f along the blade", double(r.blade_frac)).c_str() : "",
+                   slot);
     }
 }
 
 void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::string& log) {
     now = in.time;
     head_pose = in.head;
+    hands_in = in;
     left_grip = in.grip[0];
     left_aim = in.aim[0];
     if (!hitbox_log.empty()) {
@@ -882,6 +985,7 @@ void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::str
         if (held_item.Active()) {
             held_item.Cancel(now, menus.Layout().game.held, "no player in the world");
         }
+        SyncHeldSignal();
         filter.SetHoldMask(0);
         if (was_active) {
             menus.CloseAll();
@@ -1053,14 +1157,15 @@ void GameUi::DrawGunRay(const sb::UiGameLayout& g) {
     hud_canvas.on_top = false;
 }
 
-void GameUi::DrawHeldItem(const sb::UiGameLayout& g) {
+void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
     if (!held_item.Active()) {
         return;
     }
     const held::ItemInfo& info = held_item.Info();
     const bool grip = held_item.Gripped();
-    // A simple stand-in for the item: a coloured disc at the hand (no item meshes yet), a ring
-    // that fills while the gesture is held, and what to do with it.
+    // The item: its extracted 3D mesh at the grip (translucent and pulsing until the grip closes,
+    // solid once held), else a coloured disc at the hand; plus a ring that fills while the gesture
+    // is held and what to do with it.
     const sb::UiColor color = info.kind == held::Kind::Mouth   ? sb::UiColor{0.85f, 0.08f, 0.1f, 1.0f}
                               : info.kind == held::Kind::Blade ? sb::UiColor{1.0f, 0.55f, 0.1f, 1.0f}
                                                                : sb::UiColor{0.3f, 0.7f, 1.0f, 1.0f};
@@ -1068,14 +1173,79 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g) {
     const sb::UiPanel panel = sb::UiPanel::Facing(at, head_pose.position, {0, 1, 0});
     hud_canvas.on_top = true;
     hud_canvas.alpha = grip ? 1.0f : 0.55f;
-    hud_canvas.Disc(panel, 0, 0, 0.026f, {0.0f, 0.0f, 0.0f, 0.8f});
-    hud_canvas.Disc(panel, 0, 0, 0.021f, color);
+    float ring_in = 0.029f; // the progress ring clears the mesh
+    const held::MeshCache::Entry* mesh = held_meshes.Resolve(assets, info.goods);
+    const int h = held_item.Hand();
+    if (mesh && held_logged.insert(info.goods).second) {
+        // One line per held item: the mesh file was found / a stand-in is drawn (and why, with the path tried).
+        if (mesh->standin) {
+            hitbox_log += Fmt("game UI: held item: goods %d %s (no mesh file: %s)\n", info.goods, mesh->source.c_str(),
+                              mesh->why.c_str());
+        } else {
+            hitbox_log += Fmt("game UI: held item: goods %d mesh file found: %s\n", info.goods,
+                              mesh->tried_path.c_str());
+        }
+    }
+    if (mesh && hands_in.grip[h].valid) {
+        // One placement for both hand modes (vr_held_mesh.h SocketMeshWorld: the sandbox's tuned pose
+        // for its rows, else the item's category socket with the mesh's own upright turn). With the
+        // custom hands the mesh joins their batch (sorted with the fingers, which wrap it); with the
+        // game's hands it is alone in the top layer.
+        sb::UiColor tint = mesh->spec.color;
+        tint.a = grip ? 1.0f : 0.40f + 0.20f * std::sin(float(now) * 7.0f);
+        // The game's hands: the visible hand is the arms IK's, not the controller (the IK eases / clamps
+        // a far target, and the game's hand sits where its bone is), so the item goes to the hand bone's
+        // frame (a grip pose in the headset's space) when the host sent it, else the controller.
+        const BbXrGameDebug& dbg = current.debug;
+        const bool bone_ok = !hands && (dbg.flags & BBXR_DEBUG_POSE) && (dbg.weapon_valid & (1u << h));
+        const held::HandPlacement at_hand = held::PlaceInHand(bone_ok ? dbg.weapon[h] : nullptr,
+                                                               hands_in.grip[h].position, hands_in.grip[h].rotation);
+        const Mat4 world = held::SocketMeshWorld(mesh->spec, mesh->from_table, info.kind, held_item.Id(), h,
+                                                  at_hand.pos, at_hand.rot);
+        size_t drawn = 0;
+        if (hands) {
+            std::vector<Vec3> pos, nrm;
+            held::TransformModel(mesh->model, world, pos, nrm);
+            drawn = held::AddModel(*hands, mesh->model, pos, nrm, tint, held_meshes.Sheet(assets),
+                                    info.kind == held::Kind::Mouth ? 0.85f : 0.0f);
+        } else {
+            drawn = held::AppendMesh(hud_canvas.top, mesh->model, world, tint, head_pose.position,
+                                      held_meshes.Sheet(assets),
+                                      info.kind == held::Kind::Mouth ? 0.85f : 0.0f);
+        }
+        if (grip && held_logged.insert(-info.goods - 1000000).second) { // once: it was really drawn
+            const Vec3 c = {world.m[12], world.m[13], world.m[14]};
+            hitbox_log += Fmt("game UI: held draw: goods %d: %zu of %zu triangles in the %s hand (%s), centre %.2f m from the head, scale %.3f\n",
+                              info.goods, drawn, mesh->model.indices.size() / 3, h ? "right" : "left",
+                              hands ? "custom hands" : "the game's hands", double(Length(c - head_pose.position)),
+                              double(mesh->spec.scale));
+            if (!hands) {
+                hitbox_log += Fmt("game UI: held place: goods %d at the %s hand %s; controller grip to the game hand %.3f m\n",
+                                  info.goods, h ? "right" : "left",
+                                  at_hand.from_bone ? "bone (R_Weapon/L_Weapon frame)"
+                                  : bone_ok         ? "controller (the bone is not a pose or too far)"
+                                                    : "controller (no hand bone from the host)",
+                                  bone_ok ? double(at_hand.gap_m) : -1.0);
+            }
+        }
+        ring_in = std::max(ring_in, mesh->radius + 0.008f);
+    } else {
+        hud_canvas.Disc(panel, 0, 0, 0.026f, {0.0f, 0.0f, 0.0f, 0.8f});
+        hud_canvas.Disc(panel, 0, 0, 0.021f, color);
+        if (held_logged.insert(-info.goods - 1).second) {
+            hitbox_log += Fmt("game UI: held draw: goods %d drawn as a disc (%s)\n", info.goods,
+                              !mesh ? "no mesh or stand-in" : "the hand's grip pose is not valid");
+        }
+    }
     if (held_item.Progress() > 0.0f || held_item.InContact()) {
-        hud_canvas.Sector(panel, 0, 0, 1.5708f, 3.1416f * std::max(held_item.Progress(), 0.05f), 0.029f,
-                          0.035f, {1.0f, 1.0f, 1.0f, 1.0f});
+        hud_canvas.Sector(panel, 0, 0, 1.5708f, 3.1416f * std::max(held_item.Progress(), 0.05f), ring_in,
+                          ring_in + 0.006f, {1.0f, 1.0f, 1.0f, 1.0f});
     }
     if (hud_font.Ready()) {
-        hud_canvas.Text(panel, 0.0f, 0.046f, 0.02f, held_item.Hint(), {1, 1, 1, 1}, sb::UiAlign::Center);
+        hud_canvas.Text(panel, 0.0f, ring_in + 0.017f, 0.02f, held_item.Hint(), {1, 1, 1, 1},
+                        sb::UiAlign::Center);
+        hud_canvas.Text(panel, 0.0f, ring_in + 0.039f, 0.013f, held_item.CancelHint(), {0.8f, 0.8f, 0.8f, 1},
+                        sb::UiAlign::Center);
     }
     if (grip && info.kind == held::Kind::Mouth && head_pose.valid) {
         // The mouth, as a faint ring.
@@ -1087,6 +1257,138 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g) {
     }
     hud_canvas.on_top = false;
     hud_canvas.alpha = 1.0f;
+}
+
+bool GameUi::CustomHandsOn() const {
+    return custom_hands_env >= 0 ? custom_hands_env == 1 : menus.Layout().game.custom_hands.on;
+}
+
+void GameUi::DrawHands(const sb::UiGameLayout& g) {
+    hand_tris = 0;
+    held::TriBatch batch(head_pose.position);
+    const sb::UiCustomHands& c = g.custom_hands;
+    for (int h = 0; h < 2; ++h) {
+        const sb::UiPose& grip = hands_in.grip[h];
+        if (!grip.valid) {
+            continue;
+        }
+        // The pose: the item's hold while one is gripped in this hand, the weapon grip while the
+        // hand holds a game weapon (the trigger still closes the index), else the controller's.
+        hand::Pose pose = hand::ControllerPose(hands_in.squeeze[h], hands_in.trigger[h]);
+        if (held_item.Active() && held_item.Hand() == h && held_item.Gripped()) {
+            pose = hand::HoldPose(hand::GripFor(held_item.Id()), hands_in.trigger[h]);
+        } else if (c.weapon_grip) {
+            // weapons[]: right 1, right 2, left 1, left 2; weapon_active[0] right, [1] left.
+            const uint32_t w = h ? current.weapons[current.weapon_active[0] & 1]
+                                 : current.weapons[2 + (current.weapon_active[1] & 1)];
+            if (w != BBXR_ITEM_NONE && w != 0u && w != 110000u) { // 0: no state yet; 110000: unarmed (the fists row)
+                pose = hand::HoldPose(hand::CategoryGrip(hand::HoldCategory::Weapon), hands_in.trigger[h]);
+            }
+        }
+        hand_pose[h] = pose;
+        const hand::HandMesh& m = hand_models.hand[h];
+        Mat4 joints[hand::kJoints];
+        hand::PoseJoints(m, pose, joints);
+        std::vector<Vec3> pos, nrm;
+        hand::Skin(m, joints, hand::HandWorld(m, h, grip.position, grip.rotation, c.scale), pos, nrm);
+        hand_tris += batch.Add(pos, nrm, m.indices.data(), m.indices.size(), c.color);
+    }
+    DrawHeldItem(g, &batch); // the item's mesh joins the batch; its ring and hint are drawn there
+    hud_canvas.on_top = true;
+    hud_canvas.alpha = 1.0f;
+    batch.Emit(hud_canvas.top);
+    hud_canvas.on_top = false;
+}
+
+void GameUi::DrawSkins() {
+    skin_tris = 0;
+    if (!skin_cfg_read) {
+        skin_cfg = skin::ReadConfig();
+        skin_cfg_read = true;
+    }
+    if (!skin_cfg.Enabled()) {
+        return;
+    }
+    if (!skin_tried) { // once: the mesh is cached, never loaded per frame
+        skin_tried = true;
+        std::string msg;
+        skin_ok = skin::LoadConfigured(skin_cfg, assets, skin_mesh, msg);
+        hitbox_log += msg + '\n';
+    }
+    const uint32_t count = std::min<uint32_t>(current.skin.count, BBXR_SKIN_MAX);
+    if (!skin_ok || count == 0) {
+        return;
+    }
+    if (!skin_announced) {
+        skin_announced = true;
+        hitbox_log += Fmt("VR skin: drawing %u target(s)\n", count);
+    }
+    hud_canvas.on_top = true;
+    hud_canvas.alpha = 1.0f;
+    const float height = skin_mesh.hi.y - skin_mesh.lo.y;
+    for (uint32_t i = 0; i < count; ++i) {
+        const BbXrSkinTarget& t = current.skin.targets[i];
+        float roll = 0.0f;
+        float bob = 0.0f;
+        if (skin_cfg.bob) {
+            bob = skin::SkinBob(float(std::fmod(now, 3600.0)) + float(t.id) * 0.37f, t.speed_mps, &roll, height);
+        }
+        const Vec3 pos{t.pos[0], t.pos[1], t.pos[2]};
+        const Vec3 fwd{t.forward[0], t.forward[1], t.forward[2]};
+        const Vec3 up{t.up[0], t.up[1], t.up[2]};
+        if (!std::isfinite(pos.x + pos.y + pos.z + fwd.x + fwd.y + fwd.z + up.x + up.y + up.z)) {
+            continue;
+        }
+        const Mat4 world = skin::SkinWorld(pos, fwd, up, skin_cfg.yaw_rad, bob, roll);
+        skin_tris += skin::AppendSkin(hud_canvas.top, skin_mesh, world, head_pose.position);
+    }
+    hud_canvas.on_top = false;
+}
+
+// The aimed throw: the arc as a thin ribbon from the hand and a flat ring + dot at the impact.
+static void DrawThrowAim(sb::UiCanvas& cv, const held::ThrowArc& arc, const Vec3& eye) {
+    const bool floor_hit = arc.hit_floor;
+    const sb::UiColor arc_c = floor_hit ? sb::UiColor{1.0f, 0.55f, 0.12f, 0.75f} : sb::UiColor{0.7f, 0.7f, 0.7f, 0.6f};
+    const sb::UiColor mark_c = floor_hit ? sb::UiColor{1.0f, 0.6f, 0.15f, 0.85f} : sb::UiColor{0.6f, 0.6f, 0.6f, 0.7f};
+    cv.on_top = true;
+    cv.alpha = 1.0f;
+    const size_t step = 2;
+    for (size_t i = 0; i + 1 < arc.points.size(); i += step) {
+        const Vec3 a = arc.points[i], b = arc.points[std::min(i + step, arc.points.size() - 1)];
+        const Vec3 d = b - a;
+        const float len = Length(d);
+        if (len < 1e-4f) {
+            continue;
+        }
+        const Vec3 dir = d * (1.0f / len);
+        const Vec3 mid = (a + b) * 0.5f;
+        sb::UiPanel seg;
+        seg.origin = mid;
+        seg.x = dir;
+        seg.z = Normalize(Perp(eye - mid, dir), AnyPerp(dir));
+        seg.y = Cross(seg.z, seg.x);
+        cv.Box(seg, 0.0f, 0.0f, len * 1.05f, 0.01f, arc_c);
+    }
+    const Vec3 c = arc.impact + Vec3{0.0f, 0.01f, 0.0f};
+    constexpr int kSeg = 24;
+    constexpr float kR = 0.35f, kTwoPi = 6.2831853f;
+    for (int i = 0; i < kSeg; ++i) {
+        const float a0 = kTwoPi * float(i) / kSeg, a1 = kTwoPi * float(i + 1) / kSeg, am = 0.5f * (a0 + a1);
+        const Vec3 p0 = c + Vec3{std::cos(a0), 0, std::sin(a0)} * kR, p1 = c + Vec3{std::cos(a1), 0, std::sin(a1)} * kR;
+        sb::UiPanel seg;
+        seg.origin = c + Vec3{std::cos(am), 0, std::sin(am)} * kR;
+        seg.x = Normalize(p1 - p0);
+        seg.z = {0, 1, 0};
+        seg.y = Cross(seg.z, seg.x);
+        cv.Box(seg, 0.0f, 0.0f, Length(p1 - p0) * 1.1f, 0.03f, mark_c);
+    }
+    sb::UiPanel flat;
+    flat.origin = c;
+    flat.x = {1, 0, 0};
+    flat.z = {0, 1, 0};
+    flat.y = Cross(flat.z, flat.x);
+    cv.Disc(flat, 0, 0, 0.05f, mark_c);
+    cv.on_top = false;
 }
 
 bool GameUi::Build() {
@@ -1117,9 +1419,26 @@ bool GameUi::Build() {
     hud_canvas.outline = 0.12f;
     sb::DrawSwingHud(hud_canvas, readout, c, head_pose, left_grip);
     DrawGunRay(g);
-    DrawHeldItem(g);
+    hand_tris = 0;
+    if (CustomHandsOn() && !hand_models.tried) {
+        if (hand_models.Load(assets / "hands")) {
+            hitbox_log += "game UI: custom hands: " + (assets / "hands").string() + " loaded\n";
+        } else {
+            hitbox_log += "game UI: custom hands: " + hand_models.error +
+                          " (out/vr_assets/hands: WebXR Input Profiles generic-hand, docs/vr/findings/40)\n";
+        }
+    }
+    if (CustomHandsOn() && hand_models.Ready()) {
+        DrawHands(g);
+    } else {
+        DrawHeldItem(g);
+    }
     hud_canvas.on_top = false;
     hud_canvas.alpha = 1.0f;
+    if (const held::ThrowArc* arc = held_item.Aim()) {
+        DrawThrowAim(hud_canvas, *arc, head_pose.position);
+    }
+    DrawSkins();
     hitboxes.Draw(hud_canvas, g.debug_hitboxes, current, now, head_pose.position, hitbox_log);
     hud_visible = !hud_canvas.world.empty() || !hud_canvas.top.empty();
     if (hud_gpu_ready) {

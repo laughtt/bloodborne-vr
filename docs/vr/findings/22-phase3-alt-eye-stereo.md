@@ -538,3 +538,46 @@ already submits the rendered view's FOV, so the compositor crops. Start log:
 `VR head: render fov ... display fov ...`. Cost: the frame stays 1920x1080 (the game's frame size),
 so the pixel density drops by 1/1.1 horizontally and 1/1.15 vertically; no extra shading. Needs a
 headset run to confirm.
+
+## 10. Mono in the sewers, cutscenes in first person (headset run, 2026-10-11)
+
+Log `out/vr_all_alt.log` (bb-probe-all46, session of 2026-10-11).
+
+- **Sewers (rat area) flat for the whole area [C, log; cause partly inferred]:** entering the Central
+  Yharnam sewers (player y about -60) the pairing went "no eye frames for a while (unmatched)" (log
+  lines 21473, 21508) and stayed mono for about 2 minutes until the ladder back up (line 22540: "eye
+  frames again"). Every 10 s window shows `held N (no camera 0, repeat 0, unmatched N), mono N` while H1
+  kept publishing views ("set up L 70580" grows, "presenter: L 70464" stops). The mono pairing found no
+  match either ("mono images with their camera's view: 0 paired"), which compares the rotation alone,
+  so the frames' scene camera had another rotation than every eye view. `CameraMotion::OnConstants`
+  takes the first G-buffer scene constants of a frame as the camera; in the sewers that is most
+  likely another view drawn first (a reflection or a second view of the water), or a far plane other
+  than 3000 rejects the main block. **Fix:** `CameraMotion::FrameCameras` keeps every distinct camera
+  of the frame's G-buffer passes (any far plane, up to 4), and `xrstereo::Pairing::OnFrame` tries each
+  (the main one first). Log lines for the next run: `a frame matched its eye by scene camera N of M`,
+  `matched by another scene camera than the first N` in the 10 s summary, and on an unmatched mono
+  start `M scene camera(s) in the frame, the nearest eye view X off in rotation, Y m in position`.
+  Test: `bbport_xr_stereo_test` (another scene camera first: 200 of 200 frames paired, the old single
+  camera stays unmatched and mono).
+- **Cutscenes shown from the frozen hunter's eyes [C, log]:** the Gascoigne intro (log 23908-24261,
+  47 s): a fade (`VR HUD: the UI covers the screen`, 1.5 s), then the game camera cut to 40 m away
+  (`game camera pos (-16.826 -40.300 93.796)`) while the player and its head bone did not move, and the
+  first-person state stayed "first person" the whole time: the field-camera check (findings/16) passed,
+  so H1 kept the camera at the hunter's eyes and the user never saw the cinematic. **Fix:** a second
+  check reads SprjRemo (`[0x5940058]+8`, the playing Remo's player: camera matrix +0x120, flags +0x168,
+  eboot 0x1e08e38 and 0x1d3b17d): a Remo with flag bit 1 or 2 whose camera is the game's camera is a
+  cutscene (`vr_cutscene_raw`, hysteresis on after 3 frames, off after 20). In alt mode H1/H2 then leave
+  the game camera alone (no head pose, FOV or eye offset) and call `bbgpu_vr_set_cinema(1)`: every frame
+  goes to the cinema screen at once (`Pairing::SetCinema`, reason "cinema"), the HUD quad keeps the
+  subtitles. Log: `VR FP: cutscene starts (cinema screen): field camera ..., Remo 0x... flags 0x..`,
+  `VR head: cutscene: the game's own camera ...`, `VR stereo: cutscene: frames go to the cinema
+  screen`; every second while a Remo exists `VR FP: Remo check: ...`. Not yet seen in the headset.
+- **NPC talk, black with subtitles [S]:** the log has no `UI covers the screen` episode other than the
+  start (390), the two deaths (17872, 24608) and the Gascoigne fades (23908, 24261), so the full-screen
+  UI heuristic did not misfire on a dialogue in this session. The talking with subtitles was most
+  likely the Gascoigne intro (he speaks): the eyes kept rendering from the hunter's frozen position
+  (360 + 360 eye frames per 10 s) with the subtitles on the HUD quad, and the fades went to the cinema
+  screen, which the old bridge could place out of view (7f78da3). Why the eye view looked black is not
+  in the log; with the cinema routing above the cutscene shows the game's own image. If a talk without
+  a cutscene still goes black, run with `BB_XR_HUD_DEBUG=1` (HUD alpha probes) to see whether a dim
+  overlay is drawn into the HUD layer.

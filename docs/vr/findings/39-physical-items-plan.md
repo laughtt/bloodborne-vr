@@ -117,6 +117,12 @@ one plays). [U] the sub-ids of the use animations: read the TimeAct ring's newes
 `runtime_vr_atkspeed.c` / `runtime_vr_arms.c`) and log it during each use (a log-only change). Risk: the
 whole character's dt is scaled (stamina regen, movement) for that time; OK up to ~2x (runtime_vr_atkspeed.c:34).
 
+Done (headset check pending): `BB_VR_THROW_ANIM_SPEED` (default 3.6, 1 = off, max 4; was 1.8, doubled after the headset test). The throw gesture's `USE_QUICK` (c > 0) calls
+`vr_atkspeed_throw_begin`; the "VR Attack Speed (chr dt)" hook then waits (4 s) for a NEW TimeAct clip (id change or clip restart,
+not a weapon move 30000-49999 or a dodge 7000s) and scales the player's dt by the factor until that clip ends (`src/vr_throw_anim.h`,
+test `vr-throw-anim-test`). Drinking and other uses never arm it. The release point inside the clip is not moved (the sub-ids are
+still unknown): the projectile leaves at the same clip time, so the delay shrinks by the factor. `BB_VR_FP_LOG=1` logs `VR throw anim: clip <id> latched`.
+
 ## 2. Weapon buffs (Fire Paper, Bolt Paper, Empty Phantasm Shell, Bone Marrow Ash)
 
 ### 2A. Gesture -> the game's own use (cheapest)
@@ -248,8 +254,8 @@ Phase 1 as built (branch `physical-items`):
   Idle / Pending / Held; mouth sphere dwell, blade-segment touch dwell, release-velocity throw, cancel), `CollisionPulse`.
 - `vr_game_ui.cpp`: a wheel/dashboard/body-slot pick of a physical item goes into a hand (`held_items`, default true)
   instead of the use action; the gesture sends the same `USE_QUICK` the dashboard did (the host's executor). A thrown item
-  first sends `BBXR_UI_THROW_ORIGIN` / `_DIR` (head-frame mm and unit vector). The right grip must close within
-  `held.pickup_grace_s`; opening it without a gesture, opening a menu, the game's own menu or lost tracking puts the item back.
+  first sends `BBXR_UI_THROW_ORIGIN` / `_DIR` (head-frame mm and unit vector). Selecting the item IS the grip (no squeeze; `held.pickup_grace_s` is
+  unused); a fresh trigger press, opening a menu, the game's own menu or lost tracking puts the item back.
   While an item is in a hand (and `held.lockout_s` after) the filter hides R1/R2/d-pad right (and L1 for the left hand)
   from the game (`InputFilter::SetHoldMask`), so the throw is not an attack and the grip tap does not swap weapons.
 - Hands: drinks and throws the right hand (a drink grabbed from a body slot stays in the grabbing hand); a weapon paper in
@@ -260,8 +266,12 @@ Phase 1 as built (branch `physical-items`):
   into the world with the latest first-person camera and arm the launch hook (0x1df6ca0, "VR Gun Aim (bullet spawn)") for 4 s.
   The hook's throw mode (`vg_throw_launch`, `src/vr_gun_math.h`) moves the launch origin to the hand (unless it is more than
   `BB_VR_THROW_SHIFT_M` = 2 m from the game's muzzle) and turns the launch Z axis and aim point onto the release direction.
-  Only ids in `BBXR_THROW_BULLET_IDS` = 100,105,120,121,150,170,180,410,460,470 (flying goods with a launch speed and a range;
-  NOT the cures 200/230/320, the rope molotovs 110/114, Pungent Blood 160, Shining Coins 300, Executioner's Gloves 350).
+  Only ids in `BBXR_THROW_BULLET_IDS` = 100,105,110,114,120,121,150,160,170,180,300,350,410,460,470 (the bullet of every goods the
+  held-item code classifies as Throw; NOT the cures 200/230/320 nor the impact children). The rope molotov (110) was left to the game at
+  first and flew backwards (the game aims along the character's facing), so it is aimed too. A throw with several bullets (the rope
+  molotov's chain 110/111/112, the gloves' fan) redirects them together: later bullets with the first's id or in
+  `BBXR_THROW_FOLLOW_IDS` (111,112,115,116; `BB_VR_THROW_FOLLOW_IDS`) within 1 s get the first bullet's turn (`vg_throw_group_*`), so their
+  spread is kept; the origin shifts only for a bullet born within 0.5 m of the first's muzzle.
   Every player projectile id that reaches the hook is logged (first sight, then rate limited). A throwable that never reaches
   the hook is still thrown with the game's own direction.
 - Haptics: `collision_haptics` (`on`, `hit`, `hit_strong`, `wall`, `object`, `strength_ref`, `scale_by_strength`) on
@@ -270,3 +280,16 @@ Phase 1 as built (branch `physical-items`):
 - Not done (phase 2): throw speed from the hand velocity, faster item-use animations, item meshes, per-item haptics.
 - Gated on the headset: the head-frame to world conversion of the hand position (a wrong assumption keeps the game's origin
   and logs it), that thrown goods reach 0x1df6ca0 at all, the launch delay of each use animation, and the blade segment per weapon.
+
+Phase 2, speed from the hand (option ii of 1A; `BB_VR_THROW_SPEED=1` default, **[L] unverified live**):
+
+- The headset's `BBXR_UI_USE_QUICK` of a throw carries the hand's speed relative to the head in `c` (cm/s). `src/runtime_vr_ui.c`
+  passes it to `vr_gun_throw_speed`, which stores it in the armed throw (the loop handles `THROW_DIR` before the use).
+- `thr_redirect` (the launch hook, now given `rdi` = BulletIns) stashes `{bullet, release direction, factor}` with
+  `factor = vg_throw_speed_factor(speed, BB_VR_THROW_SPEED_REF=7, _MIN=0.3, _MAX=1.5)` (a factor within 2 % of 1 is skipped). The launch
+  init writes the velocity vec4 at BulletIns+0x40 (copied to +0x50) after the hook returns (static RE, 0x1df77a7/0x1df77b3), so the
+  rewrite waits for the next camera frame (`vr_gun_view`) or the next launch hook entry, within 300 ms: the vec4 must be finite,
+  |v| 0.5..100 m/s and within 15 deg of the release direction, and writable; then xyz of +0x40 and +0x50 are scaled (w kept).
+- Log lines: `VR throw: speed rewrite bullet N: hand x m/s (ref 7.0) -> factor f: |v| a -> b m/s ...`, then `one frame later |v| = X
+  (expected about Y)`. If X equals the old speed the mover does not integrate +0x40 (the rewrite has no effect: drop it or find the
+  field the mover reads, 27:39 / mover 0x1df4f00); if it equals Y it works. `dropped: <why>` when the velocity never validated.

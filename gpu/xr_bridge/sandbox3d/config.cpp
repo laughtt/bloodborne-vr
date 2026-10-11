@@ -109,6 +109,8 @@ void Config::Load(const json::Value& d) {
     physics.Load(d["physics"]);
     throwables.Load(d["throwables"]);
     consumables.Load(d["consumables"]);
+    parry.Load(d["parry"]);
+    hands.Load(d["hands"]);
     render_scale = std::clamp(render_scale, 0.1f, 2.0f);
     near_z = std::max(near_z, 0.001f);
 }
@@ -147,6 +149,8 @@ std::string Config::Summary() const {
       << "  \"physics\": " << physics.Summary("  ") << ",\n"
       << "  \"throwables\": " << throwables.Summary("  ") << ",\n"
       << "  \"consumables\": " << consumables.Summary("  ") << ",\n"
+      << "  \"parry\": " << parry.Summary("  ") << ",\n"
+      << "  \"hands\": " << hands.Summary() << ",\n"
       << "  \"show\": {\"body\": " << show_body << ", \"head\": " << show_head
       << ", \"masked\": " << show_masked << ", \"skeleton\": " << show_skeleton
       << ", \"dummies\": " << show_dummies << ", \"weapon\": " << show_weapon

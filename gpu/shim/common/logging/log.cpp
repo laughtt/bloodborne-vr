@@ -18,6 +18,11 @@ static Level threshold() {
     return level;
 }
 bool ShouldLog(Level level) { return level >= threshold(); }
+// BB_GPU_LOG threshold, or (dev builds) BB_NET_TRACE=1 lets info and up through for Lib.Np* classes.
+bool ShouldLog(Level level, std::string_view log_class) {
+    if (level >= threshold()) return true;
+    return false;
+}
 void Write(std::string_view log_class, Level level, const char* file, int line, const char* function,
            std::string&& message) {
     static std::mutex mutex;

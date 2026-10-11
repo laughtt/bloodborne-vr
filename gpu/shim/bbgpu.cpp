@@ -265,11 +265,13 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
 }
 
 namespace Libraries::Kernel { void StartKernelService(); }
+extern "C" void bbnet_register(void); // bbnet/bbnet_glue.cpp: network and PSN (co-op)
 extern "C" void bbgpu_register_kernel(void) {
     Libraries::Kernel::StartKernelService();
     Core::Loader::SymbolsResolver resolver;
     Libraries::Kernel::RegisterEventQueue(&resolver);
     Libraries::AvPlayer::RegisterLib(&resolver);
+    bbnet_register();
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
@@ -445,6 +447,13 @@ extern "C" void bbgpu_vr_set_eye_view(const BbVrEyeView* view) {
     std::memcpy(out.position, view->position, sizeof(out.position));
     std::memcpy(out.center, view->center, sizeof(out.center));
     stereo.Add(out);
+}
+
+extern "C" void bbgpu_vr_set_cinema(int on) {
+    Vulkan::XrStereo& stereo = Vulkan::XrStereo::Get();
+    if (stereo.Enabled()) {
+        stereo.SetCinema(on != 0);
+    }
 }
 
 extern "C" int bbgpu_vr_stereo_status(BbVrStereoStatus* out) {

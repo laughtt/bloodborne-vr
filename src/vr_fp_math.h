@@ -150,4 +150,44 @@ static inline void vr_stick_rotate(uint8_t *sx, uint8_t *sy, float angle) {
     *sy = (uint8_t)(oy + 0.5f);
 }
 
+/* ---- real-time cutscenes (Remo): the cinema screen instead of first person ---- */
+
+/* 1 when two camera matrices (rows right, up, forward, position) show the same view: each rotation
+ * element within rot_tol, the positions within pos_tol meters. */
+static inline int vr_cam_same_view(const float a[4][4], const float b[4][4], float rot_tol, float pos_tol) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            if (!(fabsf(a[i][j] - b[i][j]) <= rot_tol)) return 0;
+    const float dx = a[3][0] - b[3][0], dy = a[3][1] - b[3][1], dz = a[3][2] - b[3][2];
+    return dx * dx + dy * dy + dz * dz <= pos_tol * pos_tol;
+}
+
+/* The frame shows a cutscene when the game camera is not the field camera (debug camera, or a Remo
+ * selected through SprjCamera+0x18), or when a Remo is playing (SprjRemo's player +0x168 bit 1 or 2,
+ * eboot 0x1e08e38 and 0x1d3b17d) and the game camera is the Remo camera (the player's +0x120 matrix,
+ * which SprjCameraStep copies into +0x18). The Gascoigne intro played with the field camera equal to
+ * the game camera (findings/16), so the field check alone misses Remo. A Remo flag left over after
+ * the cutscene does not count: the gameplay camera is not the Remo camera. */
+static inline int vr_cutscene_raw(int field_is_game, int remo_flags, int remo_is_game) {
+    return !field_is_game || ((remo_flags & 3) != 0 && remo_is_game);
+}
+
+/* Hysteresis: on after VR_CUTSCENE_ON frames in a row, off after VR_CUTSCENE_OFF frames without
+ * (a camera cut or one odd frame neither leaves nor enters the cinema screen). */
+#define VR_CUTSCENE_ON 3u
+#define VR_CUTSCENE_OFF 20u
+typedef struct {
+    int on;
+    uint32_t run;
+} VrCutsceneLatch;
+static inline int vr_cutscene_update(VrCutsceneLatch *l, int raw) {
+    if ((raw != 0) == (l->on != 0)) {
+        l->run = 0;
+    } else if (++l->run >= (l->on ? VR_CUTSCENE_OFF : VR_CUTSCENE_ON)) {
+        l->on = raw != 0;
+        l->run = 0;
+    }
+    return l->on;
+}
+
 #endif

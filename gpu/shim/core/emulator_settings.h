@@ -72,6 +72,34 @@ public:
     bool IsVkValidationEnabled() { static const auto value = Flag("BB_VK_VALIDATION", false); return value; }
     bool IsVkValidationGpuEnabled() { return false; }
     bool IsVkValidationSyncEnabled() { static const auto value = Flag("BB_VK_VALIDATION_SYNC", false); return value; }
+    // bbport co-op: online play through a shadNet server (BB_ONLINE=1, set by the launcher).
+    static std::string Text(const char* name, const char* fallback) {
+        const char* v = std::getenv(name);
+        return v && v[0] ? v : fallback;
+    }
+    bool IsConnectedToNetwork() { static const auto value = Flag("BB_ONLINE", false); return value; }
+    bool IsShadNetEnabled() { return IsConnectedToNetwork() && !shadnet_session_disabled.load(); }
+    void SetShadNetSessionDisabled(bool v) { shadnet_session_disabled.store(v); }
+    // BB_ONLINE_SERVER=host:port is shorthand for both: the shadNet server, and its WebAPI on
+    // http://host:port+2 (the shadNet port layout). BB_SHADNET_SERVER / BB_SHADNET_WEBAPI win.
+    // No address is built in: it is the player's setting (the launcher passes it); empty means no server.
+    std::string GetShadNetServer() {
+        return Text("BB_SHADNET_SERVER", Text("BB_ONLINE_SERVER", "").c_str());
+    }
+    std::string GetShadNetWebApiServer() {
+        const char* v = std::getenv("BB_SHADNET_WEBAPI");
+        if (v && v[0]) return v;
+        const std::string server = Text("BB_ONLINE_SERVER", "");
+        const auto colon = server.rfind(':');
+        if (colon == std::string::npos || colon == 0) return std::string{};
+        const long port = std::strtol(server.c_str() + colon + 1, nullptr, 10);
+        if (port <= 0) return std::string{};
+        return "http://" + server.substr(0, colon) + ":" + std::to_string(port + 2);
+    }
+    bool IsUPnPEnabled() { static const auto value = Flag("BB_UPNP", true); return value; }
 
+
+private:
+    std::atomic<bool> shadnet_session_disabled{false};
 };
 #define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())

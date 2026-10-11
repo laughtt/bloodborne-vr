@@ -2,6 +2,7 @@
  * docs/vr/findings/27-gun-aim.md): the controller ray in the game world and the launch redirect.
  * Build: ninja -C out/gpu vr-gun-test (no GPU, no game). Prints PASS lines; exit 0. */
 #include "vr_gun_math.h"
+#include "vr_fp_math.h"
 #include <stdio.h>
 
 static int failures, checks;
@@ -150,7 +151,8 @@ static void test_ids(void) {
 }
 
 /* ---- Physical items: the throw mode (findings/39) ---- */
-#define THROW_IDS "100,105,120,121,150,170,180,410,460,470" /* = BBXR_THROW_BULLET_IDS (checked in vr_game_ui_test) */
+#define THROW_IDS "100,105,111,115,120,121,150,160,170,180,300,350,410,460,470"
+#define FOLLOW_IDS "111,112,115,116" /* = BBXR_THROW_BULLET_IDS (checked in vr_game_ui_test) */
 
 static void test_rel_to_world(void) {
     float rows[3][4];
@@ -207,21 +209,180 @@ static void test_throw_launch(void) {
     if (!failures) printf("PASS: the throw launch (origin at the hand, Z along the release, aim point moved)\n");
 }
 
+static void test_throw_group(void) {
+    /* a throw of three bullets fanned 20 deg either side of the game's forward (the gloves), the first one the middle */
+    const VrVec3 muzzle = vr_v3(0, 1.4f, 0), hand = vr_v3(0.3f, 1.2f, 0.4f);
+    const VrVec3 dir = vam_norm(vr_v3(1, 0.4f, 1), vr_v3(0, 0, 1));
+    float mid[3][4], a[3][4], b[3][4];
+    const VrQuat qa = vr_qaxis(vr_v3(0, 1, 0), 20.0f * VR_DEG), qb = vr_qaxis(vr_v3(0, 1, 0), -20.0f * VR_DEG);
+    set_launch(mid, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    set_launch(a, vr_qrotate(qa, vr_v3(1, 0, 0)), vr_v3(0, 1, 0), vr_qrotate(qa, vr_v3(0, 0, 1)), muzzle);
+    set_launch(b, vr_qrotate(qb, vr_v3(1, 0, 0)), vr_v3(0, 1, 0), vr_qrotate(qb, vr_v3(0, 0, 1)), muzzle);
+    VgThrowGroup g = vg_throw_group_make((const float (*)[4])mid, hand, dir, 2.0f);
+    CHECK(g.moved == 1, "hand in reach");
+    int moved = 0;
+    VrVec3 od, nd;
+    vg_throw_launch(mid, NULL, hand, dir, 2.0f, &moved, NULL, NULL);
+    vg_throw_group_apply(a, NULL, &g, 0.5f, &moved, &od, &nd);
+    CHECK(moved == 1 && near_v(vg_launch_origin((const float (*)[4])a), hand, 1e-5f), "member at the hand");
+    vg_throw_group_apply(b, NULL, &g, 0.5f, &moved, NULL, NULL);
+    const VrVec3 za = vg_launch_axis((const float (*)[4])a, 2), zb = vg_launch_axis((const float (*)[4])b, 2);
+    CHECK(near_f(vg_angle_deg(za, dir), 20.0f, 0.05f) && near_f(vg_angle_deg(zb, dir), 20.0f, 0.05f), "spread 20 deg around the release");
+    CHECK(near_f(vg_angle_deg(za, zb), 40.0f, 0.05f), "relative spread kept (40 deg)");
+    CHECK(near_v(vg_launch_axis((const float (*)[4])mid, 2), dir, 1e-4f), "first bullet along the release");
+    /* a member born far from the first bullet's muzzle (an impact child) is turned but not moved */
+    float far_m[3][4];
+    set_launch(far_m, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), vr_v3(5, 1, 5));
+    vg_throw_group_apply(far_m, NULL, &g, 0.5f, &moved, NULL, NULL);
+    CHECK(moved == 0 && near_v(vg_launch_origin((const float (*)[4])far_m), vr_v3(5, 1, 5), 1e-6f), "far member keeps its origin");
+    CHECK(near_v(vg_launch_axis((const float (*)[4])far_m, 2), dir, 1e-4f), "far member still turned");
+    /* hand out of reach: the group keeps every origin */
+    set_launch(mid, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    g = vg_throw_group_make((const float (*)[4])mid, vr_v3(3, 1.4f, 0), dir, 2.0f);
+    set_launch(a, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    vg_throw_group_apply(a, NULL, &g, 0.5f, &moved, NULL, NULL);
+    CHECK(g.moved == 0 && moved == 0 && near_v(vg_launch_origin((const float (*)[4])a), muzzle, 1e-6f), "far hand: origin kept");
+    /* the aim point is turned and moved with the member */
+    float t[3] = {0, 1.4f, 6.0f};
+    set_launch(a, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), muzzle);
+    g = vg_throw_group_make((const float (*)[4])a, hand, dir, 2.0f);
+    vg_throw_group_apply(a, t, &g, 0.5f, &moved, NULL, NULL);
+    CHECK(near_v(vr_v3(t[0], t[1], t[2]), vr_add(hand, vr_scale(dir, 6.0f)), 1e-3f), "aim point along the release from the hand");
+    if (!failures) printf("PASS: a multi-bullet throw keeps its spread\n");
+}
+
 static void test_throw_ids(void) {
-    static const int listed[] = {100, 105, 120, 121, 150, 170, 180, 410, 460, 470};
+    static const int listed[] = {100, 105, 111, 115, 120, 121, 150, 160, 170, 180, 300, 350, 410, 460, 470};
     for (size_t i = 0; i < sizeof listed / sizeof *listed; ++i) CHECK(vg_id_in_list(THROW_IDS, listed[i]), "bullet %d is listed", listed[i]);
     /* the self-targeted and non-flying ones are never redirected: Antidote 200, Sedative 230, Lead Elixir 320,
-     * the rope molotovs 110 / 114, Pungent Blood 160, Shining Coins 300, Executioner's Gloves 350, the
+     * the rope molotovs' speed-0 spawners 110 / 114 (their flying child 111 / 115 is aimed), the
      * firearms 500-999 (the gun's own list) and the burst children */
-    static const int excluded[] = {200, 230, 320, 110, 114, 160, 300, 350, 101, 106, 151, 600, 601, 0};
+    static const int excluded[] = {200, 230, 320, 101, 106, 110, 114, 112, 116, 151, 600, 601, 0};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; ++i) CHECK(!vg_id_in_list(THROW_IDS, excluded[i]), "bullet %d is not listed", excluded[i]);
     if (!failures) printf("PASS: the thrown bullet id list\n");
 }
 
+static void test_assist(void) {
+    VgAssist a = vg_assist_defaults();
+    const VrVec3 mz = vr_v3(0, 1.5f, 0);
+    /* cone: wide close, narrow far, clamped */
+    CHECK(near_f(vg_assist_cone(&a, 0.5f), 18.0f, 1e-4f), "close = max cone");
+    CHECK(near_f(vg_assist_cone(&a, 3.0f), atanf(0.2f) / VR_DEG, 1e-3f), "3 m cone %.2f", vg_assist_cone(&a, 3.0f));
+    CHECK(near_f(vg_assist_cone(&a, 30.0f), 4.0f, 1e-4f), "far = min cone");
+    /* an enemy 3 m ahead; a ray 3 degrees off is inside the inner part: pulled 80% of the way */
+    const VrVec3 tg = vr_v3(0, 1.5f, 3.0f);
+    const float r = 3.0f * VR_DEG;
+    const VrVec3 ray = vr_v3(sinf(r), 0, cosf(r));
+    int pick = -2;
+    float ang = 0;
+    VrVec3 d = vg_assist_dir(ray, mz, &tg, 1, &a, &pick, &ang);
+    CHECK(pick == 0 && near_f(ang, 3.0f, 1e-3f), "picked");
+    CHECK(near_f(vg_angle_deg(d, vr_v3(0, 0, 1)), 0.6f, 0.1f), "pulled to %.2f deg", vg_angle_deg(d, vr_v3(0, 0, 1)));
+    /* outside the cone: untouched */
+    const float r2 = 15.0f * VR_DEG;
+    const VrVec3 far_ray = vr_v3(sinf(r2), 0, cosf(r2));
+    d = vg_assist_dir(far_ray, mz, &tg, 1, &a, &pick, &ang);
+    CHECK(pick == -1 && near_v(d, far_ray, 1e-5f), "outside the cone");
+    /* strength 1 inside the inner cone snaps onto the point; strength 0 does nothing */
+    a.strength = 1.0f;
+    d = vg_assist_dir(ray, mz, &tg, 1, &a, &pick, &ang);
+    CHECK(near_v(d, vr_v3(0, 0, 1), 1e-4f), "snap");
+    a.strength = 0.0f;
+    d = vg_assist_dir(ray, mz, &tg, 1, &a, &pick, &ang);
+    CHECK(near_v(d, ray, 1e-5f), "off");
+    /* the pull fades toward the cone's edge: the remaining miss never shrinks as the ray moves out */
+    a.strength = 0.8f;
+    float prev = 0.0f;
+    for (float deg = 0.0f; deg < 11.0f; deg += 0.5f) {
+        const float rr = deg * VR_DEG;
+        const VrVec3 rv = vr_v3(sinf(rr), 0, cosf(rr));
+        d = vg_assist_dir(rv, mz, &tg, 1, &a, &pick, &ang);
+        const float miss = vg_angle_deg(d, vr_v3(0, 0, 1));
+        CHECK(miss >= prev - 1e-3f, "monotone at %.1f deg: %.3f < %.3f", deg, miss, prev);
+        prev = miss;
+    }
+    /* the nearest in angle wins; targets too close or too far are ignored */
+    const VrVec3 two[3] = {vr_v3(0.5f, 1.5f, 3.0f), vr_v3(0.1f, 1.5f, 3.0f), vr_v3(0, 1.5f, 40.0f)};
+    d = vg_assist_dir(vr_v3(0, 0, 1), mz, two, 3, &a, &pick, &ang);
+    CHECK(pick == 1, "nearest in angle %d", pick);
+    const VrVec3 close = vr_v3(0, 1.5f, 0.1f);
+    vg_assist_dir(vr_v3(0, 0, 1), mz, &close, 1, &a, &pick, &ang);
+    CHECK(pick == -1, "too close ignored");
+    if (!failures) printf("PASS: the parry aim assist (cone by distance, smooth falloff, nearest in angle)\n");
+}
+
+static void test_throw_speed(void) {
+    CHECK(near_f(vg_throw_speed_factor(7.0f, 7.0f, 0.3f, 1.5f), 1.0f, 1e-6f), "the reference speed is the game's speed");
+    CHECK(near_f(vg_throw_speed_factor(3.5f, 7.0f, 0.3f, 1.5f), 0.5f, 1e-6f), "half the reference: half");
+    CHECK(near_f(vg_throw_speed_factor(30.0f, 7.0f, 0.3f, 1.5f), 1.5f, 1e-6f), "a fast throw is capped");
+    CHECK(near_f(vg_throw_speed_factor(0.5f, 7.0f, 0.3f, 1.5f), 0.3f, 1e-6f), "a slow throw is floored");
+    CHECK(near_f(vg_throw_speed_factor(0.0f, 7.0f, 0.3f, 1.5f), 1.0f, 1e-6f), "no speed: 1");
+    CHECK(near_f(vg_throw_speed_factor(-2.0f, 7.0f, 0.3f, 1.5f), 1.0f, 1e-6f), "negative speed: 1");
+    CHECK(near_f(vg_throw_speed_factor(5.0f, 0.0f, 0.3f, 1.5f), 1.0f, 1e-6f), "bad reference: 1");
+    if (!failures) printf("PASS: throw speed factor (clamp(speed / ref, min, max), no speed = 1)\n");
+}
+
+/* The live throw that went backwards (out/vr_all_alt.log, v75, goods 1200 molotov, bullet 100):
+ *   bridge: "direction (0.75 0.59 -0.28) [raw velocity (2.59 2.03 -0.97), forward 2.76 m/s ...]" (stage space)
+ *   FP:     "player ... yaw 51.01 deg (faces -128.99 deg)", "turn smooth: view 50.5 deg = psi + head 38.3 deg"
+ *   host:   "bullet 100 #0 thrown: yaw -127.6 pitch 29.2 -> yaw 48.6 pitch 36.4 (turn 114.3 deg)"
+ * The hand went forward relative to the head (forward 2.76 of 3.4 m/s: the head looked along stage
+ * (0.936, 0, -0.350)) and up 36 deg. Head frame -> world (vg_rel_dir_to_world) gives the view's heading,
+ * so the conversion is right; the game's own launch went along the BODY, which faced -129.0, 180 deg from
+ * the view: the stick had turned the body around (face=attack leaves the game's facing outside attacks).
+ * The fix turns the body to the aim from the release (vr_fp_throw_face, vg_body_yaw_for_heading). */
+static void test_throw_logged_case(void) {
+    const float view = 50.49f * VR_DEG; /* the first-person camera's heading at the throw */
+    float rows[3][4];
+    set_rows(rows, vr_v3(cosf(view), 0, -sinf(view)), vr_v3(0, 1, 0), vr_v3(sinf(view), 0, cosf(view)));
+    /* the head's yaw in the stage: its -Z along (0.936, 0, -0.350) */
+    const float head_yaw = atan2f(-0.936f, 0.350f);
+    const VrQuat head = vr_qaxis(vr_v3(0, 1, 0), head_yaw);
+    const VrVec3 fwd = vr_qrotate(head, vr_v3(0, 0, -1));
+    CHECK(near_v(fwd, vr_v3(0.936f, 0, -0.350f), 0.01f), "head forward %.3f %.3f %.3f", fwd.x, fwd.y, fwd.z);
+    /* what the bridge sends: conj(head) * the stage direction */
+    const VrVec3 stage_dir = vam_norm(vr_v3(0.75f, 0.59f, -0.28f), vr_v3(0, 0, 0));
+    const VrVec3 rel = vr_qrotate(vr_qconj(head), stage_dir);
+    CHECK(rel.z < -0.7f && fabsf(rel.x) < 0.1f && rel.y > 0.5f, "forward and up in the head (%.2f %.2f %.2f)", rel.x, rel.y, rel.z);
+    const VrVec3 world = vam_norm(vg_rel_dir_to_world(rel, (const float (*)[4])rows), vr_v3(0, 0, 0));
+    float yaw, pitch;
+    vg_yaw_pitch(world, &yaw, &pitch);
+    /* the world direction the player meant: the view's heading, pitched up as the hand went */
+    CHECK(vg_heading_diff_deg(yaw, 50.49f) < 10.0f, "release heading %.1f within 10 deg of the view 50.5", yaw);
+    CHECK(vg_heading_diff_deg(yaw, 48.6f) < 3.0f && near_f(pitch, 36.4f, 2.0f), "matches the host's logged 48.6 / 36.4 (%.1f / %.1f)", yaw, pitch);
+    /* the game's own launch (yaw -127.6) is the body's facing, opposite the view */
+    const float body_yaw_logged = 51.01f * VR_DEG;
+    const float facing = vr_facing_heading(body_yaw_logged) / VR_DEG;
+    CHECK(vg_heading_diff_deg(facing, -127.6f) < 3.0f, "game launch along the body's facing (%.1f)", facing);
+    CHECK(vg_heading_diff_deg(facing, 50.49f) > 170.0f, "the body faced away from the view (%.1f vs 50.5)", facing);
+    /* the fix: the body turned to the release heading faces it; a launch along the body is then the aim's heading */
+    const float body = vg_body_yaw_for_heading(yaw * VR_DEG);
+    CHECK(vg_heading_diff_deg(vr_facing_heading(body) / VR_DEG, yaw) < 0.1f, "body yaw %.1f faces the aim %.1f", body / VR_DEG, yaw);
+    /* and the redirect of the game's launch (Z along the body's old facing, pitch 29.2) onto the release ends on it */
+    const float gp = 29.2f * VR_DEG, gy = -127.6f * VR_DEG;
+    const VrVec3 z = vr_v3(cosf(gp) * sinf(gy), sinf(gp), cosf(gp) * cosf(gy));
+    const VrVec3 y = vam_norm(vr_sub(vr_v3(0, 1, 0), vr_scale(z, z.y)), vr_v3(0, 1, 0));
+    float m[3][4];
+    set_launch(m, vr_cross(y, z), y, z, vr_v3(-194.12f, -27.38f, 67.57f));
+    float t[3] = {-194.12f + 6.0f * z.x, -27.38f + 6.0f * z.y, 67.57f + 6.0f * z.z};
+    int moved = 0;
+    VrVec3 od, nd;
+    const float turn = vg_throw_launch(m, t, vr_v3(-193.87f, -26.97f, 67.59f), world, 2.0f, &moved, &od, &nd);
+    float ny, np;
+    vg_yaw_pitch(nd, &ny, &np);
+    CHECK(near_f(turn, 114.3f, 2.0f), "turn %.1f (logged 114.3)", turn);
+    CHECK(vg_heading_diff_deg(ny, yaw) < 0.5f && near_f(np, pitch, 0.5f) && moved, "launch Z yaw %.1f pitch %.1f", ny, np);
+    if (!failures) printf("PASS: the logged backwards throw (conversion right, the body faced away; body turned to the aim)\n");
+}
+
 int main(void) {
+    test_throw_logged_case();
+    test_throw_speed();
+    test_assist();
     test_rel_to_world();
     test_throw_launch();
     test_throw_ids();
+    test_throw_group();
     test_aim_in_world();
     test_turn();
     test_redirect();

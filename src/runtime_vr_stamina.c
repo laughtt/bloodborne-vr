@@ -59,6 +59,7 @@
 #include "hooks.h"
 #include "vr_stamina_tickets.h"
 #include "vr_hitbox.h"
+#include "vr_visceral.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h" /* BBXR_EV_*: the tickets for the VR UI's swing labels */
 #include <math.h>
 #include <stdio.h>
@@ -399,6 +400,11 @@ static void vs_hit(BbHookContext *ctx, uint32_t site, int kind, uint64_t rec, ui
     int32_t atk_id = -1, is_pc = -1;
     rd32(rec + 0x3C, &atk_id);
     rd32(rec + 0x40, &is_pc);
+    if (kind == 0 && vr_visceral_active() && vs_readable(rec + 0x180, 12)) { /* the visceral window's hit confirm (findings/41 7) */
+        float pt[3];
+        memcpy(pt, (const void *)(uintptr_t)(rec + 0x180), sizeof(pt));
+        if (isfinite(pt[0]) && isfinite(pt[1]) && isfinite(pt[2])) vr_visceral_note_hit(atk_id, pt);
+    }
     if (vrst_contact_pays(contact)) /* the hitbox overlay's hit markers (findings/29) */
         vr_hitbox_hit(contact == VRST_HIT_WALL ? 1 : contact == VRST_HIT_OBJ ? 2 : 0, atk_id, (uintptr_t)rec);
     const double now = vs_now();

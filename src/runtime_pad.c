@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#include "vr_visceral.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +148,13 @@ static void sample_host(PadData *d) {
     for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
     if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
     if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+    /* Mouse (only while the game window has the focus): left R1, right R2, middle R3 (lock-on). */
+    if (SDL_GetKeyboardFocus()) {
+        const SDL_MouseButtonFlags mb=SDL_GetMouseState(NULL,NULL);
+        if (mb & SDL_BUTTON_LMASK) d->buttons|=BTN_R1;
+        if (mb & SDL_BUTTON_RMASK) d->buttons|=BTN_R2;
+        if (mb & SDL_BUTTON_MMASK) d->buttons|=BTN_R3;
+    }
     if (d->buttons & BTN_L2) d->l2=255;
     if (d->buttons & BTN_R2) d->r2=255;
     d->left_x=(uint8_t)(128-(k[SDL_SCANCODE_A] ? 128 : 0)+(k[SDL_SCANCODE_D] ? 127 : 0));
@@ -307,6 +315,8 @@ static void sample(PadData *d) {
     sample_vr(d);
     /* VR UI (BB_VR_UI=1): the headset menus' choices as the game's own presses (d-pad, square). */
     d->buttons|=runtime_vr_ui_pad(d->buttons);
+    /* VR visceral (findings/41 7): R1 for a thrust / closeness after a parry-candidate shot. */
+    d->buttons|=vr_visceral_pad();
     if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
     record_sample(d);
     read_inject();

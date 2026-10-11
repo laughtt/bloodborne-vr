@@ -7,7 +7,7 @@
 //   BloodborneVR.exe                        the dashboard
 //   BloodborneVR.exe --web [args]           the web settings menu in a console window (old behaviour)
 //   BloodborneVR.exe --check / --reset ...  any launcher argument also runs the console launcher
-//   BloodborneVR.exe --screenshot FILE.png [--tab play|options|dlss|controls|about]   one frame, no START
+//   BloodborneVR.exe --screenshot FILE.png [--tab play|options|dlss|controls|online|about]   one frame, no START
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
@@ -249,6 +249,19 @@ struct App {
     int crash_base = -1;           // crash reports saved when the game was started (-1: no game started yet)
     std::string crash_new;         // path of the report saved by the session that just ended ("" = none / dismissed)
     std::string tab = "play";
+    json online = json::object();  // newest answer of `bbvr_cli.py online view` (UI thread owns it)
+    json online_incoming;
+    bool online_has_incoming = false, online_have = false;
+    std::string online_msg;        // result of the last create / join / leave
+    bool online_msg_bad = false;
+    double online_poll_at = -100;
+    char online_code[16] = "";
+    bool alpha_ack = false;         // OK pressed on the early-alpha notice (the state catches up a moment later)
+    char online_addr[160] = "";     // lobby address typed by the player (never shipped; saved with `online server`)
+    bool online_open = false;       // the Play tab shows the Play online step instead of the profiles
+    bool online_start = false;      // a host / join worked: start the game with the room
+    bool online_mode_seen = false;  // the remembered choice was applied once
+    std::string demo_flow;          // screenshots only: open | room | running | noserver
     std::string group = "display";
     bool advanced = false;
     bool quit_confirm = false;
@@ -299,6 +312,41 @@ static void cli_async(std::vector<std::string> args, std::string body = "")
     }).detach();
 }
 
+// Online tab: `bbvr_cli.py online <args>` (create | join CODE | leave | view). Anything but `view` is followed by a
+// `view`, whose answer fills the tab; the first answer's message (errors) is shown under the buttons.
+static void start_game(bool solo);
+static void online_async(std::vector<std::string> args, std::string then_mode = "")
+{
+    A.cli_busy++;
+    std::thread([args, then_mode] {
+        auto run = [](const std::vector<std::string>& a) {
+            std::string out;
+            std::vector<std::wstring> wa = {A.env.script_dir + L"\\bbvr_cli.py", L"online"};
+            for (auto& x : a) wa.push_back(W(x));
+            run_capture(A.env, wa, "", [&](const std::string& c) { out += c; });
+            try {
+                size_t brace = out.find('{');
+                return json::parse(out.substr(brace == std::string::npos ? 0 : brace));
+            } catch (...) {
+                return json{{"ok", false}, {"message", "The settings helper did not answer: " + out.substr(0, 200)}};
+            }
+        };
+        std::lock_guard<std::mutex> lock(A.cli_mu);
+        json first = run(args);
+        if (!then_mode.empty() && first.value("ok", false)) run({"mode", then_mode});  // remember Host / Join
+        json view = args[0] == "view" ? first : run({"view"});
+        std::lock_guard<std::mutex> l2(A.mu);
+        if (args[0] != "view") {
+            A.online_msg = first.value("ok", false) ? "" : (first.contains("message") && first["message"].is_string() ? first["message"].get<std::string>() : "That did not work.");
+            A.online_msg_bad = !A.online_msg.empty();
+            if (!then_mode.empty() && first.value("ok", false)) A.online_start = true;  // host / join worked: start the game
+        }
+        A.online_incoming = view;
+        A.online_has_incoming = true;
+        A.cli_busy--;
+    }).detach();
+}
+
 static std::string default_save_body(bool values)
 {
     json b = json::object();
@@ -307,7 +355,7 @@ static std::string default_save_body(bool values)
     return b.dump();
 }
 
-static void start_game()
+static void start_game(bool solo)
 {
     if (A.running || !A.env.ok) return;
     {
@@ -324,7 +372,7 @@ static void start_game()
     A.job = make_job();
     HANDLE job = A.job;
     std::string game = A.st.value("app", json::object()).value("game_dir", "");
-    std::thread([body, job, game] {
+    std::thread([body, job, game, solo] {
         {  // the launcher reads the saved settings: make sure the last edit is on disk first
             std::lock_guard<std::mutex> lock(A.cli_mu);
             std::string ignore;
@@ -332,6 +380,7 @@ static void start_game()
         }
         log_add("Starting. Put the headset on when the game says so.\n");
         std::vector<std::wstring> args = {A.env.script_dir + L"\\bbvr_launcher.py", L"--no-menu"};
+        if (solo) args.push_back(L"--solo");  // Play solo: online off even when a room is saved
         if (!game.empty()) {
             args.push_back(L"--game-dir");
             args.push_back(W(game));
@@ -867,6 +916,168 @@ static void draw_options_list(const std::string& group, bool dlss_tab)
 // ---------------------------------------------------------------------------------------------
 // tabs
 
+// ---- Play online / Play solo (the start flow) ------------------------------------------------------------------
+// Play solo starts the launcher with --solo. Play online opens a step: Host a game (creates a room, shows the code,
+// starts the game as the host), Join a friend (code, joins, starts as a guest), or - already in a room - Start / Leave.
+// The code stays on the Play tab, big, with a Copy button, for as long as the room lasts.
+
+static bool online_in_room() { return A.online.value("in_room", false) && !A.online.value("closed", false); }
+static bool online_no_server() { return A.online_have && A.online.value("error", "") == "no_server"; }
+
+static void poll_online()
+{
+    if (A.cli_busy == 0 && ImGui::GetTime() - A.online_poll_at > 3.0) {
+        A.online_poll_at = ImGui::GetTime();
+        online_async({"view"});
+    }
+}
+
+static void copy_code_button(const std::string& code, float w)
+{
+    if (Button("Copy code", ImVec2(w, S(34)), true)) {
+        ImGui::SetClipboardText(code.c_str());
+        std::lock_guard<std::mutex> lock(A.mu);
+        A.online_msg = "Code copied.";
+        A.online_msg_bad = false;
+    }
+}
+
+static void big_code(const std::string& code, float size)
+{
+    ImGui::PushFont(F_MONO, S(size));
+    ImGui::PushStyleColor(ImGuiCol_Text, CV(TEXT));
+    ImGui::TextUnformatted(code.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+}
+
+// The lobby address is a setting, never shipped: ask for it where the room is created / joined.
+static void lobby_address_field(bool busy)
+{
+    MutedWrapped("Your host's lobby address (once). Ask them for it.", 13);
+    ImGui::SetNextItemWidth(S(230));
+    ImGui::InputTextWithHint("##lobby", "http://address:port", A.online_addr, sizeof(A.online_addr), ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::SameLine();
+    if (busy || !A.online_addr[0]) ImGui::BeginDisabled();
+    if (Button("Save", ImVec2(S(80), S(32)), true)) online_async({"server", A.online_addr});
+    if (busy || !A.online_addr[0]) ImGui::EndDisabled();
+}
+
+static void online_messages()
+{
+    std::lock_guard<std::mutex> lock(A.mu);
+    if (!A.online_msg.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, CV(A.online_msg_bad ? ACCENT : GREEN));
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(A.online_msg.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+}
+
+static void online_start_card(ImVec2 size, bool ready)
+{
+    const bool busy = A.cli_busy > 0;
+    const json& v = A.online;
+    const std::string step = jstr(A.st.value("app", json::object()), "online_step", "host");
+    if (BeginCard("onlinestart", size)) {
+        Heading("Play online");
+        if (online_in_room()) {
+            std::string code = jstr(v, "code");
+            big_code(code, 40);
+            MutedWrapped(jstr(v, "role") == "host" ? "You host this room. Give the code to up to two friends." : "You are a guest in this room.", 13);
+            ImGui::Dummy(ImVec2(0, S(6)));
+            copy_code_button(code, S(120));
+            ImGui::SameLine();
+            if (busy) ImGui::BeginDisabled();
+            if (Button(jstr(v, "role") == "host" ? "Close room" : "Leave", ImVec2(S(110), S(34)), false, true)) online_async({"leave"});
+            if (busy) ImGui::EndDisabled();
+            ImGui::Dummy(ImVec2(0, S(8)));
+            if (!ready) ImGui::BeginDisabled();
+            ImGui::PushFont(F_SEMI, S(18));
+            if (Button("Start with this room", ImVec2(-FLT_MIN, S(46)), true) && ready) start_game(false);
+            ImGui::PopFont();
+            if (!ready) ImGui::EndDisabled();
+        } else if (online_no_server()) {
+            lobby_address_field(busy);
+        } else {
+            if (!ready) ImGui::BeginDisabled();
+            if (busy) ImGui::BeginDisabled();
+            if (Button("Host a game", ImVec2(-FLT_MIN, S(44)), step != "join")) online_async({"create"}, "host");
+            if (busy) ImGui::EndDisabled();
+            if (!ready) ImGui::EndDisabled();
+            MutedWrapped("Opens a room and shows its code. Friends join with it.", 12);
+            ImGui::Dummy(ImVec2(0, S(8)));
+            Heading("Join a friend");
+            ImGui::SetNextItemWidth(S(150));
+            ImGui::PushFont(F_MONO, S(20));
+            ImGui::InputTextWithHint("##startcode", "K7Q-M4X", A.online_code, sizeof(A.online_code), ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+            ImGui::PopFont();
+            ImGui::SameLine();
+            bool off = busy || !ready || !A.online_code[0];
+            if (off) ImGui::BeginDisabled();
+            if (Button("Join", ImVec2(S(80), S(34)), step == "join")) online_async({"join", A.online_code}, "join");
+            if (off) ImGui::EndDisabled();
+        }
+        if (busy) Muted("Working...");
+        online_messages();
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() - S(48));
+        if (Button("Back", ImVec2(S(80), S(32)), false, true)) A.online_open = false;
+    }
+    EndCard();
+}
+
+// While a room exists the code stays on the Play tab (also while the game runs).
+static void room_code_card(ImVec2 size)
+{
+    if (BeginCard("roomcode", size)) {
+        Heading(jstr(A.online, "role") == "host" ? "Your room (host)" : "Your room (guest)");
+        std::string code = jstr(A.online, "code");
+        big_code(code, 34);
+        ImGui::SameLine(0, S(14));
+        copy_code_button(code, S(110));
+        int n = (int)A.online.value("members", json::array()).size();
+        if (n > 0) Muted((std::to_string(n) + " of " + std::to_string(A.online.value("max", 3)) + " in the room").c_str());
+    }
+    EndCard();
+}
+
+// Play tab, under the profile cards: "Low fps? Try Performance" on a PC without an RTX GPU, and the 3D / Flat screen
+// (mono) choice. The mode is the Stereo mode option; it is saved through the same bbvr_cli save path as every option
+// (so the profile becomes Custom, which keeps all the other values).
+static void play_view_row(const std::string& cur)
+{
+    const json caps = A.st.value("caps", json::object());
+    bool any_rtx = false;
+    for (const json& g : caps.value("gpus", json::array())) any_rtx |= g.value("rtx", false);
+    if (!any_rtx && cur != "Performance") {
+        ImGui::PushStyleColor(ImGuiCol_Text, CV(AMBER));
+        ImGui::PushFont(F_REG, S(13));
+        ImGui::TextUnformatted("Low fps? Try Performance.");
+        ImGui::PopFont();
+        ImGui::PopStyleColor();
+    }
+    if (!A.st.contains("values")) return;
+    const std::string mode = jstr(A.st["values"], "mode", "alt");
+    ImGui::PushFont(F_SEMI, S(15));
+    ImGui::TextUnformatted("View");
+    ImGui::PopFont();
+    const struct { const char* label; const char* value; } choices[] = {{"3D", "alt"}, {"Flat screen (mono)", "mono"}};
+    float w = (ImGui::GetContentRegionAvail().x - S(8)) / 2;
+    for (int i = 0; i < 2; i++) {
+        if (i) ImGui::SameLine(0, S(8));
+        if (Button(choices[i].label, ImVec2(w, S(32)), mode == choices[i].value) && mode != choices[i].value) {
+            json vals = A.st["values"];
+            vals["mode"] = choices[i].value;
+            json b = {{"values", vals}, {"game_running", A.running.load()}};
+            A.dirty = false;
+            cli_async({"save"}, b.dump());
+            A.st["values"]["mode"] = choices[i].value;
+            A.st["profile"] = "Custom";
+        }
+    }
+}
+
 static void tab_play(ImVec2 avail)
 {
     float gap = S(16);
@@ -910,7 +1121,29 @@ static void tab_play(ImVec2 avail)
     ImGui::SameLine(0, gap);
     ImGui::BeginGroup();
     float btn_h = S(58);
-    if (BeginCard("profiles", ImVec2(right_w, avail.y - btn_h - S(52)))) {
+    const bool play_online = A.have_state && A.st.value("app", json::object()).value("online_play", true);
+    if (A.online_start && !A.running) {  // Host a game / Join a friend worked
+        A.online_start = false;
+        start_game(false);
+    }
+    if (g_demo && A.demo_flow == "noserver" && !A.online_have) {
+        A.online = json{{"ok", false}, {"error", "no_server"}};
+        A.online_have = true;
+    }
+    if (play_online && !A.online_mode_seen) {  // the last choice is remembered: online players land on the online step
+        A.online_mode_seen = true;
+        A.online_open = A.st.value("app", json::object()).value("play_mode", "solo") == "online";
+    }
+    if (!A.online_have) poll_online();
+    const bool room_up = play_online && online_in_room();
+    if (play_online && (A.online_open || room_up)) poll_online();
+    const float room_h = (room_up && (!A.online_open || A.running)) ? S(120) : 0;
+    const float below = A.running ? btn_h + S(52) : (play_online ? 2 * btn_h + S(64) : btn_h + S(52));
+    if (A.online_open && !A.running) {
+        const json app0 = A.st.value("app", json::object());
+        online_start_card(ImVec2(right_w, avail.y), app0.value("eboot", false) && app0.value("accepted", false) && A.env.ok);
+    } else {
+    if (BeginCard("profiles", ImVec2(right_w, avail.y - below - room_h - (room_h > 0 ? S(8) : 0)))) {
         Heading("Profile");
         std::string cur = jstr(A.st, "profile", "Default");
         const json notes = A.st.value("profile_notes", json::object());
@@ -921,7 +1154,8 @@ static void tab_play(ImVec2 avail)
                 if (p == "Custom" && cur != "Custom") continue;
                 n++;
             }
-            float ch = std::min(S(88), (ImGui::GetContentRegionAvail().y - (n - 1) * ImGui::GetStyle().ItemSpacing.y - S(6)) / std::max(n, 1));
+            const float view_h = S(84);  // the hint and the 3D / Flat screen row under the cards
+            float ch = std::min(S(88), (ImGui::GetContentRegionAvail().y - view_h - (n - 1) * ImGui::GetStyle().ItemSpacing.y - S(6)) / std::max(n, 1));
             for (auto& pj : A.st["profiles"]) {
                 std::string p = pj.get<std::string>();
                 if (p == "Custom" && cur != "Custom") continue;
@@ -947,21 +1181,40 @@ static void tab_play(ImVec2 avail)
                 dl->AddText(F_REG, S(13), ImVec2(pos.x + S(14), pos.y + S(32)), C(MUTED), note.c_str(), nullptr, cw - S(48));
                 ImGui::PopID();
             }
+            play_view_row(cur);
         }
     }
     EndCard();
-
+    if (room_h > 0) {
+        ImGui::Dummy(ImVec2(0, S(2)));
+        room_code_card(ImVec2(right_w, room_h));
+    }
+    }
     const json app = A.st.value("app", json::object());
     bool ready = app.value("eboot", false) && app.value("accepted", false) && A.env.ok;
-    ImGui::Dummy(ImVec2(0, S(2)));
-    if (A.running) {
-        if (Button("Stop the game", ImVec2(right_w, btn_h), false, true)) stop_game();
-    } else {
-        if (!ready) ImGui::BeginDisabled();
-        ImGui::PushFont(F_SEMI, S(21));
-        if (Button("START VR", ImVec2(right_w, btn_h), true) && ready) start_game();
-        ImGui::PopFont();
-        if (!ready) ImGui::EndDisabled();
+    const bool last_online = app.value("play_mode", "solo") == "online";
+    if (!(A.online_open && !A.running)) {
+        ImGui::Dummy(ImVec2(0, S(2)));
+        if (A.running) {
+            if (Button("Stop the game", ImVec2(right_w, btn_h), false, true)) stop_game();
+        } else if (!play_online) {
+            if (!ready) ImGui::BeginDisabled();
+            ImGui::PushFont(F_SEMI, S(21));
+            if (Button("START VR", ImVec2(right_w, btn_h), true) && ready) start_game(false);
+            ImGui::PopFont();
+            if (!ready) ImGui::EndDisabled();
+        } else {
+            if (!ready) ImGui::BeginDisabled();
+            ImGui::PushFont(F_SEMI, S(21));
+            if (Button("Play solo", ImVec2(right_w, btn_h), !last_online) && ready) {
+                A.st["app"]["play_mode"] = "solo";
+                online_async({"mode", "solo"});
+                start_game(true);
+            }
+            if (Button("Play online", ImVec2(right_w, btn_h), last_online)) A.online_open = true;
+            ImGui::PopFont();
+            if (!ready) ImGui::EndDisabled();
+        }
     }
     if (A.running) Muted("The game is running. Put the headset on.");
     else if (!A.env.ok) Muted(A.env.problem.substr(0, 80).c_str());
@@ -1085,6 +1338,143 @@ static void tab_dlss(ImVec2 avail)
     EndCard();
 }
 
+static unsigned online_state_color(const std::string& st)
+{
+    if (st == "in world") return GREEN;
+    if (st == "sign up") return AMBER;
+    if (st == "host") return ACCENT;
+    return MUTED;
+}
+
+static std::string online_bell_text(const json& b, bool in_room)
+{
+    if (!in_room) return "";
+    if (!b.is_object() || b.empty()) return "Not running. It starts with the game, which rings your bell by itself.";
+    std::string state = jstr(b, "state");
+    static const struct { const char* id; const char* text; } names[] = {
+        {"waiting_for_world", "waiting until your character is in the world"}, {"bell_missing", "the bell is not in your inventory"},
+        {"ready", "ready to ring"}, {"ringing", "ringing now"}, {"room_full", "room is full, resting"},
+        {"room_closed", "the room closed"}, {"sign_up", "your sign is up, waiting for the host"},
+        {"summoned", "you are in the host's world"}, {"off", "off"}};
+    for (auto& n : names)
+        if (state == n.id) state = n.text;
+    std::string t = "Auto-bell: " + state + ".  Rings so far: " + std::to_string(b.value("rings", 0));
+    double next = b.value("next_ring_in_s", 0.0);
+    if (next > 1 && jstr(b, "state") == "ready") t += ".  Next ring in " + std::to_string((int)next) + " s";
+    return t;
+}
+
+static void tab_online(ImVec2 avail)
+{
+    const bool busy = A.cli_busy > 0;
+    const json& v = A.online;
+    const bool in_room = v.value("in_room", false);
+    float gap = S(16), lw = std::floor((avail.x - gap) * 0.5f);
+    ImGui::BeginGroup();
+    if (BeginCard("room", ImVec2(lw, avail.y))) {
+        if (!A.online_have) {
+            Muted("Reading the room state...");
+        } else if (!v.value("ok", true) || (v.contains("error") && !v.contains("in_room"))) {
+            Heading("Room");
+            MutedWrapped(online_no_server() ? "No lobby address yet. Enter it once (your host gives it to you)." : jstr(v, "message", "The room server is not reachable."), 14);
+            if (online_no_server()) lobby_address_field(busy);
+        } else if (in_room) {
+            Heading("Room code");
+            std::string code = jstr(v, "code");
+            ImGui::PushFont(F_MONO, S(46));
+            ImGui::PushStyleColor(ImGuiCol_Text, CV(TEXT));
+            ImGui::TextUnformatted(code.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+            MutedWrapped(jstr(v, "role") == "host" ? "You are the host. Give this code to your friends." : "You are a guest in this room.", 14);
+            ImGui::Dummy(ImVec2(0, S(6)));
+            if (Button("Copy code", ImVec2(S(130), S(36)), true)) {
+                ImGui::SetClipboardText(code.c_str());
+                std::lock_guard<std::mutex> lock(A.mu);
+                A.online_msg = "Code copied.";
+                A.online_msg_bad = false;
+            }
+            ImGui::SameLine();
+            if (busy) ImGui::BeginDisabled();
+            if (Button(jstr(v, "role") == "host" ? "Close room" : "Leave room", ImVec2(S(150), S(36)), false, true)) online_async({"leave"});
+            if (busy) ImGui::EndDisabled();
+            ImGui::Dummy(ImVec2(0, S(10)));
+            if (v.value("closed", false)) MutedWrapped("The room has closed.", 14);
+        } else {
+            Heading("Join a room");
+            MutedWrapped("Type the code your host gave you, like K7Q-M4X.", 14);
+            ImGui::Dummy(ImVec2(0, S(4)));
+            ImGui::SetNextItemWidth(S(190));
+            ImGui::PushFont(F_MONO, S(22));
+            ImGui::InputTextWithHint("##code", "K7Q-M4X", A.online_code, sizeof(A.online_code), ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+            ImGui::PopFont();
+            ImGui::SameLine();
+            if (busy || !A.online_code[0]) ImGui::BeginDisabled();
+            if (Button("Join", ImVec2(S(100), S(36)), true)) online_async({"join", A.online_code});
+            if (busy || !A.online_code[0]) ImGui::EndDisabled();
+            ImGui::Dummy(ImVec2(0, S(14)));
+            Heading("Or host one");
+            MutedWrapped("Open a room and give its code to up to two friends.", 14);
+            ImGui::Dummy(ImVec2(0, S(4)));
+            if (busy) ImGui::BeginDisabled();
+            if (Button("Create room", ImVec2(S(150), S(36)), false, true)) online_async({"create"});
+            if (busy) ImGui::EndDisabled();
+            if (v.value("closed", false)) {
+                ImGui::Dummy(ImVec2(0, S(8)));
+                MutedWrapped("Your last room closed" + (jstr(v, "reason").empty() ? std::string(".") : " (" + jstr(v, "reason") + ")."), 14);
+            }
+        }
+        if (busy) {
+            ImGui::Dummy(ImVec2(0, S(6)));
+            Muted("Working...");
+        }
+        {
+            std::lock_guard<std::mutex> lock(A.mu);
+            if (!A.online_msg.empty()) {
+                ImGui::Dummy(ImVec2(0, S(6)));
+                ImGui::PushStyleColor(ImGuiCol_Text, CV(A.online_msg_bad ? ACCENT : GREEN));
+                ImGui::PushTextWrapPos(0);
+                ImGui::TextUnformatted(A.online_msg.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+    EndCard();
+    ImGui::EndGroup();
+    ImGui::SameLine(0, gap);
+    if (BeginCard("members", ImVec2(avail.x - lw - gap, avail.y))) {
+        Heading("Members");
+        if (!in_room) {
+            MutedWrapped("Nobody yet. Create or join a room to see who is in it.", 14);
+        } else {
+            int i = 0;
+            for (const json& m : v.value("members", json::array())) {
+                ImGui::PushID(i++);
+                std::string st = jstr(m, "state", "waiting");
+                ImVec2 start = ImGui::GetCursorPos();
+                Dot(online_state_color(st));
+                ImGui::SetCursorPos(ImVec2(start.x + S(24), start.y));
+                ImGui::PushFont(F_SEMI, S(15));
+                std::string name = jstr(m, "name", "?") + (m.value("you", false) ? " (you)" : "");
+                ImGui::TextUnformatted(name.c_str());
+                ImGui::PopFont();
+                ImGui::SetCursorPos(ImVec2(start.x + S(24), start.y + S(22)));
+                std::string line = st == "host" ? "host" : st == "in world" ? "in the host's world" : st == "sign up" ? "sign is up, waiting to be summoned" : "waiting (no sign yet)";
+                MutedWrapped(line, 13);
+                ImGui::Dummy(ImVec2(0, S(8)));
+                ImGui::PopID();
+            }
+            ImGui::Dummy(ImVec2(0, S(6)));
+            Heading("Auto-bell");
+            MutedWrapped(online_bell_text(v.value("bell", json::object()), true), 14);
+            std::string err = v.contains("bell") && v["bell"].is_object() ? jstr(v["bell"], "last_error") : "";
+            if (!err.empty()) MutedWrapped("Last problem: " + err, 13);
+        }
+    }
+    EndCard();
+}
+
 static void tab_controls(ImVec2 avail)
 {
     static const char* rows[][2] = {
@@ -1097,7 +1487,11 @@ static void tab_controls(ImVec2 avail)
         {"Left trigger (hold)", "Hold the gun (L2)"},
         {"Left-hand thrust forward (gun held)", "Shoot"},
         {"Left grip (squeeze)", "L1 (transform)"},
-        {"A / B / X / Y", "Circle (dodge, sprint) / Cross (interact) / Square (use quick item) / Triangle (blood vial)"},
+        {"A (right)", "Swap the right-hand weapon"},
+        {"B (right)", "Roll / dodge, hold to sprint"},
+        {"X (left)", "Swap the left-hand weapon"},
+        {"Y (left)", "Interact (doors, pickups, ladders)"},
+        {"Heal", "From the quick wheel, or bring a held Blood Vial to your mouth"},
         {"Right stick click (tap)", "Open the item wheel: pick with your right hand (touch or point) or the stick"},
         {"Left stick click while standing", "Open the VR dashboard (equipment, items, options)"},
         {"Left stick click while moving", "Jump"},
@@ -1231,8 +1625,9 @@ static void prompts()
     if (!A.have_state) return;
     const json app = A.st.value("app", json::object());
     bool need_legal = !app.value("accepted", false);
+    bool need_alpha = !need_legal && app.value("alpha_notice", false) && !A.alpha_ack;
     bool quit = A.quit_confirm;
-    const char* which = need_legal ? "Welcome" : (quit ? "Quit" : nullptr);
+    const char* which = need_legal ? "Welcome" : (need_alpha ? "Early alpha" : (quit ? "Quit" : nullptr));
     if (!which) return;
     ImGui::OpenPopup(which);
     centered_popup(which, ImVec2(S(560), 0));
@@ -1246,9 +1641,18 @@ static void prompts()
         if (need_legal) {
             ImGui::TextUnformatted(LEGAL);
             ImGui::Dummy(ImVec2(0, S(6)));
-            ImGui::TextUnformatted("Single-player alpha. Free software under the GPL. If the game crashes, a report is saved on this PC (the About tab shows where); nothing is ever sent automatically.");
+            ImGui::TextUnformatted("Early alpha with co-op (up to 3 players). Free software under the GPL. If the game crashes, a report is saved on this PC (the About tab shows where); nothing is ever sent automatically.");
             ImGui::Dummy(ImVec2(0, S(10)));
             if (Button("I own a legal copy of Bloodborne - continue", ImVec2(-1, S(44)), true)) cli_async({"accept"});
+        } else if (need_alpha) {
+            ImGui::TextUnformatted("Early alpha: many bugs, crashes are possible, please be patient.");
+            ImGui::Dummy(ImVec2(0, S(6)));
+            ImGui::TextUnformatted("If the game crashes, the report stays on this PC (the About tab shows where); it is never uploaded. To report a bug, see README.txt. This note shows once per version.");
+            ImGui::Dummy(ImVec2(0, S(10)));
+            if (Button("OK", ImVec2(-1, S(44)), true)) {
+                A.alpha_ack = true;
+                cli_async({"alpha-ack"});
+            }
         } else {
             ImGui::TextUnformatted("The game is running. Quitting the dashboard stops it. Quit anyway?");
             ImGui::Dummy(ImVec2(0, S(10)));
@@ -1309,10 +1713,12 @@ static void draw_ui(float w, float h)
     dl->AddText(F_REG, S(14), ImVec2(px - S(16) - vz.x, S(32) - vz.y * 0.5f), C(MUTED), ver.c_str());
 
     // tabs
-    static const struct { const char* id; const char* label; } tabs[] = {{"play", "Play"}, {"options", "Options"}, {"dlss", "DLSS"}, {"controls", "Controls"}, {"about", "About"}};
+    static const struct { const char* id; const char* label; } tabs[] = {{"play", "Play"}, {"options", "Options"}, {"dlss", "DLSS"}, {"controls", "Controls"}, {"online", "Online"}, {"about", "About"}};
+    const bool show_online = A.have_state && (!A.st.value("app", json::object()).value("public", false) || A.st.value("app", json::object()).value("online_play", true));
     float x = mx;
     ImGui::SetCursorPos(ImVec2(0, 0));
     for (auto& t : tabs) {
+        if (std::string(t.id) == "online" && !show_online) continue;
         ImVec2 sz = F_SEMI->CalcTextSizeA(S(16), FLT_MAX, 0, t.label);
         float bw = sz.x + S(32);
         ImGui::SetCursorScreenPos(ImVec2(x, S(70)));
@@ -1362,7 +1768,13 @@ static void draw_ui(float w, float h)
     else if (A.tab == "options") tab_options(avail);
     else if (A.tab == "dlss") tab_dlss(avail);
     else if (A.tab == "controls") tab_controls(avail);
-    else tab_about(avail);
+    else if (A.tab == "online" && show_online) {
+        if (ImGui::GetTime() - A.online_poll_at > 3.0 && A.cli_busy == 0) {  // the room changes under us: look again
+            A.online_poll_at = ImGui::GetTime();
+            online_async({"view"});
+        }
+        tab_online(avail);
+    } else tab_about(avail);
     ImGui::EndChild();
 
     {  // toast for folder errors etc.
@@ -1383,14 +1795,27 @@ static void draw_ui(float w, float h)
 static void pump_state()
 {
     std::lock_guard<std::mutex> lock(A.mu);
+    if (A.online_has_incoming) {
+        A.online = A.online_incoming;
+        A.online_has_incoming = false;
+        A.online_have = true;
+        if (g_demo && (A.tab == "online" || A.demo_flow == "room" || A.demo_flow == "running")) {  // screenshots only
+            A.online = json::parse(R"({"ok":true,"in_room":true,"code":"K7Q-M4X","role":"host","closed":false,"members":[
+                {"name":"Hunter","role":"host","state":"host","you":true},{"name":"Friend A","role":"guest","state":"in world"},
+                {"name":"Friend B","role":"guest","state":"sign up"}],"bell":{"state":"ready","rings":2,"next_ring_in_s":48}})");
+        }
+    }
     if (A.has_incoming && !A.dirty) {
         A.st = A.incoming;
         A.has_incoming = false;
         A.have_state = true;
         if (g_demo) {  // screenshots only: pretend the first-run steps are done (nothing is written)
             A.st["app"]["accepted"] = true;
+            A.st["app"]["alpha_notice"] = false;
             A.st["app"]["eboot"] = true;
             A.st["app"]["game_dir"] = R"(C:\Dumps\Bloodborne\CUSA03173)";
+            if (!A.demo_flow.empty()) A.st["app"]["play_mode"] = "online";
+            if (A.demo_flow == "running") A.running = true;
         }
         const json cr = A.st.value("crash", json::object());
         if (!A.running && A.crash_base >= 0 && cr.value("count", 0) > A.crash_base) {  // the session that just ended crashed
@@ -1432,6 +1857,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         else if (args[i] == L"--group" && i + 1 < args.size()) A.group = U8(args[++i]);
         else if (args[i] == L"--advanced") A.advanced = true;
         else if (args[i] == L"--demo") g_demo = true;
+        else if (args[i] == L"--flow" && i + 1 < args.size()) A.demo_flow = U8(args[++i]);  // screenshots: open | room | running | noserver
         else passthrough.push_back(args[i]);
     }
     if (web || !passthrough.empty()) {  // any launcher argument: the console launcher with the web menu

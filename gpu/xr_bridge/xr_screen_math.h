@@ -448,6 +448,98 @@ inline float HeadAngleToScreen(const HeadSample& head, const Pose& screen) {
 
 constexpr float kFollowDegrees = 60.0f;
 
+/// A head the cinema screen may follow: oriented, positioned and finite, however far the runtime's
+/// space origin is (Plausible() also rejects Pimax's real head 9 to 25 m from its LOCAL origin, so
+/// a screen placed there by Placer (Steady) was never put in front of the user again).
+inline bool Usable(const HeadSample& head) {
+    return head.oriented && head.positioned && IsFinite(head.pose.position);
+}
+
+/// Normalized lerp from a to b (t in 0..1), on the same hemisphere.
+inline Quat NlerpT(Quat a, Quat b, float t) {
+    const float sign = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0.0f ? -1.0f : 1.0f;
+    const Quat q{a.x + t * (sign * b.x - a.x), a.y + t * (sign * b.y - a.y),
+                 a.z + t * (sign * b.z - a.z), a.w + t * (sign * b.w - a.w)};
+    const float length = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return length > 1e-6f ? Quat{q.x / length, q.y / length, q.z / length, q.w / length} : a;
+}
+
+/// The cinema screen while the flat image is what the user sees (menus, loading, summon, bell):
+///   - Show: it just became the visible layer after the 3D view. With recenter_on_show it is put
+///     in front of the head at once (head yaw only, level, same distance), whatever it was before.
+///   - Tick (every frame while it shows): world-locked (the pose does not change) until the head
+///     has faced more than follow_deg away from it for follow_seconds; then it glides to the front
+///     of the head over glide_seconds (lazy follow). follow_deg <= 0: never.
+///   - Hide: the 3D view is back; forgets the timers.
+/// Pure logic: the caller feeds the head each frame and takes `*screen` back.
+class CinemaFollow {
+public:
+    struct Config {
+        bool recenter_on_show = true;
+        float follow_deg = kFollowDegrees;
+        double follow_seconds = 1.0;
+        double glide_seconds = 0.6;
+    };
+
+    /// Returns true when the screen was moved (snapped in front of the head).
+    bool Show(const Config& cfg, const HeadSample& head, float distance, Pose* screen) {
+        away_since_ = -1.0;
+        gliding_ = false;
+        if (!cfg.recenter_on_show || !Usable(head)) {
+            return false;
+        }
+        *screen = PlaceScreen(head.pose.position, head.pose.orientation, distance);
+        return true;
+    }
+
+    void Hide() {
+        away_since_ = -1.0;
+        gliding_ = false;
+    }
+
+    /// Returns true when a glide starts this call (for a log line).
+    bool Tick(double now, const Config& cfg, const HeadSample& head, float distance,
+              Pose* screen) {
+        if (gliding_) {
+            const double u = std::clamp((now - glide_at_) / cfg.glide_seconds, 0.0, 1.0);
+            const float s = float(u * u * (3.0 - 2.0 * u));
+            screen->orientation = NlerpT(from_.orientation, to_.orientation, s);
+            screen->position = Add(from_.position,
+                                   Scale(Sub(to_.position, from_.position), s));
+            if (u >= 1.0) {
+                gliding_ = false;
+                away_since_ = -1.0;
+            }
+            return false;
+        }
+        if (cfg.follow_deg <= 0.0f || !Usable(head) ||
+            HeadAngleToScreen(head, *screen) <= cfg.follow_deg) {
+            away_since_ = -1.0;
+            return false;
+        }
+        if (away_since_ < 0.0) {
+            away_since_ = now;
+        }
+        if (now - away_since_ < cfg.follow_seconds) {
+            return false;
+        }
+        from_ = *screen;
+        to_ = PlaceScreen(head.pose.position, head.pose.orientation, distance);
+        glide_at_ = now;
+        gliding_ = true;
+        return true;
+    }
+
+    bool Gliding() const {
+        return gliding_;
+    }
+
+private:
+    double away_since_ = -1.0, glide_at_ = 0.0;
+    bool gliding_ = false;
+    Pose from_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}, to_ = from_;
+};
+
 /// The flat screen just reappeared after the 3D view: place it again in front of the user? Only
 /// with a plausible head, when following is on and (always, or the head faces more than
 /// kFollowDegrees away from the screen).
