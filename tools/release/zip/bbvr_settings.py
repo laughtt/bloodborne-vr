@@ -173,7 +173,7 @@ def _build_schema():
     a(_o('item_wheel', 'ui', 'Item wheel (hold the right stick click)', 'bool', ('ui', 'active'), True,
          help='The quick wheel on the right stick click hold, next to the dashboard and the wrist counters.'))
     a(_o('lock_on', 'ui', 'Right stick click locks on', 'bool', ('ui', 'lock_on'), False, live_ui=True))
-    a(_o('r3_hold', 'ui', 'Hold time for the item wheel (s)', 'float', ('ui', 'r3_hold_s'), 0.5, min=0.15, max=3.0, step=0.05))
+    a(_o('r3_hold', 'ui', 'Hold time for the item wheel (s)', 'float', ('ui', 'r3_hold_s'), 0.15, min=0.1, max=3.0, step=0.05))
     a(_o('hud_head', 'ui', 'HUD follows your head', 'bool', ('ui', 'hud.head'), False))
     a(_o('hud_wrist', 'ui', 'Wrist HUD', 'bool', ('ui', 'hud.wrist'), True))
     a(_o('hud_distance', 'ui', 'HUD distance (m)', 'float', ('ui', 'hud.distance'), 0.9, min=0.2, max=5.0, step=0.05))
