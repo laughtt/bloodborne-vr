@@ -119,13 +119,16 @@ def lobby_info(config=None):
 
 
 def online_identity(name=None):
-    """Account name for this install, created on first use: <Name>_<4 random>, kept in user/online_identity.json."""
+    """Account for this install, created on first use: <Name>_<4 random> plus a random password (the game only
+    logs in to shadNet with both), kept in user/online_identity.json."""
     path = _user_dir() / 'online_identity.json'
     ident = _read_json(path)
     if not re.fullmatch(r'[A-Za-z0-9_-]{3,16}', str(ident.get('npid', ''))):
         base = re.sub(r'[^A-Za-z0-9]', '', name or os.environ.get('USERNAME') or os.environ.get('USER') or 'Hunter')[:10] or 'Hunter'
         base = base.ljust(3, 'x')
         ident = {'npid': base + '_' + ''.join(secrets.choice('23456789ABCDEFGHJKMNPQRSTUVWXYZ') for _ in range(4))}
+    if not ident.get('password'):
+        ident['password'] = secrets.token_urlsafe(12)  # also fills in identities made before alpha8 (name only)
         _write_json(path, ident)
     return ident
 

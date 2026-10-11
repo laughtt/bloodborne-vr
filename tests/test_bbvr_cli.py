@@ -192,6 +192,21 @@ class OnlineCliTests(CliTests):
         (self.port / 'defaults').mkdir(exist_ok=True)
         (self.port / 'defaults' / 'release.json').write_text(json.dumps({'default_lobby': url}))
 
+    def test_room_game_gets_a_password(self):
+        # the game skips the shadNet login without BB_SHADNET_PASSWORD; an alpha7 identity (name only) is filled in
+        self._write_default(self.url)
+        user = self.port / 'user'
+        user.mkdir(exist_ok=True)
+        (user / 'online_identity.json').write_text(json.dumps({'npid': 'Old_2222'}))
+        with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
+            self.assertTrue(bbvr_cli.run(['online', 'create'])['ok'])
+            ident = json.loads((user / 'online_identity.json').read_text())
+            self.assertEqual(ident['npid'], 'Old_2222')
+            self.assertGreaterEqual(len(ident['password']), 12)
+            env = S.online_env({}, {}, user, public=True, port=self.port)
+        self.assertEqual(env['BB_SHADNET_NPID'], 'Old_2222')
+        self.assertEqual(env['BB_SHADNET_PASSWORD'], ident['password'])
+
     def test_default_lobby_used_when_unset(self):
         self._write_default(self.url)
         with mock.patch.dict('os.environ', {'BBVR_LOBBY_URL': ''}):
