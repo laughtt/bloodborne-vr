@@ -814,7 +814,8 @@ bool PipelineCache::RefreshComputeKey() {
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding,
+                                              std::vector<u32>* deferred_spv) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -835,13 +836,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
         DebugState.CollectShader(name, info.sw_stage, module, spv, code,
                                  patch ? *patch : std::span<const u32>{}, is_patched);
+    }
+    if (deferred_spv) {
+        *deferred_spv = std::move(spv);
+    } else {
+        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
     }
     return module;
 }
@@ -955,7 +959,12 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         const auto start = binding;
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        // bbport: the binary is stored only with its meta (below). A stereo permutation with its
+        // own Info has no meta in the disk cache; its SPIR-V stored at this index used to be
+        // paired, in a later session, with another permutation's meta of the same index (other
+        // resource bindings): misbound draws, NaN in the post chain, a white screen in stereo.
+        std::vector<u32> spv;
+        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding, &spv);
 
         // bbport (VR Phase 4): permutations share the program's Info, which describes the
         // resources of the first one. A stereo permutation adds a StereoView buffer, so in
@@ -967,6 +976,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             binding = start; // AddBindings below
         } else {
             RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+            RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
         }
         std::unique_lock lk{programs_mutex};
         program->AddPermut(module, std::move(spec));

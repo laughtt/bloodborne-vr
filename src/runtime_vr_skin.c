@@ -18,6 +18,7 @@
  * PlayerIns object and one level of pointers (BB_USER_NAME on the local player teaches the offset). */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "vr_mem_cache.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
 #include "vr_hitbox.h"
 #include "vr_skin.h"
@@ -85,24 +86,9 @@ typedef struct {
 } SkGuard;
 
 static int sk_readable(SkGuard *g, uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const double now = sk_now();
-    if (now - g->t > 1.0) { g->n = 0; g->t = now; }
-    for (int i = 0; i < g->n; ++i)
-        if (g->lo[i] <= a && a + n <= g->hi[i]) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (g->n < 16) { g->lo[g->n] = lo; g->hi[g->n] = hi; ++g->n; }
-        at = hi;
-    }
-    return 1;
+    (void)g;
+    static _Thread_local VmCache cache; /* page-probed, cached (vr_mem_cache.h) */
+    return vm_readable(&cache, a, n);
 }
 /* Reads through ReadProcessMemory on ourselves: the finder thread walks objects the game may free
  * at any moment, and a read that loses that race fails instead of faulting. */

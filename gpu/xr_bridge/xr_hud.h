@@ -8,7 +8,7 @@
 // settings, bbport_xr_math_test checks them.
 //
 // Environment:
-//   BB_XR_HUD=layer|off|force  layer (default with BB_XR_MODE=alt or mono): the HUD layer; off:
+//   BB_XR_HUD=layer|off|force  layer (default with BB_XR_MODE=alt, mono or stereo): the HUD layer; off:
 //                              the HUD stays in the game image; force: separate the UI even
 //                              without a headset (flat tests: the frame dumps get a "hud" image).
 //   BB_XR_HUD_DIST=<m>         distance of the quad (default 2.5)
@@ -51,7 +51,7 @@ inline bool Is(const char* value, const char* word) {
 }
 
 /// The HUD mode for BB_XR_HUD (`hud`, may be null) and BB_XR_MODE (`xr_mode`, may be null):
-/// unset or empty turns the layer on in the head-tracked modes (alt, mono), where the HUD in the
+/// unset or empty turns the layer on in the head-tracked modes (alt, mono, stereo), where the HUD in the
 /// eye image sits at the edges of the lenses; the cinema screen keeps it in the image.
 inline Mode ParseMode(const char* hud, const char* xr_mode) {
     if (Is(hud, "off") || Is(hud, "0")) {
@@ -63,7 +63,8 @@ inline Mode ParseMode(const char* hud, const char* xr_mode) {
     if (Is(hud, "layer") || Is(hud, "1")) {
         return Mode::Layer;
     }
-    return Is(xr_mode, "alt") || Is(xr_mode, "mono") ? Mode::Layer : Mode::Off;
+    return Is(xr_mode, "alt") || Is(xr_mode, "mono") || Is(xr_mode, "stereo") ? Mode::Layer
+                                                                              : Mode::Off;
 }
 
 enum class Alpha { Premul, Straight, Opaque };

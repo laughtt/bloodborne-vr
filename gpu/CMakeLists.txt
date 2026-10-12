@@ -156,6 +156,7 @@ add_host_shader(depth_resample.frag depth_resample_frag)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
 add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
+add_host_shader(stereo_warp.comp stereo_warp_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -326,6 +327,13 @@ target_link_libraries(motion-shader-test PRIVATE bbgpu)
 add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
 target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(ui-composition-test PRIVATE ..)
+add_executable(stereo-warp-test EXCLUDE_FROM_ALL ../tests/test_stereo_warp.cpp)
+target_compile_options(stereo-warp-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(stereo-warp-test PRIVATE ..)
+# Command buffers copied at submit (pm4_snapshot.h): the "Unimplemented PM4 type 0" load crash.
+add_executable(pm4-snapshot-test EXCLUDE_FROM_ALL ../tests/test_pm4_snapshot.cpp)
+target_compile_options(pm4-snapshot-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(pm4-snapshot-test PRIVATE ..)
 
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
@@ -348,6 +356,11 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
+# VR true stereo P4.4 slice 3: eye-R descriptor substitution, arena eye flag, dispatch write policy.
+add_executable(stereo-substitute-test EXCLUDE_FROM_ALL ../tests/test_stereo_substitute.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(stereo-substitute-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(stereo-substitute-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(stereo-substitute-test PRIVATE bbgpu)
 
 # Host-call hook trampoline test (src/runtime_hooks.c). Self-contained: no GPU/Vulkan, no runtime.
 add_executable(hooks-test EXCLUDE_FROM_ALL ../tests/test_hooks.c ../src/runtime_hooks.c)
@@ -418,6 +431,16 @@ add_executable(vr-throw-anim-test EXCLUDE_FROM_ALL ../tests/test_vr_throw_anim.c
 set_target_properties(vr-throw-anim-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-throw-anim-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-throw-anim-test PRIVATE ../src)
+# VR gun-shot animation speed (src/vr_gun_speed.h, src/runtime_vr_atkspeed.c): findings/27 section 8.
+add_executable(vr-gun-speed-test EXCLUDE_FROM_ALL ../tests/test_vr_gun_speed.c)
+set_target_properties(vr-gun-speed-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-gun-speed-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-gun-speed-test PRIVATE ../src)
+# VR hit-reaction animation speed (src/vr_hurt_speed.h, src/runtime_vr_atkspeed.c): findings/27 section 9.
+add_executable(vr-hurt-speed-test EXCLUDE_FROM_ALL ../tests/test_vr_hurt_speed.c)
+set_target_properties(vr-hurt-speed-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-hurt-speed-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-hurt-speed-test PRIVATE ../src)
 # VR held-item fire block (gpu/xr_bridge/vr_held_fire.h): which attack inputs a hand holding an item loses.
 add_executable(vr-held-fire-test EXCLUDE_FROM_ALL ../tests/test_vr_held_fire.c)
 set_target_properties(vr-held-fire-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -448,6 +471,18 @@ add_executable(vr-turn-replay EXCLUDE_FROM_ALL ../tools/vr_turn_replay.c)
 set_target_properties(vr-turn-replay PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-turn-replay PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-turn-replay PRIVATE ../src)
+
+# VR hook profiler (src/vr_hook_prof.h, src/runtime_hooks.c): the 10 s "VR hooks:" line.
+add_executable(vr-hook-prof-test EXCLUDE_FROM_ALL ../tests/test_vr_hook_prof.c)
+set_target_properties(vr-hook-prof-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-hook-prof-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-hook-prof-test PRIVATE ../src)
+
+# VR guest-memory guard cache (src/vr_mem_cache.h).
+add_executable(vr-mem-cache-test EXCLUDE_FROM_ALL ../tests/test_vr_mem_cache.c)
+set_target_properties(vr-mem-cache-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-mem-cache-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-mem-cache-test PRIVATE ../src)
 
 # VR comfort dash (gpu/xr_bridge/vr_dash.h built as C, src/vr_dash_detect.h): docs/vr/findings/19.
 add_executable(vr-dash-test EXCLUDE_FROM_ALL ../tests/test_vr_dash.c)
@@ -522,11 +557,33 @@ add_executable(xr-dlss-test EXCLUDE_FROM_ALL ../tests/test_xr_dlss.cpp)
 target_compile_options(xr-dlss-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(xr-dlss-test PRIVATE ..)
 
+# bbport VR frame rate counter (renderer_vulkan/xr_fps_logic.h): colour thresholds, smoothing,
+# bottleneck verdict, bitmap text. docs/vr/findings/31-true-stereo.md section 10.9.
+add_executable(xr-view-predict-test EXCLUDE_FROM_ALL ../tests/test_xr_view_predict.cpp)
+target_compile_options(xr-view-predict-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(xr-view-predict-test PRIVATE ..)
+
+add_executable(xr-fps-test EXCLUDE_FROM_ALL ../tests/test_xr_fps.cpp)
+target_compile_options(xr-fps-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(xr-fps-test PRIVATE ..)
+
+# bbport VR HUD centre gate (renderer_vulkan/xr_hud_center.h): the middle-of-the-view HUD quad is
+# hidden in plain gameplay (HP and stamina are on the wrist); mode parse, message detection, hold.
+add_executable(xr-hud-center-test EXCLUDE_FROM_ALL ../tests/test_xr_hud_center.cpp)
+target_compile_options(xr-hud-center-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(xr-hud-center-test PRIVATE ..)
+
 # bbport VR resize bookkeeping (renderer_vulkan/xr_resize_logic.h): frame size debounce, resize
 # reason, swapchain size tracking (device-lost crashes on a one-frame eye size flip).
 add_executable(xr-resize-test EXCLUDE_FROM_ALL ../tests/test_xr_resize.cpp)
 target_compile_options(xr-resize-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(xr-resize-test PRIVATE ..)
+
+# bbport VR DLSS-NR logic (renderer_vulkan/xr_dlssnr_logic.h): settings, pass regions, streams and
+# slots, history reset. docs/vr/findings/42-dlss-nr.md.
+add_executable(xr-dlssnr-test EXCLUDE_FROM_ALL ../tests/test_xr_dlssnr.cpp)
+target_compile_options(xr-dlssnr-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(xr-dlssnr-test PRIVATE ..)
 
 # bbport: the DLSS bridge (gpu/dlss_bridge, bbport_dlss.dll, MIT) links NVIDIA's DLSS SDK, which
 # ships MSVC libraries only, so it is its own MSVC project. BB_DLSS_SDK_ROOT (a checkout or copy

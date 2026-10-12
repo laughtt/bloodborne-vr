@@ -4,6 +4,7 @@
  * out/gpu vr-arms-test vr-arms-test-cpp (no GPU, no game). Prints PASS lines; exit 0. */
 #include "vr_arm_math.h"
 #include "vr_fp_math.h"
+#include "vr_arms_roll.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -408,6 +409,81 @@ static void test_spaghetti(void) {
     printf("PASS spaghetti guards\n");
 }
 
+/* Arms detached while the body evades (vr_arms_roll.h): the blend, the camera-frame pin. */
+static void test_roll_detach(void) {
+    VrArmsRoll r;
+    vr_roll_reset(&r);
+    CHECK(vr_roll_capturing(&r, 0) && !vr_roll_capturing(&r, 1), "pins are captured only outside an evade");
+    /* 0 -> 1 over VR_ROLL_BLEND_S, no pop */
+    float prev = 0.0f, worst = 0.0f;
+    for (int i = 0; i < 20; ++i) {
+        const float e = vr_roll_step(&r, 1, 0.01f, VR_ROLL_BLEND_S);
+        if (e - prev > worst) worst = e - prev;
+        prev = e;
+    }
+    CHECK(near_f(r.e, 1.0f, 1e-6f) && worst <= 0.1001f, "blend in over 0.1 s (step %.3f)", worst);
+    CHECK(!vr_roll_capturing(&r, 0), "no capture while still fading out");
+    vr_roll_step(&r, 0, 0.05f, VR_ROLL_BLEND_S);
+    CHECK(near_f(r.e, 0.5f, 1e-5f), "blend out, half way %.3f", r.e);
+    vr_roll_step(&r, 0, 0.2f, VR_ROLL_BLEND_S);
+    CHECK(r.e == 0.0f && vr_roll_capturing(&r, 0), "attached again, capturing");
+    CHECK(vr_roll_step(&r, 1, 0.0f, VR_ROLL_BLEND_S) == 0.0f, "dt 0 changes nothing");
+    CHECK(vr_roll_step(&r, 1, 0.01f, 0.0f) == 1.0f, "blend 0 = at once");
+    /* the pin stays put in the camera frame while the body (the model-space shoulder) tumbles */
+    const VrVec3 cam_p = vr_v3(0.1f, 1.6f, -0.2f);
+    const VrQuat cam_q = vr_qnormalize(vam_axis_angle(vr_v3(0, 1, 0), 0.4f));
+    const VrXform sh = vr_xf(vr_v3(-0.17f, 1.44f, 0.03f), vr_qidentity());
+    const VrXform rel = vr_roll_to_cam(cam_p, cam_q, sh);
+    const VrXform same = vr_roll_from_cam(cam_p, cam_q, rel);
+    CHECK(near_v(same.t, sh.t, 1e-5f), "pin round trip");
+    const VrVec3 cam2_p = vr_v3(0.5f, 1.0f, -0.9f); /* the view moved on (a roll) */
+    const VrQuat cam2_q = vr_qnormalize(vr_qmul(vam_axis_angle(vr_v3(0, 1, 0), 1.2f), vam_axis_angle(vr_v3(1, 0, 0), 0.5f)));
+    const VrXform moved = vr_roll_from_cam(cam2_p, cam2_q, rel);
+    const VrVec3 back = vr_qrotate(vr_qconj(cam2_q), vr_sub(moved.t, cam2_p));
+    CHECK(near_v(back, rel.t, 1e-5f), "pinned shoulder keeps its camera-relative position");
+    const VrXform b0 = vr_roll_blend(sh, moved, 0.0f), b1 = vr_roll_blend(sh, moved, 1.0f), bh = vr_roll_blend(sh, moved, 0.5f);
+    CHECK(near_v(b0.t, sh.t, 1e-6f) && near_v(b1.t, moved.t, 1e-6f) &&
+          near_v(bh.t, vr_scale(vr_add(sh.t, moved.t), 0.5f), 1e-5f), "blend ends and middle");
+    printf("PASS roll detach\n");
+}
+
+/* A roll with a sliding camera and a body moving ahead: the hands must stay fixed relative to the eye. */
+static void test_roll_lag(void) {
+    const float dt = 1.0f / 90.0f;
+    const float yaw = 0.7f;
+    /* body 9 m/s along its heading; the camera slides at 4 m/s along it (the comfort dash, anim_smooth) */
+    const VrVec3 dir = vr_qrotate(vr_qaxis(vr_v3(0, 1, 0), yaw), vr_v3(0, 0, 1));
+    const VrVec3 hand_off = vr_v3(0.2f, -0.3f, -0.4f); /* the controller relative to the camera, model axes */
+    float worst_plain = 0.0f, worst_lead = 0.0f;
+    VrVec3 body = vr_v3(3, 0, -2), cam = vr_add(body, vr_v3(0, 1.6f, 0)), prev_cam = cam, prev_body = body;
+    VrVec3 rel_vel = vr_v3(0, 0, 0), view_cam_model = vr_v3(0, 1.6f, 0);
+    for (int i = 0; i < 60; ++i) {
+        /* the render before: the snapshot the IK will use */
+        view_cam_model = vr_qrotate(vr_qaxis(vr_v3(0, 1, 0), -yaw), vr_sub(cam, body));
+        rel_vel = vr_roll_rel_vel(prev_cam, prev_body, cam, body, yaw, dt);
+        prev_cam = cam;
+        prev_body = body;
+        /* the next render: the body and the camera moved on; the model is drawn at the body, the eye is at cam */
+        body = vr_add(body, vr_scale(dir, 9.0f * dt));
+        cam = vr_add(cam, vr_scale(dir, 4.0f * dt));
+        const VrVec3 eye_hand = vr_add(cam, vr_qrotate(vr_qaxis(vr_v3(0, 1, 0), yaw), hand_off));
+        for (int lead = 0; lead < 2; ++lead) {
+            const VrVec3 c = lead ? vr_roll_lead(view_cam_model, rel_vel, dt, 1.0f) : view_cam_model;
+            const VrVec3 drawn = vr_add(body, vr_qrotate(vr_qaxis(vr_v3(0, 1, 0), yaw), vr_add(c, hand_off)));
+            const float err = vam_len(vr_sub(drawn, eye_hand));
+            if (i > 3 && lead && err > worst_lead) worst_lead = err;
+            if (i > 3 && !lead && err > worst_plain) worst_plain = err;
+        }
+    }
+    CHECK(worst_plain > 0.04f, "without the lead the hands run ahead of the eye (%.3f m)", worst_plain);
+    CHECK(worst_lead < 0.002f, "with the lead the hands stay on the eye (%.4f m)", worst_lead);
+    CHECK(vam_len(vr_roll_rel_vel(prev_cam, prev_body, vr_v3(9, 9, 9), prev_body, yaw, dt)) == 0.0f, "a jump is no velocity");
+    CHECK(vam_len(vr_roll_rel_vel(prev_cam, prev_body, prev_cam, prev_body, yaw, 0.5f)) == 0.0f, "a stale snapshot is no velocity");
+    CHECK(near_v(vr_roll_lead(view_cam_model, rel_vel, dt, 0.0f), view_cam_model, 1e-7f), "no lead while attached");
+    CHECK(vam_len(vr_roll_lead(vr_v3(0, 0, 0), vr_v3(100, 0, 0), 0.05f, 1.0f)) <= 0.2001f, "lead capped");
+    printf("PASS roll lag\n");
+}
+
 int main(void) {
     test_math();
     test_two_bone();
@@ -418,6 +494,8 @@ int main(void) {
     test_game_mapping();
     test_weight();
     test_body_follow();
+    test_roll_detach();
+    test_roll_lag();
     if (failures) { printf("%d of %d checks failed\n", failures, checks); return 1; }
     printf("All VR arm tests passed (%d checks)\n", checks);
     return 0;

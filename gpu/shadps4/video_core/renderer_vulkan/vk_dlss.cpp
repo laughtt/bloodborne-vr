@@ -73,6 +73,8 @@ bool CollectExtensions(const VkExtensionProperties* required, u32 count,
 struct Dlss::Impl {
     HMODULE module{};
     const BbDlssApi* api{};
+    const BbDlssNrApi* nr_api{}; ///< DLSS-NR (BbDlssGetNrApi), null with older bridges
+    bool nr_tried{}, nr_ready{};
     std::vector<std::string> instance_extensions, device_extensions;
     std::array<std::optional<FeatureDesc>, Slots> features; // by slot (vk_dlss.h)
     std::string problem;
@@ -130,6 +132,14 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
             impl->Disable("bbport_dlss.dll is missing or not a DLSS bridge");
         }
         return;
+    }
+    const auto get_nr =
+        reinterpret_cast<BbDlssGetNrApiFn>(GetProcAddress(impl->module, "BbDlssGetNrApi"));
+    impl->nr_api = get_nr ? get_nr() : nullptr;
+    if (impl->nr_api && impl->nr_api->abi != BBPORT_DLSS_NR_ABI) {
+        std::printf("DLSS-NR: bbport_dlss.dll has DLSS-NR ABI %u, this build needs %d\n",
+                    impl->nr_api->abi, BBPORT_DLSS_NR_ABI);
+        impl->nr_api = nullptr;
     }
     // NGX writes its logs and model updates here: beside the saves and shader caches.
     std::filesystem::path data = directory / "dlss";
@@ -273,11 +283,62 @@ void Dlss::ReleaseFeature(u32 slot) {
     }
 }
 
+bool Dlss::HasNr() const {
+    return impl->available && impl->nr_api;
+}
+
+bool Dlss::NrInitialize() {
+    if (!impl->nr_tried && HasNr()) {
+        impl->nr_tried = true;
+        impl->nr_ready = impl->nr_api->Initialize() != 0;
+    }
+    return impl->nr_ready;
+}
+
+bool Dlss::NrCreateFeature(vk::CommandBuffer command, u32 slot, u32 width, u32 height) {
+    return impl->nr_ready && slot < NrSlots &&
+           impl->nr_api->CreateFeature(slot, command, width, height) != 0;
+}
+
+bool Dlss::NrEvaluate(vk::CommandBuffer command, u32 slot, const NrFrame& frame) {
+    if (!impl->nr_ready || slot >= NrSlots) {
+        return false;
+    }
+    const auto image = [](const Resource& r) {
+        const vk::ImageSubresourceRange range{r.aspect, 0, 1, 0, 1};
+        return BbDlssImage{r.image,
+                           r.view,
+                           static_cast<VkImageSubresourceRange>(range),
+                           static_cast<VkFormat>(r.format),
+                           r.width,
+                           r.height};
+    };
+    const auto rect = [](const NrRect& r) { return BbDlssRect{r.x, r.y, r.width, r.height}; };
+    const BbDlssNrEvaluate parameters{image(frame.color),
+                                      image(frame.output),
+                                      rect(frame.color_rect),
+                                      rect(frame.output_rect),
+                                      frame.reset ? 1 : 0,
+                                      frame.style,
+                                      frame.intensity,
+                                      frame.local_tone,
+                                      frame.local_structure,
+                                      frame.skin_structure};
+    return impl->nr_api->Evaluate(slot, command, &parameters) != 0;
+}
+
+void Dlss::NrReleaseFeature(u32 slot) {
+    if (impl->nr_ready && slot < NrSlots) {
+        impl->nr_api->ReleaseFeature(slot);
+    }
+}
+
 void Dlss::Shutdown() {
     impl->available = false;
     for (auto& feature : impl->features) {
         feature.reset();
     }
+    impl->nr_ready = false; // the bridge's Shutdown releases DLSS-NR too
     if (impl->api && impl->initialized) {
         impl->api->Shutdown();
         impl->initialized = false;
@@ -318,6 +379,19 @@ bool Dlss::Evaluate(vk::CommandBuffer, const Frame&, u32) {
     return false;
 }
 void Dlss::ReleaseFeature(u32) {}
+bool Dlss::HasNr() const {
+    return false;
+}
+bool Dlss::NrInitialize() {
+    return false;
+}
+bool Dlss::NrCreateFeature(vk::CommandBuffer, u32, u32, u32) {
+    return false;
+}
+bool Dlss::NrEvaluate(vk::CommandBuffer, u32, const NrFrame&) {
+    return false;
+}
+void Dlss::NrReleaseFeature(u32) {}
 
 #endif
 

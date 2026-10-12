@@ -59,6 +59,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    if (capture && !capture_pass) [[unlikely]] {
+        AbortCapture(); // bbport: a dispatch capture (P4.4 slice 3) never holds a render pass
+    }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
@@ -130,7 +133,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    if (capture) [[unlikely]] {
+    if (capture && capture_pass) [[unlikely]] {
         FinishCapture(true); // bbport: VR Phase 4 stereo
         return;
     }
@@ -143,8 +146,26 @@ bool Scheduler::BeginCapture(std::shared_ptr<RecordArena> arena, CaptureEnd on_e
     }
     capture_arena = std::move(arena);
     capture = capture_arena.get();
+    capture_pass = true;
     capture_end = std::move(on_end);
     return true;
+}
+
+bool Scheduler::BeginComputeCapture(std::shared_ptr<RecordArena> arena, CaptureEnd on_end) {
+    if (capture || is_rendering || !IsRecordingDeferred() || !arena) {
+        return false;
+    }
+    capture_arena = std::move(arena);
+    capture = capture_arena.get();
+    capture_pass = false;
+    capture_end = std::move(on_end);
+    return true;
+}
+
+void Scheduler::EndCapture() {
+    if (capture && !capture_pass) {
+        FinishCapture(true);
+    }
 }
 
 void Scheduler::FinishCapture(bool complete) {
@@ -154,7 +175,7 @@ void Scheduler::FinishCapture(bool complete) {
     auto arena = std::move(capture_arena);
     auto on_end = std::move(capture_end);
     Record([arena](vk::CommandBuffer cmdbuf) { arena->Execute(cmdbuf); });
-    if (complete) {
+    if (complete && capture_pass) {
         Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
     }
     if (on_end) {
@@ -238,6 +259,7 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+    const BbStats::PerfScope perf{BbStats::PerfHostCopyWait};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
@@ -247,6 +269,7 @@ void Scheduler::WaitDeferredSignals() {
 }
 
 void Scheduler::WaitHostCopies() {
+    const BbStats::PerfScope perf{BbStats::PerfHostCopyWait};
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
@@ -300,12 +323,14 @@ void Scheduler::SyncRecording() {
     }
     KickRecording(true);
     BbStats::WaitTimer timer{BbStats::sync_recording_ns};
+    const BbStats::PerfScope perf{BbStats::PerfSyncRecording};
     std::unique_lock lk{recorder_mutex};
     recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
+    BbStats::perf_thread = BbStats::PerfThreadRecorder;
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -336,7 +361,10 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_busy = true;
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
-        chunk->Execute(current_cmdbuf);
+        {
+            const BbStats::PerfScope perf{BbStats::PerfBusy};
+            chunk->Execute(current_cmdbuf);
+        }
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));
@@ -380,6 +408,7 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    const BbStats::PerfScope perf{BbStats::PerfTickWait};
     work_semaphore.Wait(tick);
 }
 
@@ -452,6 +481,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).
     WaitHostCopies();
+    const BbStats::PerfScope perf{BbStats::PerfSubmit}; // the "Cmd:" line: end and submit
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = work_semaphore.Handle();

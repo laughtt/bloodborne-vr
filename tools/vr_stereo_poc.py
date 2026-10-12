@@ -88,7 +88,11 @@ class Game:
                    BB_DUMP_DIR=str(self.dump), BB_EXIT_FILE=str(self.exit),
                    BB_EXIT_AFTER_SECONDS=str(timeout), BB_USER_DIR=str(user), BB_DATA_DIR=str(data),
                    BB_CONFIG=str(data / 'bbport.ini'), BB_PAD_KEYBOARD='0', BB_GAME_DIR=game_dir,
-                   BB_FPS_LIMIT='0', BB_PROBE=str(Path(probe).resolve()))
+                   BB_FPS_LIMIT='0', BB_PROBE=str(Path(probe).resolve()),
+                   # The checks here want the region at the center camera unless they say
+                   # otherwise; hybrid stereo (the stereo default) is tested by
+                   # vr_true_stereo_test.py warp, which turns it back on.
+                   BB_STEREO_HYBRID='0')
         env.update(extra_env)  # overrides (BB_XR_MODE, BB_UPSCALER, ...)
         self.log = out / 'session.log'
         with open(self.log, 'wb') as sink:

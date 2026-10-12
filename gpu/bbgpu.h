@@ -88,8 +88,31 @@ typedef struct {
     BbVrPose head;                               /* world space of bbgpu_vr_views */
     float fov_left, fov_right, fov_up, fov_down; /* radians; left and down negative */
     float rows[3][3];
+    /* BB_XR_MODE=stereo (bridge ABI 10): the eyes' offsets from the head, in the head's frame
+     * (OpenXR axes), taken from the same snapshot as `head`, so the pair's two layer poses come
+     * from one xrLocateViews. has_eye_offset 0: none (fake head). */
+    uint32_t has_eye_offset;
+    float eye_offset[2][3];
 } BbVrRenderView;
 void bbgpu_vr_set_render_view(const BbVrRenderView *view);
+/* The views for another display time (bridge ABI 10 GetViewsAt, XrTime ns as
+ * BbVrViews.display_time_ns): like bbgpu_vr_views, predicted for `display_time_ns`. Falls back to
+ * the latest views (bbgpu_vr_views) when the bridge cannot or time <= 0. Returns 1 while the head
+ * orientation is valid. */
+int bbgpu_vr_views_at(int64_t display_time_ns, BbVrViews *out);
+/* The release -> display latency the bridge measures (true stereo, ABI 10): ahead_ns is where H1
+ * should ask views for, from now: the host's own camera -> release time (measured by the presenter,
+ * smoothed) plus the bridge's release -> display time; display_time_ns is that moment as an XrTime
+ * (0: the runtime cannot convert time, use bbgpu_vr_views). Returns 1 when measured. */
+typedef struct {
+    int64_t display_time_ns;   /* the XrTime the image of a camera set up now is displayed at */
+    int64_t ahead_ns;          /* display_time_ns minus now */
+    int64_t period_ns;         /* the display period */
+    float release_to_display_periods;
+    float camera_to_release_ms; /* the host's part */
+    uint64_t pairs, half_pairs;
+} BbVrDisplayAhead;
+int bbgpu_vr_display_ahead(BbVrDisplayAhead *out);
 /* VR alternate-eye stereo (BB_XR_MODE=alt, docs/vr/findings/22): the camera hook H1 chose `eye`
  * for the frame it just set up and moved the camera there. The presenter recognizes the finished
  * frame by this camera (rows, position, and the eye tag in the projection's x scale) and hands it

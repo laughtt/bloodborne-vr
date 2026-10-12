@@ -31,6 +31,7 @@
  * Works with BB_VR=0 too (flat tests: the probe and the pad presses, no headset). */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "vr_mem_cache.h"
 #include "hooks.h"
 #include "gpu/bbgpu.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
@@ -119,33 +120,9 @@ static double vu_now(void) {
 /* ---- guest memory: read only what is mapped (the chains dangle during loads); the guard of
  * src/runtime_vr_stamina.c / runtime_vr_fp.c (a copy, as each VR file keeps its own) ---- */
 #ifdef _WIN32
-static struct { uintptr_t lo, hi; } vu_regions[32];
-static int vu_region_count;
-static double vu_regions_time;
-static int vu_readable(uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const double now = vu_now();
-    if (now - vu_regions_time > 1.0) { vu_region_count = 0; vu_regions_time = now; }
-    for (int i = 0; i < vu_region_count; ++i)
-        if (vu_regions[i].lo <= a && a + n <= vu_regions[i].hi) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (vu_region_count < (int)(sizeof(vu_regions) / sizeof(*vu_regions))) {
-            vu_regions[vu_region_count].lo = lo;
-            vu_regions[vu_region_count].hi = hi;
-            ++vu_region_count;
-        }
-        at = hi;
-    }
-    return 1;
-}
+/* page-probed reads with a per-thread cache (vr_mem_cache.h): VirtualQuery on the guest mappings took ms per cold lookup (run12e/g profiles) */
+static _Thread_local VmCache vu_cache;
+static int vu_readable(uintptr_t a, size_t n) { return vm_readable(&vu_cache, a, n); }
 #else
 #include <unistd.h>
 static int vu_readable(uintptr_t a, size_t n) {

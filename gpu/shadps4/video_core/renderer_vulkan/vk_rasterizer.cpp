@@ -510,13 +510,26 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
             return;
         }
         u8* dst = constant_ring->Data(*offset);
-        if (source) {
+        RingBinding binding{index, static_cast<u32>(size), *offset, address, {}, 0};
+        if (size == 864 && Stereo::RemapShaders()) {
+            // bbport (stereo-perf): the scene constants for stage B, from these same bytes (the
+            // ring is write-combined memory: reading it back there was ~30% of stage B).
+            alignas(16) std::array<u8, 864> block;
+            if (source) {
+                std::memcpy(block.data(), source, size);
+            } else {
+                memory->CopySparseMemory(address, block.data(), size);
+            }
+            std::memcpy(dst, block.data(), size);
+            binding.scene_valid = Stereo::ParseSceneConstants(
+                reinterpret_cast<const float*>(block.data()), binding.scene);
+        } else if (source) {
             std::memcpy(dst, source, size);
         } else {
             memory->CopySparseMemory(address, dst, size);
         }
         constant_ring->Flush(*offset, size);
-        out.push_back({index, static_cast<u32>(size), *offset, address});
+        out.push_back(binding);
     };
     for (u32 index = 0; index < stage.buffers.size(); ++index) {
         const auto& desc = stage.buffers[index];
@@ -1204,6 +1217,13 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_draw = false;
     motion_geometry = 0;
     PrepareRenderState(pipeline);
+    // bbport: VR Phase 4 (vk_stereo.cpp), off by default: indirect draws of a doubled region run
+    // for both eyes like direct ones (GPU particles), so their binds are recorded after the
+    // capture starts (StereoBeforeEmit), as DrawRecord does.
+    const bool stereo = Stereo::RemapShaders();
+    if (stereo) {
+        StereoBeginDraw(pipeline, true);
+    }
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1215,9 +1235,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     const auto state = BeginRendering(pipeline);
 
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer();
+    if (stereo) {
+        ResolveVertexBuffers(pipeline, nullptr);
+        if (is_indexed) {
+            ResolveIndexBuffer(0);
+        }
+    } else {
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            BindIndexBuffer();
+        }
     }
 
     const auto [buffer, base] =
@@ -1231,6 +1258,13 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
     }
 
+    if (stereo) {
+        StereoBeforeEmit(pipeline, state); // flushes the barriers this draw needs first
+        EmitVertexBuffers();
+        if (is_indexed) {
+            EmitIndexBuffer();
+        }
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1271,6 +1305,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
     });
+    if (stereo) {
+        StereoAfterIndirectDraw(pipeline); // bbport: the write guard for doubled indirect draws
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -1332,6 +1369,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
+    StereoBeginDispatch(pipeline); // bbport: VR Phase 4 (vk_stereo.cpp), off by default
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -1387,6 +1425,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     }
 
     scheduler.EndRendering();
+    StereoBeginDispatch(pipeline); // bbport: VR Phase 4 (vk_stereo.cpp), off by default
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -1396,6 +1435,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatchIndirect(args, args_offset);
     });
+    StereoAfterDispatch(pipeline->GetStage(Shader::SwStage::Compute)); // bbport, as above
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -2065,6 +2105,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         }
     }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    // bbport: VR full stereo (vk_stereo.cpp): eye R's copy between the twins.
+    StereoAfterImageCopy(desc0.is_written ? image1_id : image0_id,
+                         desc0.is_written ? image0_id : image1_id);
     return true;
 }
 
@@ -2123,6 +2166,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     runtime.ClearImage(&image1, range, clear);
+    StereoAfterImageClear(image1_id); // bbport: VR full stereo (vk_stereo.cpp)
     return true;
 }
 
@@ -2140,9 +2184,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
                 }
-                if (ring->size == 864 && Stereo::RemapShaders()) {
-                    Stereo::OnSceneConstants(
-                        reinterpret_cast<const float*>(constant_ring->Data(ring->offset)));
+                if (ring->size == 864 && ring->scene_valid && Stereo::RemapShaders()) {
+                    Stereo::SetSceneConstants(ring->scene); // parsed by stage A (CollectRingBindings)
                 }
                 push_data.AddOffset(binding.buffer, 0);
             }

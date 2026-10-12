@@ -56,6 +56,7 @@ void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, Ru
 }
 
 Frontend::WindowSDL* g_window = nullptr;
+extern std::atomic<bool> bb_process_exiting; // shim/common/assert.cpp
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
@@ -243,6 +244,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         LOG_INFO(Frontend, "Window closed by user");
         std::fflush(stdout);
+        bb_process_exiting = true; // assertions from here on park (shim/common/assert.cpp)
         Vulkan::Xr::ShutdownForExit(2000); // OpenXR session and swapchains first, _Exit skips atexit
         std::fflush(stderr);
 #ifdef _WIN32
@@ -385,9 +387,7 @@ extern "C" int bbgpu_vr_hands(BbVrHands* out) {
     return 1;
 }
 
-extern "C" int bbgpu_vr_views(BbVrViews* out) {
-    Vulkan::Xr* xr = Vulkan::Xr::Get();
-    const auto views = xr ? xr->LatestViews() : std::nullopt;
+static int FillViews(const std::optional<Vulkan::Xr::Views>& views, BbVrViews* out) {
     *out = {};
     if (!views) {
         return 0;
@@ -414,16 +414,45 @@ extern "C" int bbgpu_vr_views(BbVrViews* out) {
     return 1;
 }
 
+extern "C" int bbgpu_vr_views(BbVrViews* out) {
+    Vulkan::Xr* xr = Vulkan::Xr::Get();
+    return FillViews(xr ? xr->LatestViews() : std::nullopt, out);
+}
+
+extern "C" int bbgpu_vr_views_at(int64_t display_time_ns, BbVrViews* out) {
+    Vulkan::Xr* xr = Vulkan::Xr::Get();
+    return FillViews(xr ? xr->ViewsAt(display_time_ns) : std::nullopt, out);
+}
+
+extern "C" int bbgpu_vr_display_ahead(BbVrDisplayAhead* out) {
+    Vulkan::Xr* xr = Vulkan::Xr::Get();
+    const auto ahead = xr ? xr->LatestDisplayAhead() : std::nullopt;
+    *out = {};
+    if (!ahead) {
+        return 0;
+    }
+    out->display_time_ns = ahead->display_time_ns;
+    out->ahead_ns = ahead->ahead_ns;
+    out->period_ns = ahead->period_ns;
+    out->release_to_display_periods = ahead->release_to_display_periods;
+    out->camera_to_release_ms = ahead->camera_to_release_ms;
+    out->pairs = ahead->pairs;
+    out->half_pairs = ahead->half_pairs;
+    return 1;
+}
+
 extern "C" void bbgpu_vr_set_render_view(const BbVrRenderView* view) {
     Vulkan::Xr* xr = Vulkan::Xr::Get();
     if (!xr || !view) {
         return;
     }
     Vulkan::Xr::RenderView out{view->seq, view->display_time, {}, view->fov_left,
-                               view->fov_right, view->fov_up, view->fov_down, {}};
+                               view->fov_right, view->fov_up, view->fov_down, {}, false, {}, 0};
     std::memcpy(out.head.position, view->head.position, sizeof(out.head.position));
     std::memcpy(out.head.orientation, view->head.orientation, sizeof(out.head.orientation));
     std::memcpy(out.rows, view->rows, sizeof(out.rows));
+    out.has_eye_offset = view->has_eye_offset != 0;
+    std::memcpy(out.eye_offset, view->eye_offset, sizeof(out.eye_offset));
     xr->SetRenderView(out);
 }
 
@@ -451,7 +480,7 @@ extern "C" void bbgpu_vr_set_eye_view(const BbVrEyeView* view) {
 
 extern "C" void bbgpu_vr_set_cinema(int on) {
     Vulkan::XrStereo& stereo = Vulkan::XrStereo::Get();
-    if (stereo.Enabled()) {
+    if (stereo.Enabled() || stereo.PairEnabled()) {
         stereo.SetCinema(on != 0);
     }
 }

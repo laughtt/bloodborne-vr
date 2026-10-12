@@ -16,7 +16,7 @@ menus.
 
 **Download `BloodborneVR-<version>-Setup.exe` from Releases, run it** (SmartScreen: the alpha is not
 code-signed, so click **More info, then Run anyway**), then **Start menu, Bloodborne VR, choose your
-game folder, START VR**. It installs for your user only (no admin rights); uninstalling keeps your
+game folder, PLAY**. It installs for your user only (no admin rights); uninstalling keeps your
 saves and settings. The same release has `BloodborneVR-<version>.zip`, the portable option: unzip it
 anywhere with write access and double-click `BloodborneVR.exe`. The zip's `README.txt` has the install
 steps, known issues and how to report bugs. The controls are summarised below.
@@ -66,28 +66,28 @@ trigger** confirms, **B** goes back, and the menu button closes the menu.
 
 Co-op is **EXPERIMENTAL** in this alpha. It uses the default lobby that comes with this release: there is
 nothing to type. Playing over the internet is not fully tested. Everyone needs game version 1.09 and this same
-release. **Play solo** needs no server and no account.
+release. The **VR** and **Flat** modes need no server and no account.
 
 **A) HOST (the player whose world the others join)**
 
 1. Open `BloodborneVR.exe` (the dashboard).
-2. On the **Play** tab press **Play online**.
-3. Press **Host a game**. A room code like `K7Q-M4X` appears (it also shows in the dashboard title).
+2. On the **Play** page pick **Co-op**.
+3. Press **Host a game**. A room code like `K7Q-M4X` appears (it stays on the Play page while the room lasts).
 4. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
-5. Press **Start with this room**, load your character and walk a little way into an area. Do not stand in the
+5. Press **PLAY**, load your character and walk a little way into an area. Do not stand in the
    area's entry zone, and the area's boss must still be alive.
 6. Nothing to press in the game: your bell rings by itself and your friends appear.
 
 **B) FRIEND (joining)**
 
 1. Open `BloodborneVR.exe`.
-2. On the **Play** tab press **Play online**.
-3. Type the room code under **Join a friend** and press **Join**.
-4. Press **Start with this room**, load your character and stay in the same region as the host.
+2. On the **Play** page pick **Co-op**.
+3. Type the room code under **or join a friend** and press **Join**.
+4. Press **PLAY**, load your character and stay in the same region as the host.
 5. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
    it rings again by itself.
 
-**Running your own lobby?** Under **Play online** press the small **Change** next to "Lobby: default", enter your
+**Running your own lobby?** Under **Co-op** press the small **Change** next to "Lobby: default", enter your
 address and press **Use**. **Use the default lobby** switches back.
 
 **If it does not work**
@@ -98,24 +98,34 @@ address and press **Use**. **Use the default lobby** switches back.
 - The Windows firewall must allow BloodborneVR (allow it when Windows asks).
 - Co-op is experimental and internet play is not fully tested.
 
-**Leave a room / play solo:** press **Leave** (the host sees **Close room**) in the Play online card, or **Leave room**
-on the **Online** tab. **Back** returns to the Play tab, where **Play solo** starts the game without a room.
+**Leave a room / play solo:** press **Leave** (the host sees **Close room**) in the room card, or **Leave room**
+on the **Online co-op** page. Pick **VR** or **Flat** to play without a room.
 
 ## Comfort, one-eye viewing and weaker PCs
 
-On the dashboard's **Play** tab, under the profile cards, **View** switches between **3D** and **Flat screen (mono)**, and
-picking a profile card (**Default**, **Comfort**, **Performance**, **Quality (DLSS)**) saves it at once. On a PC without an
-NVIDIA RTX card the Play tab also says "Low fps? Try Performance."
+On the dashboard's **Play** page, **Mode** is **VR**, **Co-op** or **Flat**, **VR quality** is **Low**, **Medium**, **High**,
+**Super High** (High plus DLSS-NR placed before the upscaler; needs your own `nvngx_dlssnr.dll`, which is not included; about 50-54 fps on an RTX 4090, full stereo; see `docs/vr/dlss-nr.md`) (the **Graphics** page lists what each one sets) and **VR render mode** is **Stereo** (true 3D, every preset, the default) or
+**Mono**. Every change is saved at once; the big **PLAY** button at the bottom starts the game and **Stop** ends it.
 
-- **Cannot see 3D with both eyes, flicker or discomfort:** set **View** to **Flat screen (mono)** (or Options tab, Display / VR,
-  **Stereo mode** = mono, or start with `BloodborneVR.exe --mono`). You get one big flat screen in the headset and the
-  controllers still work. If the depth looks wrong in 3D, try **Swap eyes** (Options, switch **Advanced** on) and **Stereo scale**.
-- **Motion sickness:** pick the **Comfort** profile (snap turning, locked and eased camera animation, steadier camera).
-- **Weaker PC or low fps:** pick the **Performance** profile (FSR 1 at 1.5x the frame instead of 2x, lower model detail).
-  You can also lower **Frame limit (fps)** and **Eye resolution** (Options tab, Display / VR and DLSS). With an NVIDIA RTX card,
-  the **Quality (DLSS)** profile gives the best picture.
-- **Defaults:** Stereo mode alt (true 3D), Frame limit 72 fps, FSR 1 upscaling (DLSS quality on an RTX card), eye
-  resolution 2x the 1080p frame, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
+- **Cannot see 3D with both eyes, flicker, eye strain or discomfort:** set **VR render mode** to **Mono** (Play page, or
+  Display & FPS; or start with `BloodborneVR.exe --mono`). You get one big flat screen in the headset and the
+  controllers still work. If the depth looks wrong in Stereo, try **Swap eyes** and **Stereo scale** (Display & FPS, switch
+  **Show advanced options** on).
+- **Motion sickness:** the **VR comfort** page has snap turning, the locked and eased camera animation and a steadier camera
+  (the older **Comfort** profile in Advanced sets them in one go).
+- **Weaker PC or low fps:** pick **Low** (or **Medium**) quality: a smaller eye image, and lower model detail on Low. You can also
+  lower **Frame limit (fps)**. The preset table on the Graphics page shows the eye image size of each one.
+- **DLSS-NR (Super High; experimental):** an optional NVIDIA neural-rendering pass (RTX GPU only). Its model file
+  `nvngx_dlssnr.dll` is NVIDIA's, is not part of the public DLSS SDK and is **not included**, and this project does not link to a
+  download. If you already have a copy on your PC, press **Find file...** on the Super High card (or the Graphics page): the launcher
+  copies it next to `bb-probe.exe`. **What is this?** opens the short help page (`docs/vr/dlss-nr.md`). Without the file the game
+  runs High. Super High places DLSS-NR before the upscaler (`dlssnr_place=pre`, 1 pass); the Graphics page has the other settings.
+- **Display size:** the Play page's **Display size** (your headset: Auto, a named headset or a custom size) and **Display resolution**
+  (50-150 %) set the render and eye image size for your headset and win over the quality preset's own size; the preset picks the
+  upscaler, DLSS-NR and a starting resolution step (Low 70 %, Medium 85 %). Game default keeps the preset's sizes.
+- **Defaults:** VR render mode Stereo, quality High (DLSS quality on an RTX card, else FSR 1 at 2x the 1080p frame), Frame limit
+  72 fps, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
+- **Flat mode** plays on the monitor with no headset; **Co-op** can be played in VR or on the flat screen.
 
 ## Updating (keep your saves)
 

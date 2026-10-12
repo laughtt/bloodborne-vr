@@ -25,6 +25,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/pm4_snapshot.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -75,6 +76,168 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+// bbport: command buffers copied at submit (pm4_snapshot.h, docs/vr/findings/43-pm4-race.md).
+struct Liverpool::SubmitSnapshot {
+    std::unique_ptr<Pm4::CommandSnapshot> dcb;
+    std::unique_ptr<Pm4::CommandSnapshot> ccb;
+};
+
+namespace {
+/// BB_PM4_SNAPSHOT=0: parse guest memory directly, as before.
+bool Pm4SnapshotEnabled() {
+    static const bool enabled = EmulatorSettingsImpl::Flag("BB_PM4_SNAPSHOT", true);
+    return enabled;
+}
+/// BB_PM4_SNAPSHOT_IB=1: also copy the indirect buffers a submission calls (Bloodborne's
+/// graphics buffers call none: docs/parallel_gpu.md).
+bool Pm4SnapshotIndirect() {
+    static const bool enabled = EmulatorSettingsImpl::Flag("BB_PM4_SNAPSHOT_IB", false);
+    return enabled;
+}
+/// BB_PM4_CHECK=0: do not compare each packet with guest memory when it is parsed.
+bool Pm4CheckRewrites() {
+    static const bool enabled = EmulatorSettingsImpl::Flag("BB_PM4_CHECK", true);
+    return enabled;
+}
+/// BB_PM4_STRICT=1: an invalid packet stops the process (the old assertion) instead of
+/// skipping the rest of its command buffer.
+bool Pm4Strict() {
+    static const bool enabled = EmulatorSettingsImpl::Flag("BB_PM4_STRICT", false);
+    return enabled;
+}
+
+std::atomic<u64> g_pm4_rewrites{0};
+std::atomic<u64> g_pm4_invalid{0};
+
+/// Copies guest memory the guest may have unmapped since: false if the read faulted.
+[[gnu::noinline]] bool TryReadGuest(const u32* guest, u32* out, size_t count) {
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = nullptr;
+        return false;
+    }
+    runtime_fault_recover = &recover;
+    const volatile u32* src = guest;
+    for (size_t i = 0; i < count; ++i) {
+        out[i] = src[i];
+    }
+    runtime_fault_recover = nullptr;
+    return true;
+}
+
+double MsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+/// Compares a buffer's copy with the guest's memory ahead of the parser: did the guest change
+/// words it submitted before the GPU thread parsed them? Parsing guest memory would have decoded
+/// the new words (the "Unimplemented PM4 type 0" crash when they are zeros or data). Checks a
+/// window of up to 512 dwords at a time (one guarded read per window, not per packet) and
+/// reports once per buffer. A word compared early is still compared before it is parsed, so a
+/// difference is always a rewrite before parsing.
+struct RewriteCheck {
+    const Pm4::CommandSnapshot* snap;
+    const char* engine;
+    size_t verified = 0;
+    bool done = false;
+
+    void BeforePacket(const u32* packet, size_t dwords) {
+        if (done || !snap || !snap->Contains(packet) || !Pm4CheckRewrites()) {
+            return;
+        }
+        const size_t end = std::min(snap->size, size_t(snap->OffsetOf(packet)) + dwords);
+        if (end <= verified) {
+            return;
+        }
+        const size_t from = verified;
+        const size_t to = std::min(snap->size, std::max(end, from + 512));
+        verified = to;
+        thread_local std::vector<u32> live;
+        live.resize(to - from);
+        const u32* copy = snap->words.data() + from;
+        const bool readable = TryReadGuest(snap->guest + from, live.data(), to - from);
+        size_t first = 0;
+        if (readable) {
+            first = Pm4::FirstDifference(copy, live.data(), to - from);
+            if (first == to - from) {
+                return;
+            }
+            // A Rewind packet's valid bit is set by the guest after the submit, by design.
+            const size_t at = from + first;
+            if (at > 0 && Pm4::PacketType(snap->words[at - 1]) == 3 &&
+                Pm4::Type3Opcode(snap->words[at - 1]) == Pm4::OpRewind) {
+                return;
+            }
+        }
+        done = true;
+        const u64 n = g_pm4_rewrites.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > 16 && (n & (n - 1)) != 0) {
+            return;
+        }
+        if (readable) {
+            std::printf("PM4: the guest rewrote a %s command buffer after submitting it, before "
+                        "the GPU thread parsed it: buffer %p (%zu dwords, submitted %.1f ms ago), "
+                        "word +%zu (parser at +%u): submitted %08x, now %08x. Parsing the copy "
+                        "taken at submit (rewrites seen: %llu)\n",
+                        engine, static_cast<const void*>(snap->guest), snap->size,
+                        MsSince(snap->taken), from + first, snap->OffsetOf(packet), copy[first],
+                        live[first], static_cast<unsigned long long>(n));
+        } else {
+            std::printf("PM4: the guest unmapped a %s command buffer after submitting it, before "
+                        "the GPU thread parsed it: buffer %p (%zu dwords, submitted %.1f ms ago), "
+                        "parser at +%u. Parsing the copy taken at submit (rewrites seen: %llu)\n",
+                        engine, static_cast<const void*>(snap->guest), snap->size,
+                        MsSince(snap->taken), snap->OffsetOf(packet),
+                        static_cast<unsigned long long>(n));
+        }
+        std::fflush(stdout);
+    }
+};
+
+/// A header that is no PM4 packet (or one that runs past its buffer): log it with the guest
+/// address and the words around it. Unless BB_PM4_STRICT=1, the caller skips the rest of the
+/// buffer: a header that does not parse leaves no way to find the next packet.
+void ReportInvalidPacket(const char* engine, std::span<const u32> rest,
+                         std::span<const u32> buffer, const Pm4::CommandSnapshot* snap,
+                         const char* reason) {
+    const u32* packet = rest.data();
+    const u32 header = packet[0];
+    const size_t offset = static_cast<size_t>(packet - buffer.data());
+    const u32* guest = snap && snap->Contains(packet) ? snap->GuestAt(packet) : packet;
+    const u64 n = g_pm4_invalid.fetch_add(1, std::memory_order_relaxed) + 1;
+    char around[160];
+    int len = 0;
+    const size_t from = offset >= 4 ? offset - 4 : 0;
+    const size_t to = std::min(buffer.size(), offset + 4);
+    for (size_t i = from; i < to && len < int(sizeof(around)) - 12; ++i) {
+        len += std::snprintf(around + len, sizeof(around) - len, i == offset ? " [%08x]" : " %08x",
+                             buffer[i]);
+    }
+    around[len] = '\0';
+    std::printf("PM4: %s: %s, header %08x (type %u) at guest %p, +%zu of %zu dwords (buffer %p); "
+                "words:%s",
+                engine, reason, header, Pm4::PacketType(header),
+                static_cast<const void*>(guest), offset, buffer.size(),
+                static_cast<const void*>(snap ? snap->guest : buffer.data()), around);
+    if (snap && snap->Contains(packet)) {
+        u32 now = 0;
+        if (TryReadGuest(guest, &now, 1)) {
+            std::printf("; guest memory there now %08x", now);
+        } else {
+            std::printf("; guest memory there is unmapped now");
+        }
+    }
+    std::printf(". %s (invalid packets: %llu)\n",
+                Pm4Strict() ? "Stopping (BB_PM4_STRICT=1)"
+                            : "Skipping the rest of this command buffer",
+                static_cast<unsigned long long>(n));
+    std::fflush(stdout);
+    if (Pm4Strict()) {
+        UNREACHABLE_MSG("Invalid PM4 packet {:#x} in the {}", header, engine);
+    }
+}
+} // namespace
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -104,6 +267,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    BbStats::perf_thread = BbStats::PerfThreadA; // the "Cmd:" line
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -120,10 +284,10 @@ void Liverpool::Process(std::stop_token stoken) {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
-            BbStats::gpu_idle_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - idle_start).count(),
-                std::memory_order_relaxed);
+            const auto idle_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - idle_start).count();
+            BbStats::gpu_idle_ns.fetch_add(idle_ns, std::memory_order_relaxed);
+            BbStats::pace_guest_wait_ns.fetch_add(idle_ns, std::memory_order_relaxed);
         }
         if (stoken.stop_requested()) {
             break;
@@ -395,17 +559,32 @@ bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     return false;
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
+                                           const Pm4::CommandSnapshot* snap) {
     FIBER_ENTER(ccb_task_name);
+    const std::span<const u32> ccb_all = ccb;
+    RewriteCheck rewrites{snap, "CCB"};
 
     while (!ccb.empty()) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
-        const u32 type = header->type;
-        if (type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", type);
+        // bbport: type 2 is padding here as in the draw engine; anything else but a whole type-3
+        // packet ends this buffer with a report instead of an assertion.
+        const Pm4::HeaderCheck check = Pm4::CheckHeader(header->raw, ccb.size());
+        if (check == Pm4::HeaderCheck::Packet || check == Pm4::HeaderCheck::Padding) {
+            rewrites.BeforePacket(ccb.data(), check == Pm4::HeaderCheck::Padding
+                                                  ? 1
+                                                  : Pm4::Type3Dwords(header->raw));
+        }
+        if (check == Pm4::HeaderCheck::Padding) {
+            ccb = NextPacket(ccb, 1);
+            continue;
+        }
+        if (check != Pm4::HeaderCheck::Packet) {
+            ReportInvalidPacket("constant engine (CCB)", ccb, ccb_all, snap,
+                                Pm4::HeaderCheckName(check));
+            break;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
@@ -444,8 +623,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            const Pm4::IndirectRef ref{indirect_buffer->Address<const u32>(),
+                                       indirect_buffer->ib_size};
+            const Pm4::CommandSnapshot* child = snap ? snap->ChildFor(header, ref) : nullptr;
+            auto task = ProcessCeUpdate(child ? child->Span() : std::span<const u32>{ref.address,
+                                                                                     ref.size},
+                                        child);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -454,10 +637,14 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             }
             break;
         }
-        default:
-            const u32 count = header->type3.NumWords();
-            UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), count);
+        default: {
+            char reason[64];
+            std::snprintf(reason, sizeof(reason), "unknown type-3 opcode %#x",
+                          static_cast<u32>(opcode));
+            ReportInvalidPacket("constant engine (CCB)", ccb, ccb_all, snap, reason);
+            ccb = {};
+            continue;
+        }
         }
         ccb = NextPacket(ccb, header->type3.NumWords() + 1);
     }
@@ -702,8 +889,13 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
 } // namespace
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
-                                           u64 seq) {
+                                           u64 seq, const Pm4::CommandSnapshot* dcb_snap,
+                                           const Pm4::CommandSnapshot* ccb_snap,
+                                           std::shared_ptr<const SubmitSnapshot> owner) {
     FIBER_ENTER(dcb_task_name);
+    // bbport: `owner` keeps the copies taken at submit alive while this coroutine parses them.
+    const std::span<const u32> dcb_all = dcb;
+    RewriteCheck rewrites{dcb_snap, "DCB"};
     // Top-level buffers enqueued for the draw preparation workers (nested IBs are not).
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
@@ -724,7 +916,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
+        ce_task = ProcessCeUpdate(ccb, ccb_snap);
         RESUME_GFX(ce_task);
     }
 
@@ -735,13 +927,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
 
+        // bbport: was the packet changed in guest memory since the submit (the copy is what was
+        // submitted)? And a header that is no packet, or one that runs past the buffer, ends the
+        // buffer with a report (guest address, words around it) instead of an assertion: it was
+        // "Unimplemented PM4 type 0" when the guest had reused the buffer.
+        const Pm4::HeaderCheck check = Pm4::CheckHeader(header->raw, dcb.size());
+        if (check == Pm4::HeaderCheck::Packet || check == Pm4::HeaderCheck::Padding) {
+            rewrites.BeforePacket(dcb.data(), check == Pm4::HeaderCheck::Padding
+                                                  ? 1
+                                                  : Pm4::Type3Dwords(header->raw));
+        }
+        if (check == Pm4::HeaderCheck::BadType || check == Pm4::HeaderCheck::Truncated) {
+            ReportInvalidPacket(dcb_depth ? "draw engine (indirect buffer)" : "draw engine (DCB)",
+                                dcb, dcb_all, dcb_snap, Pm4::HeaderCheckName(check));
+            dcb = {};
+            continue;
+        }
+
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
+            UNREACHABLE_MSG("Wrong PM4 type {}", type); // CheckHeader let it through
             break;
         case 2:
             // Type-2 packet are used for padding purposes
@@ -1210,8 +1416,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                // bbport: the guest sets the valid bit after submitting, in its own memory, and
+                // may write the packets after it until then: wait on guest memory, then copy
+                // the rest of the buffer again.
+                const bool copied = dcb_snap && dcb_snap->Contains(header);
+                if (copied) {
+                    rewind = reinterpret_cast<const PM4CmdRewind*>(dcb_snap->GuestAt(header));
+                }
                 while (!rewind->Valid()) {
                     YIELD_GFX();
+                }
+                if (copied) {
+                    const size_t words = dcb.size();
+                    std::memcpy(const_cast<u32*>(dcb.data()), dcb_snap->GuestAt(dcb.data()),
+                                words * sizeof(u32));
                 }
                 break;
             }
@@ -1253,8 +1471,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                const Pm4::IndirectRef ref{indirect_buffer->Address<const u32>(),
+                                           indirect_buffer->ib_size};
+                const Pm4::CommandSnapshot* child =
+                    dcb_snap ? dcb_snap->ChildFor(header, ref) : nullptr;
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    child ? child->Span() : std::span<const u32>{ref.address, ref.size}, {},
+                    NoSeq, child);
                 // Tasks start suspended: the nested body (and its scan) runs on this resume.
                 g_dcb_depth = dcb_depth + 1;
                 RESUME_GFX(task);
@@ -1306,9 +1529,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 break;
             }
-            default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
+            default: {
+                // bbport: reported, and the rest of the buffer skipped (BB_PM4_STRICT=1 stops).
+                char reason[64];
+                std::snprintf(reason, sizeof(reason), "unknown type-3 opcode %#x (count %u)",
+                              static_cast<u32>(opcode), count);
+                ReportInvalidPacket(dcb_depth ? "draw engine (indirect buffer)"
+                                              : "draw engine (DCB)",
+                                    dcb, dcb_all, dcb_snap, reason);
+                dcb = {};
+                continue;
+            }
             }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
@@ -1668,7 +1899,28 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    // bbport: the GPU thread parses copies taken now, not the guest's memory, which the guest
+    // may rewrite or free before that thread gets to it (pm4_snapshot.h). Indirect buffers are
+    // copied only with BB_PM4_SNAPSHOT_IB=1.
+    std::shared_ptr<SubmitSnapshot> snapshot;
+    if (Pm4SnapshotEnabled()) {
+        auto owned = std::make_shared<SubmitSnapshot>();
+        Pm4::SnapshotLimits limits;
+        limits.max_depth = Pm4SnapshotIndirect() ? limits.max_depth : 1;
+        std::size_t budget = limits.max_dwords;
+        auto* rast = rasterizer;
+        const auto readable = [rast](std::uintptr_t address, u64 bytes) {
+            return rast && rast->IsMapped(address, bytes);
+        };
+        owned->dcb = Pm4::TakeSnapshot(dcb, Pm4::OpIndirectBuffer, readable, limits, budget);
+        dcb = owned->dcb->Span();
+        if (!ccb.empty()) {
+            owned->ccb =
+                Pm4::TakeSnapshot(ccb, Pm4::OpIndirectBufferConst, readable, limits, budget);
+            ccb = owned->ccb->Span();
+        }
+        snapshot = std::move(owned);
+    } else if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
@@ -1684,7 +1936,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
             seq = gfx_submit_seq++;
             draw_prep->Enqueue(seq, std::move(prep_submission));
         }
-        auto task = ProcessGraphics(dcb, ccb, seq);
+        const Pm4::CommandSnapshot* dcb_snap = snapshot ? snapshot->dcb.get() : nullptr;
+        const Pm4::CommandSnapshot* ccb_snap = snapshot ? snapshot->ccb.get() : nullptr;
+        auto task = ProcessGraphics(dcb, ccb, seq, dcb_snap, ccb_snap, std::move(snapshot));
         queue.submits.emplace(task.handle);
     }
 

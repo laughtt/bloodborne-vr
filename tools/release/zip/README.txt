@@ -46,11 +46,13 @@ INSTALL THE ZIP IN 4 STEPS
    (SteamVR: Settings > OpenXR; Oculus app: Settings > General; Pimax Play / WMR: same switch).
 3. Run BloodborneVR.exe. It opens the dashboard window. On the first run it asks you to accept the
    legal note, then click "Choose folder" and pick the folder of YOUR game dump (the one that contains
-   eboot.bin). The "This PC" list shows what is ready (game dump, VR runtime, graphics card, DLSS
-   files, crash reports).
-4. Pick a profile (Default, Comfort, Performance, Quality (DLSS)) and press the big START VR button.
+   eboot.bin). The Ready check on the Play page shows what is ready (game folder, headset runtime,
+   graphics card and driver, Vulkan, DLSS).
+4. Pick a mode (VR, Co-op or Flat) and a VR quality (Low, Medium, High, Super High) on the Play page and press
+   the big PLAY button. The window has a sidebar of pages (Play, Graphics, Display & FPS, VR comfort, Combat &
+   hands, Controls, Online co-op, Advanced, Log, About); PLAY, Stop and the status line are always at the bottom.
    The first start checks the dump and builds the VR menu and hit-shape data from it (a few minutes,
-   once; stays on your PC in out\vr_assets), the log under the button shows the progress. Put the
+   once; stays on your PC in out\vr_assets), the Log page shows the progress. Put the
    headset on when it says "Starting". The first start compiles shaders and can take a while.
    Logs are in the logs\ folder next to BloodborneVR.exe.
 
@@ -61,7 +63,7 @@ the download are in SHA256SUMS.txt next to the zip.
 
 Web settings page instead of the dashboard: BloodborneVR.exe --web (or BloodborneVR-console.bat). Both edit
 the same settings. Any other launcher option also runs the console launcher:
-  BloodborneVR.exe --check (checks only)   --mono (flat screen in the headset)
+  BloodborneVR.exe --check (checks only)   --mono (VR render mode Mono)  --mode vr|coop|flat  --quality Low|Medium|High|"Super High"
   --game-dir "D:\dump\CUSA03173"           --reset (forget game folder and data)
 
 CONTROLS (alpha; may change)
@@ -123,28 +125,28 @@ PLAYING CO-OP (up to 3 players, join codes)
 -------------------------------------------
 Co-op is EXPERIMENTAL in this alpha. It uses the default lobby that comes with this release: there is
 nothing to type. Playing over the internet is not fully tested. Everyone needs game version 1.09 and this same
-release. Play solo needs no server and no account.
+release. The VR and Flat modes need no server and no account.
 
 A) HOST (the player whose world the others join)
 
 1. Open BloodborneVR.exe (the dashboard).
-2. On the Play tab press Play online.
-3. Press Host a game. A room code like K7Q-M4X appears (it also shows in the dashboard title).
+2. On the Play page pick Co-op.
+3. Press Host a game. A room code like K7Q-M4X appears (it stays on the Play page while the room lasts).
 4. Send the code to your friends (Discord, text message ...). Up to 2 friends can join (3 players in total).
-5. Press Start with this room, load your character and walk a little way into an area. Do not stand in the
+5. Press PLAY, load your character and walk a little way into an area. Do not stand in the
    area's entry zone, and the area's boss must still be alive.
 6. Nothing to press in the game: your bell rings by itself and your friends appear.
 
 B) FRIEND (joining)
 
 1. Open BloodborneVR.exe.
-2. On the Play tab press Play online.
-3. Type the room code under Join a friend and press Join.
-4. Press Start with this room, load your character and stay in the same region as the host.
+2. On the Play page pick Co-op.
+3. Type the room code under "or join a friend" and press Join.
+4. Press PLAY, load your character and stay in the same region as the host.
 5. Nothing to press in the game: your bell rings by itself and the host summons you. If you die or get sent home,
    it rings again by itself.
 
-Running your own lobby? Under Play online press the small Change next to "Lobby: default", enter your
+Running your own lobby? Under Co-op press the small Change next to "Lobby: default", enter your
 address and press Use. "Use the default lobby" switches back.
 
 If it does not work
@@ -155,24 +157,26 @@ If it does not work
   * The Windows firewall must allow BloodborneVR (allow it when Windows asks).
   * Co-op is experimental and internet play is not fully tested.
 
-Leave a room / play solo: press Leave (the host sees Close room) in the Play online card, or Leave room
-on the Online tab. Back returns to the Play tab, where Play solo starts the game without a room.
+Leave a room / play solo: press Leave (the host sees Close room) in the room card, or Leave room
+on the Online co-op page. Pick VR or Flat to play without a room.
 
 COMFORT, ONE-EYE VIEWING AND WEAKER PCS
 ----------------------------------------
-On the dashboard's Play tab, under the profile cards, View switches between 3D and Flat screen (mono), and
-picking a profile card (Default, Comfort, Performance, Quality (DLSS)) saves it at once. On a PC without an
-NVIDIA RTX card the Play tab also says "Low fps? Try Performance."
+On the dashboard's Play page, Mode is VR, Co-op or Flat, VR quality is Low, Medium, High or Super High (High plus DLSS-NR before the upscaler: needs your own nvngx_dlssnr.dll, which is not included; about 50-54 fps on an RTX 4090, full stereo; see docs/dlss-nr.md) (the Graphics page
+lists what each one sets) and VR render mode is Stereo (true 3D, the default) or Mono. Every change is saved at once;
+the big PLAY button at the bottom starts the game and Stop ends it.
 
-  * Cannot see 3D with both eyes, flicker or discomfort: set View to Flat screen (mono) (or Options tab, Display / VR,
-    Stereo mode = mono, or start with BloodborneVR.exe --mono). You get one big flat screen in the headset and the
-    controllers still work. If the depth looks wrong in 3D, try Swap eyes (Options, switch Advanced on) and Stereo scale.
-  * Motion sickness: pick the Comfort profile (snap turning, locked and eased camera animation, steadier camera).
-  * Weaker PC or low fps: pick the Performance profile (FSR 1 at 1.5x the frame instead of 2x, lower model detail).
-    You can also lower Frame limit (fps) and Eye resolution (Options tab, Display / VR and DLSS). With an NVIDIA RTX card,
-    the Quality (DLSS) profile gives the best picture.
-  * Defaults: Stereo mode alt (true 3D), Frame limit 72 fps, FSR 1 upscaling (DLSS quality on an RTX card), eye
-    resolution 2x the 1080p frame, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
+  * Cannot see 3D with both eyes, flicker, eye strain or discomfort: set VR render mode to Mono (Play page, or
+    Display & FPS; or start with BloodborneVR.exe --mono). You get one big flat screen in the headset and the
+    controllers still work. If the depth looks wrong in Stereo, try Swap eyes and Stereo scale (Display & FPS,
+    switch "Show advanced options" on).
+  * Motion sickness: the VR comfort page has snap turning, the locked and eased camera animation and a steadier camera
+    (the older Comfort profile in Advanced sets them in one go).
+  * Weaker PC or low fps: pick Low (or Medium) quality: a smaller eye image, and lower model detail on Low. You can
+    also lower Frame limit (fps). The preset table on the Graphics page shows the eye image size of each one.
+  * Defaults: VR render mode Stereo, quality High (DLSS quality on an RTX card, else FSR 1 at 2x the 1080p frame),
+    Frame limit 72 fps, FXAA, smooth turning (90 degrees per second), Stereo scale 0.77.
+  * Flat mode plays on the monitor with no headset; Co-op can be played in VR or on the flat screen.
 
 UPDATING (KEEP YOUR SAVES)
 --------------------------
@@ -183,22 +187,32 @@ UPDATING (KEEP YOUR SAVES)
 * If you later switch to a Setup.exe version: copy the zip folder's user\savedata to
   %LOCALAPPDATA%\BloodborneVR\user\ (create the folder if needed) before the first start of the installed version.
 
-SETTINGS (Options and DLSS tabs of the dashboard)
------------------------------------------------
-Groups: Display / VR, Comfort, Combat, Body / arms, UI, Patches, Advanced (switch "Advanced" on for more); the DLSS
-tab has the upscaler options. Profiles: Default (DLSS on RTX GPUs, else FSR 1), Comfort, Performance, Quality (DLSS) and
-Custom (your own values; editing any option switches to it). A blue LIVE tag means the option applies while the game
+SETTINGS (the option pages of the dashboard)
+-------------------------------------------
+Pages: Graphics (VR quality presets, upscaler, DLSS, game effects), Display & FPS (frame limit, fps counter, render mode),
+VR comfort (turning, camera, dodging, HUD and menus, wrist bar colours), Combat & hands, Advanced (switch "Show
+advanced options" on, in the sidebar, for more). VR quality presets (Low, Medium, High, Super High; all true stereo, both eyes rendered): the scene is always rendered at
+1920x1080 and the upscaler makes the eye image, so a bigger eye image looks sharper and costs more GPU time. Low: 1920x1080
+per eye (DLSS at the render size), lower model detail. Medium: 2400x1350 (Display resolution 85%). Low starts at 70%. High: DLSS quality, 2880x1620 (FSR 1 at 2x
+without DLSS). Super High: the same eye image with DLSS-NR on (placed before the upscaler), greyed out without your own nvngx_dlssnr.dll (about 50-54 fps on an RTX 4090, full stereo). Display size (Play page): your headset (Auto, a named one, custom) and Display resolution (50-150%) set the eye image for it and win over the preset's own size; the preset picks the upscaler and DLSS-NR. Any single value you change on the Graphics page stays on top of the preset (marked
+EDITED; "Reset to preset" undoes it); choosing a preset drops those edits. The older profiles (Comfort, Performance,
+Quality (DLSS), Custom) are on the Advanced page. A gold LIVE tag means the option applies while the game
 runs (keep the dashboard open and change it there); RESTART needs a new start. Changes are saved at once.
-Combat > Hitboxes: Big (default) makes your weapon's hit shapes wider and a little longer; Original uses exactly the game's own
+Combat & hands > Hitboxes: Big (default) makes your weapon's hit shapes wider and a little longer; Original uses exactly the game's own
 shapes. Enemies are never changed. Live.
 The web page (--web) shows the same options, opens in Edge / Chrome / your browser, is served only on your own PC
 (127.0.0.1) and is protected by a one-time token. Changed control files keep a .bak of the original.
-DLSS is the default upscaler on an NVIDIA RTX GPU (quality, preset K; other GPUs use FSR 1) and works out of the box: bin/nvngx_dlss.dll
+DLSS is the default upscaler on an NVIDIA RTX GPU (High: quality, preset K; other GPUs use FSR 1) and works out of the box: bin/nvngx_dlss.dll
 (NVIDIA's DLSS runtime, unmodified, redistributed under the NVIDIA RTX SDKs LICENSE) and bin/bbport_dlss.dll (our bridge)
 are part of this download. This program uses NVIDIA DLSS; the licence and the end-user terms are in
 licenses/NVIDIA-DLSS-LICENSE.txt and licenses/NVIDIA-DLSS-NOTICE.txt. Not sponsored or endorsed by NVIDIA.
+DLSS-NR (Super High; experimental): an optional NVIDIA neural-rendering pass (RTX GPU only). Its model file nvngx_dlssnr.dll is
+NVIDIA's, is not part of the public DLSS SDK and is NOT included; this project does not link to a download. If you already have a
+copy on your PC, press "Find file..." on the Super High card (or the Graphics page): the launcher copies it next to bb-probe.exe.
+"What is this?" opens the short help page (docs/dlss-nr.md). Without the file the game runs High. Super High places DLSS-NR before
+the upscaler (dlssnr_place=pre, 1 pass); the Graphics page has the other settings.
 ReShade: a globally installed ReShade Vulkan layer is kept out of the game automatically.
-Choosing an OpenXR runtime in Advanced affects only this game. SteamVR on Pimax can show double
+Choosing an OpenXR runtime on the Advanced page affects only this game. SteamVR on Pimax can show double
 images: pick the Pimax runtime.
 
 KNOWN ISSUES

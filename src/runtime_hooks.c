@@ -47,6 +47,10 @@
  */
 #define _GNU_SOURCE
 #include "hooks.h"
+#include "vr_hook_prof.h"
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -310,6 +314,8 @@ static void emit_save_call_restore(unsigned char **q, uint64_t site_abs, BbHookF
     for (int n = 0; n < 16; n++) rsp_ymm(q, 1, n, 0x98 + n * 32); /* save YMM0..15 (full 256-bit) */
     w8(q, 0x0F); w8(q, 0xAE); w8(q, 0x9C); w8(q, 0x24); w32(q, 0x90); /* stmxcsr [rsp+MXCSR] */
     w8(q, 0x48); w8(q, 0xB8); w64(q, site_abs); rsp_mem(q, 0x89, 0, 0x88); /* movabs rax,site; mov [rsp+RIP],rax */
+    w8(q, 0xC5); w8(q, 0xF8); w8(q, 0x77);      /* vzeroupper: the guest's upper halves are saved above; the host code is SSE, and SSE
+                                                 * with dirty upper halves pays transition / false-dependency stalls on every hook call */
 
     w8(q, 0x48); w8(q, 0x89); w8(q, 0xE7);      /* mov rdi,rsp  (arg0 = &ctx) */
     w8(q, 0x48); w8(q, 0x89); w8(q, 0xE3);      /* mov rbx,rsp  (ctx ptr; rbx is callee-saved) */
@@ -400,6 +406,86 @@ const char *bb_hook_install(unsigned char *image, uint64_t site_offset, uint64_t
     return NULL;
 }
 
+/* ---- hook profiler (src/vr_hook_prof.h): time every VR handler, one "VR hooks:" line per 10 s ---- */
+static const char *const prof_names[BB_PROF_COUNT] = {
+    "Camera H1", "Camera H2", "LOD fix", "FP step+UI step", "Stamina cost", "Stamina hit chr", "Stamina hit map",
+    "Stamina hit obj", "Stamina tick", "Stereo proj SetCamera", "Stereo proj pass", "Arms IK A1", "Arms IK A2", "Arms IK A3",
+    "Arms IK sync", "Arms IK player", "UI equip", "Gun aim", "Hitbox scale", "Attack speed+evade", "Visceral pad poll",
+    "Gun view (camera frame)", "  in H1: views", "  in H1: first person", "  in H1: stereo eye", "  in arms: lock wait", "  in arms: edit",
+    "  in fp: cutscene/Remo check", "  in fp: chain+eye bone", "  in fp: model hide+skin mask", "  in fp: lock-on state", "  in fp: turn+face", "  in fp: dash", "  in fp: log line",
+};
+static struct { _Atomic uint64_t calls, total, max, over; } prof_acc[BB_PROF_COUNT];
+static _Atomic int prof_state = -1; /* -1: BB_VR_HOOK_PROFILE not read yet */
+static uint64_t prof_hz;            /* ticks per second */
+static uint64_t prof_period;        /* ticks between two lines (10 s; BB_VR_HOOK_PROFILE_S for tests) */
+static _Atomic uint64_t prof_next, prof_last;
+
+static uint64_t prof_clock(void) {
+#ifdef _WIN32
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (uint64_t)c.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+static int prof_on(void) {
+    int st = atomic_load_explicit(&prof_state, memory_order_acquire);
+    if (st >= 0) return st;
+    const char *e = getenv("BB_VR_HOOK_PROFILE");
+    st = !(e && e[0] == '0');
+    if (st) {
+#ifdef _WIN32
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        prof_hz = (uint64_t)f.QuadPart;
+#else
+        prof_hz = 1000000000ull;
+#endif
+        double secs = 10.0;
+        const char *ps = getenv("BB_VR_HOOK_PROFILE_S");
+        if (ps && atof(ps) > 0.0) secs = atof(ps);
+        prof_period = (uint64_t)(secs * (double)prof_hz);
+        const uint64_t now = prof_clock();
+        atomic_store(&prof_last, now);
+        atomic_store(&prof_next, now + prof_period);
+    }
+    atomic_store_explicit(&prof_state, st, memory_order_release);
+    return st;
+}
+static void prof_report(uint64_t now) {
+    uint64_t next = atomic_load(&prof_next);
+    if (now < next || !atomic_compare_exchange_strong(&prof_next, &next, now + prof_period)) return; /* one thread reports */
+    const double secs = (double)(now - atomic_exchange(&prof_last, now)) / (double)prof_hz;
+    VhpSnap s[BB_PROF_COUNT];
+    for (int i = 0; i < BB_PROF_COUNT; i++) {
+        s[i].name = prof_names[i];
+        s[i].calls = atomic_exchange_explicit(&prof_acc[i].calls, 0, memory_order_relaxed);
+        s[i].total_ticks = atomic_exchange_explicit(&prof_acc[i].total, 0, memory_order_relaxed);
+        s[i].max_ticks = atomic_exchange_explicit(&prof_acc[i].max, 0, memory_order_relaxed);
+        s[i].over = atomic_exchange_explicit(&prof_acc[i].over, 0, memory_order_relaxed);
+    }
+    char line[4096];
+    vhp_format(line, sizeof(line), s, BB_PROF_COUNT, (double)prof_hz / 1000.0, secs);
+    fprintf(stderr, "%s\n", line);
+}
+uint64_t bb_vrprof_t0(void) { return prof_on() ? prof_clock() : 0; }
+void bb_vrprof_end(int slot, uint64_t t0) {
+    if (!t0 || slot < 0 || slot >= BB_PROF_COUNT) return;
+    const uint64_t t1 = prof_clock(), d = t1 - t0;
+    atomic_fetch_add_explicit(&prof_acc[slot].calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&prof_acc[slot].total, d, memory_order_relaxed);
+    if (d > atomic_load_explicit(&prof_acc[slot].max, memory_order_relaxed)) { /* racy max: good enough, rarely taken */
+        uint64_t m = atomic_load_explicit(&prof_acc[slot].max, memory_order_relaxed);
+        while (d > m && !atomic_compare_exchange_weak(&prof_acc[slot].max, &m, d)) {}
+    }
+    if (d * 1000 > prof_hz * (uint64_t)VHP_OVER_MS) atomic_fetch_add_explicit(&prof_acc[slot].over, 1, memory_order_relaxed);
+    if (t1 >= atomic_load_explicit(&prof_next, memory_order_relaxed)) prof_report(t1);
+}
+#define PROF(slot, call) do { const uint64_t t0_ = bb_vrprof_t0(); call; bb_vrprof_end((slot), t0_); } while (0)
+
 /* ---- registry ---- */
 static uint64_t test_counter;
 uint64_t bb_hook_test_counter_value(void) { return test_counter; }
@@ -442,13 +528,13 @@ void bb_hook_set_camera_impl(BbHookFn h1, BbHookFn h2, BbHookFn lod) {
     camera_impl[2] = lod;
 }
 static ABI void hook_camera_inject(BbHookContext *ctx) {
-    if (camera_impl[0]) camera_impl[0](ctx); /* rbx = the draw step's private PersCam */
+    if (camera_impl[0]) PROF(BB_PROF_H1, camera_impl[0](ctx)); /* rbx = the draw step's private PersCam */
 }
 static ABI void hook_camera_inject_fmtb(BbHookContext *ctx) {
-    if (camera_impl[1]) camera_impl[1](ctx); /* rbx = the main context's format-B camera */
+    if (camera_impl[1]) PROF(BB_PROF_H2, camera_impl[1](ctx)); /* rbx = the main context's format-B camera */
 }
 static ABI void hook_vr_lod(BbHookContext *ctx) {
-    if (camera_impl[2]) camera_impl[2](ctx); /* rbx = the draw context, xmm0 = the FOV's LOD term */
+    if (camera_impl[2]) PROF(BB_PROF_LOD, camera_impl[2](ctx)); /* rbx = the draw context, xmm0 = the FOV's LOD term */
 }
 
 /* First person (src/runtime_vr_fp.c, findings/16): in the in-game step at 0x1d3be5a (replay-after,
@@ -460,8 +546,10 @@ void bb_hook_set_fp_impl(BbHookFn cam) { fp_impl = cam; }
  * every gameplay frame on the game thread, after first person's handler. */
 void bb_hook_set_step_extra(BbHookFn step) { step_extra = step; }
 static ABI void hook_vr_fp_cam(BbHookContext *ctx) {
+    const uint64_t t0 = bb_vrprof_t0();
     if (fp_impl) fp_impl(ctx);
     if (step_extra) step_extra(ctx);
+    bb_vrprof_end(BB_PROF_FP_STEP, t0);
 }
 
 /* "Misses are free" stamina (src/runtime_vr_stamina.c, findings/20 1.5 and 6.2 G3), all replay-after:
@@ -478,19 +566,19 @@ void bb_hook_set_stamina_impl(BbHookFn cost, BbHookFn hit_chr, BbHookFn hit_map,
     stamina_impl[4] = tick;
 }
 static ABI void hook_vr_stamina_cost(BbHookContext *ctx) {
-    if (stamina_impl[0]) stamina_impl[0](ctx);
+    if (stamina_impl[0]) PROF(BB_PROF_STAMINA_COST, stamina_impl[0](ctx));
 }
 static ABI void hook_vr_hit_chr(BbHookContext *ctx) {
-    if (stamina_impl[1]) stamina_impl[1](ctx);
+    if (stamina_impl[1]) PROF(BB_PROF_HIT_CHR, stamina_impl[1](ctx));
 }
 static ABI void hook_vr_hit_map(BbHookContext *ctx) {
-    if (stamina_impl[2]) stamina_impl[2](ctx);
+    if (stamina_impl[2]) PROF(BB_PROF_HIT_MAP, stamina_impl[2](ctx));
 }
 static ABI void hook_vr_hit_obj(BbHookContext *ctx) {
-    if (stamina_impl[3]) stamina_impl[3](ctx);
+    if (stamina_impl[3]) PROF(BB_PROF_HIT_OBJ, stamina_impl[3](ctx));
 }
 static ABI void hook_vr_stamina_tick(BbHookContext *ctx) {
-    if (stamina_impl[4]) stamina_impl[4](ctx);
+    if (stamina_impl[4]) PROF(BB_PROF_STAMINA_TICK, stamina_impl[4](ctx));
 }
 
 /* Alternate-eye stereo, off-axis frusta (src/runtime_vr_stereo.c, findings/22 section 6), both
@@ -503,10 +591,10 @@ void bb_hook_set_stereo_impl(BbHookFn proj_setcamera, BbHookFn proj_pass) {
     stereo_impl[1] = proj_pass;
 }
 static ABI void hook_vr_proj_setcamera(BbHookContext *ctx) {
-    if (stereo_impl[0]) stereo_impl[0](ctx);
+    if (stereo_impl[0]) PROF(BB_PROF_PROJ_SETCAMERA, stereo_impl[0](ctx));
 }
 static ABI void hook_vr_proj_pass(BbHookContext *ctx) {
-    if (stereo_impl[1]) stereo_impl[1](ctx);
+    if (stereo_impl[1]) PROF(BB_PROF_PROJ_PASS, stereo_impl[1](ctx));
 }
 
 /* VR arms (src/runtime_vr_arms.c, findings/24), replay-after at both AnimationToModel copies right
@@ -521,19 +609,19 @@ void bb_hook_set_arms_impl(BbHookFn a1, BbHookFn a2, BbHookFn a3, BbHookFn sync,
     arms_impl[4] = player;
 }
 static ABI void hook_vr_arms_player(BbHookContext *ctx) {
-    if (arms_impl[4]) arms_impl[4](ctx);
+    if (arms_impl[4]) PROF(BB_PROF_ARMS_PLAYER, arms_impl[4](ctx));
 }
 static ABI void hook_vr_arms_a3(BbHookContext *ctx) {
-    if (arms_impl[2]) arms_impl[2](ctx);
+    if (arms_impl[2]) PROF(BB_PROF_ARMS_A3, arms_impl[2](ctx));
 }
 static ABI void hook_vr_arms_sync(BbHookContext *ctx) {
-    if (arms_impl[3]) arms_impl[3](ctx);
+    if (arms_impl[3]) PROF(BB_PROF_ARMS_SYNC, arms_impl[3](ctx));
 }
 static ABI void hook_vr_arms_a1(BbHookContext *ctx) {
-    if (arms_impl[0]) arms_impl[0](ctx);
+    if (arms_impl[0]) PROF(BB_PROF_ARMS_A1, arms_impl[0](ctx));
 }
 static ABI void hook_vr_arms_a2(BbHookContext *ctx) {
-    if (arms_impl[1]) arms_impl[1](ctx);
+    if (arms_impl[1]) PROF(BB_PROF_ARMS_A2, arms_impl[1](ctx));
 }
 
 /* VR UI (src/runtime_vr_ui.c, findings/26): replay-after at the entry of the HUD input handler
@@ -542,7 +630,7 @@ static ABI void hook_vr_arms_a2(BbHookContext *ctx) {
 static BbHookFn ui_impl;
 void bb_hook_set_ui_impl(BbHookFn menu) { ui_impl = menu; }
 static ABI void hook_vr_ui_menu(BbHookContext *ctx) {
-    if (ui_impl) ui_impl(ctx);
+    if (ui_impl) PROF(BB_PROF_UI_MENU, ui_impl(ctx));
 }
 
 /* VR gun aim (src/runtime_vr_gun.c, findings/27): replay-after at the entry of SprjBulletIns's launch
@@ -550,7 +638,7 @@ static ABI void hook_vr_ui_menu(BbHookContext *ctx) {
 static BbHookFn gun_impl;
 void bb_hook_set_gun_impl(BbHookFn launch) { gun_impl = launch; }
 static ABI void hook_vr_gun_aim(BbHookContext *ctx) {
-    if (gun_impl) gun_impl(ctx);
+    if (gun_impl) PROF(BB_PROF_GUN_AIM, gun_impl(ctx));
 }
 
 /* VR hit scale (src/runtime_vr_hitscale.c, findings/32): replay-after at 0x1c5fa55 in the attack update
@@ -558,7 +646,7 @@ static ABI void hook_vr_gun_aim(BbHookContext *ctx) {
 static BbHookFn hitscale_impl;
 void bb_hook_set_hitscale_impl(BbHookFn shape) { hitscale_impl = shape; }
 static ABI void hook_vr_hit_scale(BbHookContext *ctx) {
-    if (hitscale_impl) hitscale_impl(ctx);
+    if (hitscale_impl) PROF(BB_PROF_HIT_SCALE, hitscale_impl(ctx));
 }
 
 /* VR attack speed (src/runtime_vr_atkspeed.c): replay-after at 0x1cbd711 in the ChrIns update 0x1cbd6a0
@@ -566,7 +654,7 @@ static ABI void hook_vr_hit_scale(BbHookContext *ctx) {
 static BbHookFn atkspeed_impl;
 void bb_hook_set_atkspeed_impl(BbHookFn dt) { atkspeed_impl = dt; }
 static ABI void hook_vr_atk_speed(BbHookContext *ctx) {
-    if (atkspeed_impl) atkspeed_impl(ctx);
+    if (atkspeed_impl) PROF(BB_PROF_ATK_SPEED, atkspeed_impl(ctx));
 }
 
 static const struct { const char *name; BbHookFn fn; } registry[] = {

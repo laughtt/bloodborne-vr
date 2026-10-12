@@ -74,6 +74,30 @@ public:
     bool Evaluate(vk::CommandBuffer command, const Frame& frame, u32 slot = FlatSlot);
     void ReleaseFeature(u32 slot = FlatSlot);
 
+    // bbport VR DLSS-NR (vk_xr_dlssnr.h): the player's nvngx_dlssnr.dll through the bridge's
+    // BbDlssGetNrApi. Its features are separate from the DLSS slots above.
+    static constexpr u32 NrSlots = 6;
+    /// The bridge can run DLSS-NR (whether the DLL loads is NrInitialize's answer).
+    [[nodiscard]] bool HasNr() const;
+    /// Loads and initialises nvngx_dlssnr.dll the first time it is called; later calls return
+    /// that first result.
+    bool NrInitialize();
+    struct NrRect {
+        u32 x, y, width, height;
+    };
+    struct NrFrame {
+        Resource color, output;
+        NrRect color_rect, output_rect;
+        bool reset;
+        int style;
+        float intensity, local_tone, local_structure, skin_structure;
+    };
+    /// Records the feature creation (regions up to width x height). The GPU must be done with the
+    /// slot's previous feature.
+    bool NrCreateFeature(vk::CommandBuffer command, u32 slot, u32 width, u32 height);
+    bool NrEvaluate(vk::CommandBuffer command, u32 slot, const NrFrame& frame);
+    void NrReleaseFeature(u32 slot);
+
 private:
     Dlss();
     struct Impl;

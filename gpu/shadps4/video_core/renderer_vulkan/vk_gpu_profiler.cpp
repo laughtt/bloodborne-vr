@@ -47,6 +47,19 @@ void GpuProfiler::WriteTimestamp(u64 key) {
     });
 }
 
+bool GpuProfiler::TakeFrameMs(double& ms_per_frame) {
+    if (!instance_ptr) {
+        return false;
+    }
+    const u64 frames = taken_frames.exchange(0, std::memory_order_relaxed);
+    const u64 ns = taken_ns.exchange(0, std::memory_order_relaxed);
+    if (frames == 0) {
+        return false;
+    }
+    ms_per_frame = double(ns) / 1e6 / double(frames);
+    return true;
+}
+
 void GpuProfiler::BeginFrame() {
     // Close the frame: one more timestamp without a label.
     if (used[slice] > 0 && used[slice] < SliceQueries) {
@@ -80,6 +93,11 @@ void GpuProfiler::Collect(u32 which) {
         vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
     if (result != vk::Result::eSuccess) {
         return;
+    }
+    if (count >= 2) {
+        taken_ns.fetch_add(u64(double(stamps[count - 1] - stamps[0]) * period_ns),
+                           std::memory_order_relaxed);
+        taken_frames.fetch_add(1, std::memory_order_relaxed);
     }
     for (u32 i = 0; i + 1 < count; ++i) {
         const double ms = double(stamps[i + 1] - stamps[i]) * period_ns / 1e6;

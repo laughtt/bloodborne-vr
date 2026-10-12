@@ -45,15 +45,21 @@
  *     arm_tp=0|1 arm_rest=<out,up,forward[,pitch_deg]> arm_pole=<out,down,back> arm_twist=<0..1>
  *     arm_fake_r=<x,y,z[,yaw,pitch,roll]> arm_fake_l=... arm_offset=<x,y,z[,pitch_deg]> arm_log=0|1
  *     arm_rot_l=<yaw,pitch> arm_rot_r=...: per hand aim trim (deg, + = right / up, controller axes)
+ *     arm_roll_detach=0|1 (1): while a roll / quickstep / backstep plays the shoulders and clavicles come from a
+ *       camera-frame pin of the last frame before it, not from the tumbling animation (findings/24 section 8)
+ *   BB_VR_ARMS_ROLL_DETACH=0|1 (1) the start value of arm_roll_detach; BB_VR_FP_LOG / BB_VR_EVADE_LOG=1: a line per detach/attach
  */
 #define _GNU_SOURCE
 #include "hooks.h"
 #include "vr_arms.h"
+#include "vr_arms_roll.h"
+#include "vr_evade_scale.h"
 #include "vr_arm_math.h"
 #include "vr_fp.h"
 #include "vr_fp_math.h"
 #include "vr_hitbox.h"
 #include "gpu/bbgpu.h"
+#include "vr_mem_cache.h"
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -145,6 +151,8 @@ static struct {
     int at;                 /* where the arms are written (arm_at=): AT_PLAYER (default), AT_COPY (A1-A3), AT_SYNC */
     float last_upper[2][4]; /* the upper arm rotation last written per side (a second call in one frame skips) */
     int anim, attack;
+    int roll_detach, roll_log, roll_was; /* arm_roll_detach, the log switch, the last frame's state */
+    VrArmsRoll roll;
     float reach[2];
     int clamped[2];
     float roll_prev[2];  /* last wrist roll per side (unwrapped continuity) */
@@ -187,6 +195,7 @@ typedef struct {
     VrVec3 head_pos;  /* OpenXR */
     VrQuat head_rot;
     VrVec3 body_pos;  /* the character's world position (vr_fp_body), for the hitbox overlay */
+    VrVec3 rel_vel;   /* (camera - body) in model space per second, from the last two snapshots (vr_roll_rel_vel) */
 } ArmView;
 static ArmView arm_view[2];
 static _Atomic uint32_t arm_view_seq;
@@ -203,7 +212,15 @@ void vr_arms_view(const float rows[4][4], int head_valid, const float head_pos[3
     if (!vr_fp_body(&pos, &yaw)) return;
     const uint32_t seq = atomic_load_explicit(&arm_view_seq, memory_order_relaxed);
     ArmView *v = &arm_view[(seq + 1) & 1];
-    v->time_us = arm_now_us();
+    const uint64_t t_us = arm_now_us();
+    static VrVec3 prev_cam, prev_body;
+    static uint64_t prev_us;
+    const VrVec3 cam_w = vr_v3(rows[3][0], rows[3][1], rows[3][2]);
+    v->rel_vel = prev_us ? vr_roll_rel_vel(prev_cam, prev_body, cam_w, pos, yaw, (float)(t_us - prev_us) * 1e-6f) : vr_v3(0, 0, 0);
+    prev_cam = cam_w;
+    prev_body = pos;
+    prev_us = t_us;
+    v->time_us = t_us;
     vam_camera_in_model(rows, pos, yaw, &v->cam_pos, &v->cam_rot);
     v->yaw = yaw;
     v->body_pos = pos;
@@ -242,34 +259,11 @@ int vr_arms_hitbox_view(VhbView *out, uint64_t max_age_us) {
 
 /* ---- guest memory (own guard: this may run on another thread than H1's) ---- */
 #ifdef _WIN32
-static _Thread_local struct { uintptr_t lo, hi; int write; } arm_regions[16];
-static _Thread_local int arm_region_count;
-static _Thread_local uint64_t arm_regions_time;
+/* VirtualQuery of the guest mappings took ms on a cold lookup (run12e: Arms IK hitches of 7-11 ms): see vr_mem_cache.h */
+static _Thread_local VmCache arm_cache;
 static int arm_mem_ok(uintptr_t a, size_t n, int write) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const uint64_t now = arm_now_us();
-    if (now - arm_regions_time > 1000000) { arm_region_count = 0; arm_regions_time = now; }
-    for (int i = 0; i < arm_region_count; ++i)
-        if (arm_regions[i].lo <= a && a + n <= arm_regions[i].hi && (!write || arm_regions[i].write)) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        const DWORD rw = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ | rw))) return 0;
-        const int can_write = (mbi.Protect & rw) != 0;
-        if (write && !can_write) return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (arm_region_count < (int)(sizeof(arm_regions) / sizeof(*arm_regions))) {
-            arm_regions[arm_region_count].lo = lo;
-            arm_regions[arm_region_count].hi = hi;
-            arm_regions[arm_region_count].write = can_write;
-            ++arm_region_count;
-        }
-        at = hi;
-    }
-    return 1;
+    (void)write; /* the arrays written are the game's live heap data: readable is writable */
+    return vm_readable(&arm_cache, a, n);
 }
 #else
 static int arm_mem_ok(uintptr_t a, size_t n, int for_write) {
@@ -320,6 +314,8 @@ static void arms_init(void) {
     arms.enabled = env_on("BB_VR_ARMS");
     arms.log = env_on("BB_VR_ARMS_LOG");
     arms.on = 1;
+    arms.roll_detach = !getenv("BB_VR_ARMS_ROLL_DETACH") || env_on("BB_VR_ARMS_ROLL_DETACH");
+    arms.roll_log = env_on("BB_VR_FP_LOG") || env_on("BB_VR_EVADE_LOG");
     const char *e = getenv("BB_VR_ARMS_SRC");
     arms.src = e ? src_parse(e) : SRC_XR; /* xr falls back to rest while there are no valid hands */
     arms.weight_max = 1.0f;
@@ -370,6 +366,7 @@ static void arms_apply_key(const char *k, const char *v) {
     else if (!strcmp(k, "arm_tp")) arms.tp = ok && x != 0.0f;
     else if (!strcmp(k, "arm_log")) arms.log = ok && x != 0.0f;
     else if (!strcmp(k, "arm_at")) arms.at = at_parse(v);
+    else if (!strcmp(k, "arm_roll_detach")) arms.roll_detach = ok && x != 0.0f;
     else if (!strcmp(k, "arm_body")) arms.body_on = ok && x != 0.0f;
     else if (!strcmp(k, "arm_body_dz") && ok) arms.body_dz = vr_clampf(x, 0.0f, 180.0f);
     else if (!strcmp(k, "arm_body_tau") && ok) arms.body_tau = vr_clampf(x, 0.0f, 5.0f);
@@ -660,6 +657,30 @@ static int arms_target(int side, const VamArmBind *b, VrVec3 shoulder, float bod
 
 static VrQuat q_blend(VrQuat from, VrQuat to, float w) { return w >= 1.0f ? to : vr_qnlerp(from, to, w); }
 
+/* The clavicle of `side` at its camera-frame pin (blended in by the detach amount) and everything that hangs
+ * off it outside the arm subtree (shoulder pads, cloth helpers) moved by the same rigid step. Skipped when the
+ * parent of the UpperArm is not the clavicle bone or is shared by both arms. */
+static void arms_roll_clavicle(int side, const ArmView *view, VrXform *old, VrXform *neu, uint8_t *ok, uint8_t *dirty,
+                               uintptr_t model, int n_model) {
+    const ArmBones *a = &arms.arm[side];
+    const int cp = arms.parent[a->upper];
+    if (cp < 0 || cp != a->clavicle || !ok[cp] || cp == arms.parent[arms.arm[1 - side].upper]) return;
+    const VrXform pin = vr_roll_from_cam(view->cam_pos, view->cam_rot, arms.roll.clav[side]);
+    const VrXform now = vr_roll_blend(old[cp], pin, arms.roll.e);
+    const VrXform delta = vr_xf_mul(now, vr_xf_inverse(old[cp]));
+    static _Thread_local uint8_t under[ARM_MAX_BONES];
+    neu[cp] = now;
+    dirty[cp] = 1;
+    for (int i = 0; i < n_model; ++i) {
+        const int p = arms.parent[i];
+        under[i] = i > cp && p >= 0 && (p == cp || under[p]);
+        if (!under[i] || arms.side_of[i]) continue;
+        if (!vr_xf_from_qs((const float *)(model + (uintptr_t)i * 48), &old[i])) continue;
+        neu[i] = vr_xf_mul(delta, old[i]);
+        dirty[i] = 1;
+    }
+}
+
 static void arms_edit(uintptr_t pose, int which, uint64_t now) {
     float dt = arms.last_us ? (float)(now - arms.last_us) * 1e-6f : 0.0f;
     arms.last_us = now;
@@ -674,6 +695,7 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
             view.cam_pos = vr_qrotate(d, view.cam_pos);
             view.cam_rot = vr_qnormalize(vr_qmul(d, view.cam_rot));
             view.shift = vr_qrotate(d, view.shift);
+            view.rel_vel = vr_qrotate(d, view.rel_vel);
             view.yaw = live;
         }
     }
@@ -692,6 +714,18 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
         fprintf(stderr, "VR arms: first player pose at %s: src %s, arm %d, view %d, first person %d, target weight %.2f%s\n",
                 site_names[which], src_names[arms.src], arms.on, have_view, fp_now, target,
                 target <= 0.0f ? " (nothing written until it rises: arm=1 and first person, or arm_tp=1)" : "");
+    }
+    /* an evade clip: the arms leave the body (findings/24 section 8) */
+    const int evading = arms.roll_detach && fp_now && vr_evade_move(arms.anim) != NULL;
+    const int roll_cap = vr_roll_capturing(&arms.roll, evading);
+    vr_roll_step(&arms.roll, evading, dt, VR_ROLL_BLEND_S);
+    /* the view is one render old: in an evade the camera moves against the body, so advance it by that (vr_arms_roll.h) */
+    if (have_view && arms.roll.e > 0.0f) view.cam_pos = vr_roll_lead(view.cam_pos, view.rel_vel, dt, arms.roll.e);
+    if (evading != arms.roll_was) {
+        arms.roll_was = evading;
+        if (arms.roll_log)
+            fprintf(stderr, "VR arms: %s the arms %s the body (anim a%03d_%06d, pins L %d R %d)\n", evading ? "detach" : "attach",
+                    evading ? "from" : "to", arms.anim / 1000000, arms.anim % 1000000, arms.roll.has[0], arms.roll.has[1]);
     }
     if (arms.w <= 0.0f) return;
 
@@ -747,7 +781,21 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
             const float *u = (const float *)(model + (uintptr_t)a->upper * 48 + 16);
             if (!memcmp(u, arms.last_upper[side], sizeof(arms.last_upper[side]))) continue;
         }
-        const VrVec3 shoulder = vr_add(body_yaw != 0.0f ? vam_turn_about(old[a->upper].t, pivot, body_yaw) : old[a->upper].t, shift);
+        VrVec3 shoulder = vr_add(body_yaw != 0.0f ? vam_turn_about(old[a->upper].t, pivot, body_yaw) : old[a->upper].t, shift);
+        if (have_view && arms.roll_detach) {
+            const int cp = arms.parent[a->upper];
+            if (roll_cap) { /* the last frame before an evade: the shoulder and the clavicle in the camera frame */
+                arms.roll.shoulder[side] = vr_roll_to_cam(view.cam_pos, view.cam_rot, vr_xf(shoulder, vr_qidentity()));
+                arms.roll.has[side] = 1;
+                if (cp >= 0 && ok[cp]) arms.roll.clav[side] = vr_roll_to_cam(view.cam_pos, view.cam_rot, old[cp]);
+                else arms.roll.has[side] = 0;
+            } else if (arms.roll.e > 0.0f && arms.roll.has[side]) {
+                const VrXform pin = vr_roll_from_cam(view.cam_pos, view.cam_rot, arms.roll.shoulder[side]);
+                shoulder = vam_lerp(shoulder, pin.t, arms.roll.e);
+                /* the clavicle follows its pin, and what hangs off it (shoulder pads, cloth) moves with it */
+                arms_roll_clavicle(side, &view, old, neu, ok, dirty, model, n_model);
+            }
+        }
         VrVec3 wrist;
         VrQuat hand_rot;
         if (!arms_target(side, &a->bind, shoulder, body_yaw, &view, have_view, &wrist, &hand_rot)) continue;
@@ -830,7 +878,11 @@ static void arms_hook(BbHookContext *ctx, int which, uint32_t site, uintptr_t mo
      * the "double arms" of alternate-eye stereo, findings/24 5.3); the diagnostic sites skip. */
     const int at = arms.at;
     const int edit_site = at == AT_PLAYER ? which == 4 : at == AT_SYNC ? which == 3 : which <= 2;
-    if (edit_site) arms_lock_spin();
+    if (edit_site) {
+        const uint64_t prof_t0 = bb_vrprof_t0();
+        arms_lock_spin();
+        bb_vrprof_end(BB_PROF_ARMS_LOCK, prof_t0);
+    }
     else {
         int expected = 0;
         if (!atomic_compare_exchange_strong(&arms_busy, &expected, 1)) { ++arms.skipped_busy; return; }
@@ -871,7 +923,11 @@ static void arms_hook(BbHookContext *ctx, int which, uint32_t site, uintptr_t mo
             }
             if (k < ARM_CALLERS) ++arms.caller_hits[k];
         }
-        if (edit_here) arms_edit(pose, which, now);
+        if (edit_here) {
+            const uint64_t prof_t0 = bb_vrprof_t0();
+            arms_edit(pose, which, now);
+            bb_vrprof_end(BB_PROF_ARMS_EDIT, prof_t0);
+        }
     }
     if ((arms.log || arms.diag_lines < 20) && now >= arms.next_log) {
         if (!arms.log) ++arms.diag_lines;

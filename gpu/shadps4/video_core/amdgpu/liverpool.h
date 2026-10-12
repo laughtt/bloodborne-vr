@@ -9,6 +9,7 @@
 #include <deque>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -34,6 +35,9 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 union PM4Header;
+namespace Pm4 {
+struct CommandSnapshot;
+}
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -220,8 +224,14 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq);
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    /// bbport: a submission's command buffers as copied at submit (pm4_snapshot.h); the
+    /// coroutine owns it until it is done.
+    struct SubmitSnapshot;
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq,
+                         const Pm4::CommandSnapshot* dcb_snap = nullptr,
+                         const Pm4::CommandSnapshot* ccb_snap = nullptr,
+                         std::shared_ptr<const SubmitSnapshot> owner = {});
+    Task ProcessCeUpdate(std::span<const u32> ccb, const Pm4::CommandSnapshot* snap = nullptr);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 

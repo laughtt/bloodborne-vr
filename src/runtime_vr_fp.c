@@ -100,11 +100,13 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "hooks.h"
+#include "vr_mem_cache.h"
 #include "vr_fp.h"
 #include "vr_fp_math.h"
 #include "vr_dash_game.h"
 #include "vr_dash_detect.h"
 #include "vr_turn_math.h"
+#include "vr_backstep.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,6 +229,12 @@ static _Atomic uint32_t fp_pad_bits[3];       /* floats: right stick X, left sti
 static _Atomic uint64_t fp_pad_time_us;       /* when the pad sampler last ran */
 static _Atomic int fp_stick_to_game = 1;      /* the right stick goes to the game (turn=game|off, lock-on) */
 static _Atomic uint32_t fp_remap_bits;        /* float: the left stick's rotation (radians) */
+static _Atomic uint32_t fp_facing_bits;       /* float: the player's VIEW heading (H1; the character's facing as a fallback), NAN = unknown (backstep) */
+static _Atomic int fp_locked_now;             /* lock-on, for the pad thread (backstep) */
+static VrBackstepCfg fp_bs_cfg;               /* backstep= settings (read by the pad thread) */
+static VrBackstep fp_bs;                      /* the pad thread's state */
+static int fp_bs_log;
+static uint32_t fp_bs_prev;
 static _Atomic uint32_t fp_target_bits;       /* float: the heading the game camera must have */
 static _Atomic uint32_t fp_pivot_bits[2];     /* floats: the player's x, z (the turn's pivot) */
 static _Atomic int fp_sync_on;                /* H1: turn the game camera this frame */
@@ -411,6 +419,18 @@ static void fp_init(void) {
     e = getenv("BB_VR_FP_FACE_DODGE");
     fp.face_dodge = e && !strcmp(e, "view") ? 1 : e && !strcmp(e, "strafe") ? 2 : 0;
     fp.strafe_dash = NAN;
+    vr_backstep_cfg_default(&fp_bs_cfg);
+    e = getenv("BB_VR_BACKSTEP");
+    if (e && *e) fp_bs_cfg.on = e[0] != '0';
+    e = getenv("BB_VR_BACKSTEP_ANGLE");
+    if (e && *e) fp_bs_cfg.angle_deg = vr_backstep_clamp_angle(strtof(e, NULL));
+    e = getenv("BB_VR_BACKSTEP_LOCK");
+    if (e && *e) fp_bs_cfg.in_lock = e[0] != '0';
+    e = getenv("BB_VR_EVADE_LOG");
+    fp_bs_log = e && e[0] == '1';
+    atomic_store_explicit(&fp_facing_bits, f2u(NAN), memory_order_relaxed);
+    fprintf(stderr, "VR backstep: %s (a dodge with the stick behind the character, > %.0f deg from its facing, is the backstep%s; BB_VR_BACKSTEP, backstep= backstep_angle= backstep_lock= in the control file)\n",
+            fp_bs_cfg.on ? "on" : "off", fp_bs_cfg.angle_deg, fp_bs_cfg.in_lock ? ", also locked on" : ", not locked on");
     e = getenv("BB_VR_FP_SYNC");
     fp.sync = !(e && e[0] == '0');
     e = getenv("BB_VR_FP_REMAP");
@@ -609,6 +629,9 @@ static void fp_poll_control(uint64_t now) {
         else if (!strcmp(k, "face")) { fp.face = face_parse(v); fprintf(stderr, "VR FP: face %s\n", face_name(fp.face)); }
         else if (!strcmp(k, "face_lockon")) fp.face_lockon = x != 0.0f;
         else if (!strcmp(k, "face_dodge")) { fp.face_dodge = !strcmp(v, "view") ? 1 : !strcmp(v, "strafe") ? 2 : 0; fp.strafe_on = 0; fprintf(stderr, "VR FP: face_dodge %s\n", fp.face_dodge == 2 ? "strafe" : fp.face_dodge ? "view" : "game"); }
+        else if (!strcmp(k, "backstep") && ok) { fp_bs_cfg.on = x != 0.0f; fprintf(stderr, "VR backstep: %s (control file)\n", fp_bs_cfg.on ? "on" : "off"); }
+        else if (!strcmp(k, "backstep_angle") && ok) { fp_bs_cfg.angle_deg = vr_backstep_clamp_angle(x); fprintf(stderr, "VR backstep: angle %.0f deg (control file)\n", fp_bs_cfg.angle_deg); }
+        else if (!strcmp(k, "backstep_lock") && ok) { fp_bs_cfg.in_lock = x != 0.0f; fprintf(stderr, "VR backstep: %s locked on (control file)\n", fp_bs_cfg.in_lock ? "also" : "not"); }
         else if (!strcmp(k, "sync")) fp.sync = x != 0.0f;
         else if (!strcmp(k, "remap")) fp.remap = x != 0.0f;
         else if (!strcmp(k, "deep")) atomic_store_explicit(&fp_turn_follow, x != 0.0f, memory_order_relaxed);
@@ -625,33 +648,9 @@ static void fp_poll_control(uint64_t now) {
 /* ---- guest memory: read only what is mapped (the player chain dangles during loads) ---- */
 
 #ifdef _WIN32
-static struct { uintptr_t lo, hi; } fp_regions[16];
-static int fp_region_count;
-static uint64_t fp_regions_time;
-static int fp_readable(uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const uint64_t now = fp_now_us();
-    if (now - fp_regions_time > 1000000) { fp_region_count = 0; fp_regions_time = now; }
-    for (int i = 0; i < fp_region_count; ++i)
-        if (fp_regions[i].lo <= a && a + n <= fp_regions[i].hi) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (fp_region_count < (int)(sizeof(fp_regions) / sizeof(*fp_regions))) {
-            fp_regions[fp_region_count].lo = lo;
-            fp_regions[fp_region_count].hi = hi;
-            ++fp_region_count;
-        }
-        at = hi;
-    }
-    return 1;
-}
+/* page-probed reads with a per-thread cache (vr_mem_cache.h): VirtualQuery on the guest mappings took ms per cold lookup (run12e/g profiles) */
+static _Thread_local VmCache fp_cache;
+static int fp_readable(uintptr_t a, size_t n) { return vm_readable(&fp_cache, a, n); }
 #else
 static int fp_readable(uintptr_t a, size_t n) {
     static int fds[2] = {-1, -1};
@@ -1081,7 +1080,29 @@ static void fp_pad_filter(uint32_t *buttons, uint8_t *lx, uint8_t *ly, uint8_t *
     atomic_store_explicit(&fp_pad_bits[1], f2u(((float)*lx - 128.0f) / 127.0f), memory_order_relaxed);
     atomic_store_explicit(&fp_pad_bits[2], f2u((128.0f - (float)*ly) / 127.0f), memory_order_relaxed);
     atomic_store_explicit(&fp_pad_time_us, now, memory_order_release);
-    if (now > atomic_load_explicit(&fp_active_until_us, memory_order_acquire)) return;
+    if (now > atomic_load_explicit(&fp_active_until_us, memory_order_acquire)) { fp_bs.armed = fp_bs.held = 0; return; }
+    { /* findings/19 section 11: a dodge pressed with the stick behind the character = no stick, so the game backsteps */
+        float sx, sy;
+        vr_backstep_stick(*lx, *ly, &sx, &sy);
+        const float facing = u2f(atomic_load_explicit(&fp_facing_bits, memory_order_relaxed));
+        const float mv = u2f(atomic_load_explicit(&fp_target_bits, memory_order_relaxed));
+        const int locked = atomic_load_explicit(&fp_locked_now, memory_order_relaxed);
+        const int back = vr_backstep_is_back(facing, mv, sx, sy, fp_bs_cfg.angle_deg);
+        int started = 0;
+        const uint32_t pr = *buttons & ~fp_bs_prev;
+        fp_bs_prev = *buttons;
+        if (fp_bs_log && (pr & VR_BACKSTEP_BTN_CIRCLE))
+            fprintf(stderr, "VR backstep: circle pressed (buttons 0x%x, stick %.2f %.2f, %.0f deg from the view, back %d, locked %d, on %d)\n", *buttons, sx, sy,
+                    isfinite(facing) && isfinite(mv) ? fabsf(vr_backstep_wrap(mv + atan2f(sx, sy) - facing)) / VR_DEG : -1.0f, back, locked, fp_bs_cfg.on);
+        if (vr_backstep_update(&fp_bs, &fp_bs_cfg, (double)now * 1e-6, *buttons, back, locked, &started)) {
+            if (started && fp_bs_log)
+                fprintf(stderr, "VR backstep: dodge with the stick behind (stick %.2f %.2f, %.0f deg from the view%s): the game sees no stick\n", sx, sy,
+                        fabsf(vr_backstep_wrap(mv + atan2f(sx, sy) - facing)) / VR_DEG, locked ? ", locked on" : "");
+            *lx = 128;
+            *ly = 128;
+            return;
+        }
+    }
     if (!atomic_load_explicit(&fp_stick_to_game, memory_order_relaxed))
         *rx = 128; /* first person turns with it (vr_turn_math.h): the game camera must not */
     if (fp.remap) { /* H1 sets the angle: the residual with the hook, all of it without (remap=0: none) */
@@ -1317,6 +1338,8 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
     const int logging = fp.log && now >= fp.next_log;
     if (logging) fp.next_log = now + 1000000;
     fp_poll_control(now);
+    uint64_t prof_pt = bb_vrprof_t0();
+#define FP_LAP(slot) do { bb_vrprof_end((slot), prof_pt); prof_pt = bb_vrprof_t0(); } while (0)
     /* This frame's game camera heading; the hook turned it last frame when it is on. */
     const float heading = vr_cam_heading(game);
     const int was_synced = atomic_load_explicit(&fp_sync_on, memory_order_relaxed);
@@ -1363,6 +1386,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
                                    : (cut ? "cutscene" : "Remo check"),
                     field ? "is the game's" : "is not the game's", (unsigned long long)remo, remo_flags,
                     remo_game ? "is" : "is not");
+        FP_LAP(BB_PROF_FP_CUTSCENE);
         if (!fp_read_chain(&c)) break;
         fp.body_ok = 1;
         fp.body_pos = c.pos;
@@ -1395,6 +1419,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
             world.x += root_dx;
             world.z += root_dz;
         } else fp.anim_state.valid = 0;
+        FP_LAP(BB_PROF_FP_CHAIN);
         if (cut) { fp.state = field ? "cutscene (Remo camera)" : "cutscene or debug camera"; break; }
         /* Downed (death, knockdown): the raw eye low for a while -> third person. */
         fp.down_time = have_eye && eye_raw.y < FP_DOWN_HEIGHT ? fp.down_time + dt : 0.0f;
@@ -1403,6 +1428,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
         active = 1;
     } while (0);
 
+    prof_pt = bb_vrprof_t0();
     /* The hunter's own model, hidden while the view is at its eyes. */
     fp.hidden = 0;
     if (c.player) {
@@ -1444,11 +1470,13 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
                        ((fp.hide & FP_HIDE_SKIN_ARMS) ? FP_SKIN_ARM_GROUPS : 0) |
                        ((fp.hide & FP_HIDE_SKIN_HANDS) ? FP_SKIN_HAND_GROUPS : 0));
     }
+    FP_LAP(BB_PROF_FP_HIDE);
     const int was_locked = fp.locked;
     fp.locked = c.player ? fp_lock_state(&c, &fp.target_yaw, &fp.target_valid) : 0;
     if (fp.locked != was_locked && fp.log)
         fprintf(stderr, "VR FP: lock-on %s%s\n", fp.locked ? "on" : "off",
                 fp.locked && !fp.target_valid ? " (no target point)" : "");
+    FP_LAP(BB_PROF_FP_LOCK);
 
     if (active) {
         /* Heading psi (vr_turn_math.h): our own, from where the game camera looked on entering
@@ -1576,6 +1604,10 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
         memset(&fp.turn_out, 0, sizeof(fp.turn_out));
         fp.turn_out.psi = fp.psi;
     }
+    FP_LAP(BB_PROF_FP_TURNFACE);
+
+    atomic_store_explicit(&fp_locked_now, fp.locked, memory_order_relaxed);
+    atomic_store_explicit(&fp_facing_bits, f2u(active && isfinite(fp.turn_out.view_yaw) ? fp.turn_out.view_yaw : active && c.player && isfinite(c.yaw) ? vr_facing_heading(c.yaw) : NAN), memory_order_relaxed);
 
     if (fp.trace && fp.trace_bytes < FP_TRACE_MAX) {
         const VrTurnOutput *o = &fp.turn_out;
@@ -1596,6 +1628,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
     }
     if (!active) {
         if (logging) fp_log_frame(&c, have_eye ? &eye_raw : NULL, &eye, &world, game, heading, 0);
+        FP_LAP(BB_PROF_FP_LOG);
         return 0;
     }
 
@@ -1607,12 +1640,14 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
         cam = vr_v3(p[0], p[1], p[2]);
         fp.dash_offset = vr_sub(cam, world);
     }
+    FP_LAP(BB_PROF_FP_DASH);
     if (fp.forward != 0.0f || fp.up != 0.0f)
         cam = vr_add(cam, vr_v3(sinf(fp.psi) * fp.forward, fp.up, cosf(fp.psi) * fp.forward));
     vr_cam_from_heading(out->rows, fp.psi, cam);
     out->near_plane = fp.near_plane;
     out->keep_game_rotation = !head_valid && fp.turn_game;
     if (logging) fp_log_frame(&c, &eye_raw, &eye, &world, game, heading, 1);
+    FP_LAP(BB_PROF_FP_LOG);
     return 1;
 }
 

@@ -11,6 +11,7 @@
 #include "core/libraries/videoout/video_out.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -106,6 +107,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        std::chrono::steady_clock::time_point queued{}; ///< bbport: when it was queued (pacing)
 
         operator bool() const noexcept {
             return frame != nullptr;

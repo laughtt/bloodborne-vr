@@ -892,6 +892,8 @@ void TestHudParse() {
     CHECK(ParseMode(nullptr, nullptr) == Mode::Off);   // cinema: the HUD stays in the image
     CHECK(ParseMode(nullptr, "alt") == Mode::Layer);   // head-tracked modes: layer by default
     CHECK(ParseMode("", "mono") == Mode::Layer);
+    CHECK(ParseMode(nullptr, "stereo") == Mode::Layer); // true stereo: the HUD layer too
+    CHECK(ParseMode("off", "stereo") == Mode::Off);
     CHECK(ParseMode("off", "alt") == Mode::Off);
     CHECK(ParseMode("layer", nullptr) == Mode::Layer); // explicit, also over the cinema screen
     CHECK(ParseMode("force", nullptr) == Mode::Force);

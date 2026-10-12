@@ -132,6 +132,24 @@ static inline VrVec3 vrs_default_offset(int eye, float ipd) {
     return vr_v3(eye == VRS_LEFT ? -0.5f * ipd : 0.5f * ipd, 0.0f, 0.0f);
 }
 
+/* BB_XR_MODE=stereo: both eyes' offsets from the head, from ONE views snapshot (the head and the
+ * two eyes the runtime located for the same display time), so the pair's layer poses are
+ * head . offset with the runtime's own baseline. Returns 1 when both are plausible; otherwise
+ * `off` is the default IPD split (the caller then publishes no eye offsets). */
+static inline int vrs_pair_offsets(VrQuat head, VrVec3 head_pos, VrVec3 eye0, VrVec3 eye1,
+                                   float default_ipd, VrVec3 off[2]) {
+    const VrVec3 o0 = vrs_eye_in_head(head, head_pos, eye0);
+    const VrVec3 o1 = vrs_eye_in_head(head, head_pos, eye1);
+    if (vrs_offset_ok(o0, VRS_LEFT) && vrs_offset_ok(o1, VRS_RIGHT)) {
+        off[0] = o0;
+        off[1] = o1;
+        return 1;
+    }
+    off[0] = vrs_default_offset(VRS_LEFT, default_ipd);
+    off[1] = vrs_default_offset(VRS_RIGHT, default_ipd);
+    return 0;
+}
+
 /* Moves the composed camera (rows right, up, forward, position) to the eye: the head-frame offset
  * `off` (OpenXR axes, meters) times `scale` (world scale: 1 = true size) along the camera's own
  * axes. Call after the head rotation, the first-person eye position and the head position were

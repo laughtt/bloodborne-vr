@@ -32,6 +32,7 @@
  * counted (entry+0x2E0) and the character hits the stamina hit hooks reported. */
 #define _GNU_SOURCE
 #include "hooks.h"
+#include "vr_mem_cache.h"
 #include "vr_fp_math.h"
 #include "vr_hit_scale.h"
 #include "vr_hitbox.h"
@@ -86,33 +87,8 @@ static double hs_now(void) {
 
 /* ---- guest memory (the game thread only) ---- */
 #ifdef _WIN32
-static struct { uintptr_t lo, hi; } hs_regions[16];
-static int hs_region_count;
-static double hs_regions_time;
-static int hs_readable(uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const double now = hs_now();
-    if (now - hs_regions_time > 1.0) { hs_region_count = 0; hs_regions_time = now; }
-    for (int i = 0; i < hs_region_count; ++i)
-        if (hs_regions[i].lo <= a && a + n <= hs_regions[i].hi) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (hs_region_count < (int)(sizeof(hs_regions) / sizeof(*hs_regions))) {
-            hs_regions[hs_region_count].lo = lo;
-            hs_regions[hs_region_count].hi = hi;
-            ++hs_region_count;
-        }
-        at = hi;
-    }
-    return 1;
-}
+static _Thread_local VmCache hs_cache;
+static int hs_readable(uintptr_t a, size_t n) { return vm_readable(&hs_cache, a, n); }
 #else
 static int hs_readable(uintptr_t a, size_t n) { return a >= 0x10000 && a + n >= a; }
 #endif

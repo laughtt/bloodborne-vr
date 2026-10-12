@@ -5,7 +5,9 @@
 // directory given as argv[1] (with nvngx_dlss.dll next to it), creates a Vulkan device with the
 // extensions NGX asks for, creates the two VR eye features (slots 1 and 2: independent
 // histories) and evaluates each a few times on synthetic inputs, then checks the output was
-// written. Exit 0 = pass, 77 = skipped (no NVIDIA RTX / DLSS not available), other = failure.
+// written. With nvngx_dlssnr.dll in the same directory it also runs DLSS-NR (BbDlssGetNrApi) on a
+// 3840x2160 image and prints its GPU time (docs/vr/findings/42-dlss-nr.md).
+// Exit 0 = pass, 77 = skipped (no NVIDIA RTX / DLSS not available), other = failure.
 // Contains no NVIDIA code: it uses only the bridge's C interface (bbport_dlss_bridge.h).
 //
 //   ninja -C out/gpu-dlss dlss-bridge-smoke && out/gpu-dlss/dlss-bridge-smoke.exe <dll dir>
@@ -387,6 +389,130 @@ int main(int argc, char** argv) {
     const bool right_ok = pixels[4] > 150 && pixels[5] < 110;
     vkUnmapMemory(device, memory);
 
+    // DLSS-NR (BbDlssGetNrApi), when nvngx_dlssnr.dll is next to the bridge: one feature on the
+    // centre of a 3840x2160 eye image (66 %, as VirtualDesktop-OpenXR) and one on all of it, each
+    // evaluated a few times; the output region must be written. Prints the GPU time per pass.
+    const auto get_nr =
+        reinterpret_cast<BbDlssGetNrApiFn>(GetProcAddress(module, "BbDlssGetNrApi"));
+    const BbDlssNrApi* nr = get_nr ? get_nr() : nullptr;
+    const bool nr_dll =
+        GetFileAttributesW((wdir + L"\\nvngx_dlssnr.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool nr_ok = true;
+    if (!nr || !nr_dll) {
+        std::printf("DLSS-NR: skipped (%s)\n",
+                    !nr ? "bridge without BbDlssGetNrApi" : "no nvngx_dlssnr.dll in the directory");
+    } else if (!nr->Initialize()) {
+        std::printf("FAIL: DLSS-NR initialisation (see the bridge log above)\n");
+        nr_ok = false;
+    } else {
+        // BB_NR_SMOKE=<w>x<h>[,bgra][,scratch]: the eye size, B8G8R8A8 images, the output a
+        // region-sized image written at its origin (which the DLL refuses: InvalidParameter).
+        const char* knobs = std::getenv("BB_NR_SMOKE");
+        uint32_t ew = 3840, eh = 2160;
+        bool bgra = false, scratch = false;
+        if (knobs) {
+            std::sscanf(knobs, "%ux%u", &ew, &eh);
+            bgra = std::strstr(knobs, "bgra") != nullptr;
+            scratch = std::strstr(knobs, "scratch") != nullptr;
+        }
+        const VkFormat eye_format = bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+        std::printf("DLSS-NR: eye %ux%u %s%s\n", ew, eh, bgra ? "B8G8R8A8" : "R8G8B8A8",
+                    scratch ? ", region-sized output" : "");
+        Image eye_in = MakeImage(device, physical, eye_format, ew, eh, in_usage,
+                                 VK_IMAGE_ASPECT_COLOR_BIT);
+        Image eye_out = MakeImage(device, physical, eye_format,
+                                  scratch ? (uint32_t(ew * 0.66f) + 3) & ~3u : ew,
+                                  scratch ? (uint32_t(eh * 0.66f) + 3) & ~3u : eh,
+                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                  VK_IMAGE_ASPECT_COLOR_BIT);
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical, &props);
+        const VkQueryPoolCreateInfo query_info{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                               .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                               .queryCount = 2};
+        VkQueryPool queries{};
+        CHECK_VK(vkCreateQueryPool(device, &query_info, nullptr, &queries));
+        const float fractions[2] = {0.66f, 1.0f};
+        for (uint32_t slot = 0; slot < (scratch ? 1u : 2u) && nr_ok; ++slot) {
+            const uint32_t rw = (uint32_t(ew * fractions[slot]) + 3) & ~3u;
+            const uint32_t rh = (uint32_t(eh * fractions[slot]) + 3) & ~3u;
+            const BbDlssRect rect{(ew - rw) / 2, (eh - rh) / 2, rw, rh};
+            begin();
+            const int created = nr->CreateFeature(slot, cmd, rw, rh);
+            submit();
+            if (!created) {
+                std::printf("FAIL: DLSS-NR feature creation %ux%u\n", rw, rh);
+                nr_ok = false;
+                break;
+            }
+            double best_ms = 1e9;
+            for (int frame = 0; frame < 6 && nr_ok; ++frame) {
+                begin();
+                ToGeneral(cmd, eye_in);
+                ToGeneral(cmd, eye_out);
+                const VkClearColorValue skin{{0.75f, 0.55f, 0.45f, 1.0f}};
+                const VkClearColorValue zero{{0.0f, 0.0f, 0.0f, 0.0f}};
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(cmd, eye_in.image, VK_IMAGE_LAYOUT_GENERAL, &skin, 1, &range);
+                vkCmdClearColorImage(cmd, eye_out.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+                FullBarrier(cmd);
+                vkCmdResetQueryPool(cmd, queries, 0, 2);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
+                const BbDlssRect out_rect = scratch ? BbDlssRect{0, 0, rw, rh} : rect;
+                const BbDlssNrEvaluate eval{Describe(eye_in), Describe(eye_out), rect, out_rect,
+                                            frame == 0 ? 1 : 0, 0, 1.0f, 0.2f, 0.7f, 0.5f};
+                const int ok = nr->Evaluate(slot, cmd, &eval);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
+                FullBarrier(cmd);
+                const VkBufferImageCopy copy{.bufferOffset = 0,
+                                             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                             .imageOffset = {int32_t((scratch ? rw : ew) / 2),
+                                                             int32_t((scratch ? rh : eh) / 2), 0},
+                                             .imageExtent = {1, 1, 1}};
+                vkCmdCopyImageToBuffer(cmd, eye_out.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1,
+                                       &copy);
+                submit();
+                if (!ok) {
+                    std::printf("FAIL: DLSS-NR evaluation %ux%u, frame %d\n", rw, rh, frame);
+                    nr_ok = false;
+                    break;
+                }
+                uint64_t stamps[2]{};
+                if (vkGetQueryPoolResults(device, queries, 0, 2, sizeof(stamps), stamps,
+                                          sizeof(uint64_t),
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+                        VK_SUCCESS &&
+                    frame > 0) {
+                    const double ms =
+                        double(stamps[1] - stamps[0]) * props.limits.timestampPeriod / 1e6;
+                    best_ms = ms < best_ms ? ms : best_ms;
+                }
+                CHECK_VK(vkMapMemory(device, memory, 0, 8, 0, reinterpret_cast<void**>(&pixels)));
+                const bool written = pixels[3] != 0 || pixels[0] != 0 || pixels[1] != 0;
+                if (frame == 5) {
+                    std::printf("DLSS-NR %ux%u (%.0f %% of %ux%u): centre %u %u %u (input 191 140 "
+                                "115), %.2f ms per evaluation\n",
+                                rw, rh, fractions[slot] * 100.0f, ew, eh, pixels[0], pixels[1],
+                                pixels[2], best_ms);
+                    if (!written) {
+                        std::printf("FAIL: DLSS-NR left its output region empty\n");
+                        nr_ok = false;
+                    }
+                }
+                vkUnmapMemory(device, memory);
+            }
+            nr->ReleaseFeature(slot);
+        }
+        vkDestroyQueryPool(device, queries, nullptr);
+        Destroy(device, eye_in);
+        Destroy(device, eye_out);
+        if (nr_ok) {
+            std::printf("PASS: DLSS-NR initialised, evaluated at 66 %% and 100 %% of an eye\n");
+        }
+    }
+
     api->ReleaseFeatureSlot(1);
     api->ReleaseFeatureSlot(2);
     vkDestroyBuffer(device, buffer, nullptr);
@@ -403,6 +529,9 @@ int main(int argc, char** argv) {
     vkDestroyInstance(instance, nullptr);
     if (!left_ok || !right_ok) {
         std::printf("FAIL: the eye outputs do not match their own inputs\n");
+        return 1;
+    }
+    if (!nr_ok) {
         return 1;
     }
     std::printf("PASS: two eye features (slots 1, 2) created, evaluated, released\n");

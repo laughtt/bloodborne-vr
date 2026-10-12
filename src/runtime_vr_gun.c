@@ -72,6 +72,7 @@
  * ray points at (vg_assist_dir's cone). */
 #define _GNU_SOURCE
 #include "hooks.h"
+#include "vr_mem_cache.h"
 #include "vr_gun.h"
 #include "vr_fp.h"
 #include "vr_gun_math.h"
@@ -188,6 +189,7 @@ static uint64_t gun_now_us(void) {
 static void thr_speed_poll(uint64_t now);
 void vr_gun_view(const float rows[4][4]) {
     if (!gun.on && !thr.on && !vr_visceral_active()) return;
+    const uint64_t prof_t0 = bb_vrprof_t0();
     const uint64_t now = gun_now_us();
     const uint32_t seq = atomic_load_explicit(&gun_view_seq, memory_order_relaxed);
     GunView *v = &gun_views[(seq + 1) & 1];
@@ -202,6 +204,7 @@ void vr_gun_view(const float rows[4][4]) {
         gun.hands_changed_us = now;
     }
     thr_speed_poll(now);
+    bb_vrprof_end(BB_PROF_GUN_VIEW, prof_t0);
 }
 static int gun_view_read(GunView *out) {
     for (int tries = 0; tries < 3; ++tries) {
@@ -292,23 +295,17 @@ static int thr_take(uint64_t now, VrVec3 *origin, VrVec3 *dir, float *speed) {
 }
 
 /* ---- guest memory: read only what is mapped (the player chain dangles during loads) ---- */
+/* Cold VirtualQuery lookups on the guest mappings took ms (run12e profile); the lock-on list walk reads
+ * 2 x up to 64 nodes: page-probed reads with a per-thread cache (vr_mem_cache.h). Writes are the stack
+ * copies of the launch (live data): readable is writable. */
 static int gun_mem_ok(uintptr_t a, size_t n, int write) {
-    if (a < 0x10000 || a + n < a) return 0;
-#ifdef _WIN32
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        const DWORD rw = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ | rw))) return 0;
-        if (write && !(mbi.Protect & rw)) return 0;
-        at = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-#else
     (void)write;
+#ifdef _WIN32
+    static _Thread_local VmCache cache;
+    return vm_readable(&cache, a, n);
+#else
+    return a >= 0x10000 && a + n >= a;
 #endif
-    return 1;
 }
 static int gun_rd(uintptr_t a, void *out, size_t n) {
     if (!gun_mem_ok(a, n, 0)) return 0;

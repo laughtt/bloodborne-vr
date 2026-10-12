@@ -212,6 +212,10 @@ struct UiGameLayout {
     bool hud = true;
     bool hud_head = false, hud_wrist = true; // the user asked for the wrist bar only
     std::string bar = "always";      // always | action (shown for 3 s after a swing or a cost)
+    // The wrist bars' colours (hud_bars.h ParseBarColor: a word, "#rrggbb" or "r,g,b"); both green
+    // by default. BB_VR_HP_COLOR / BB_VR_STAMINA_COLOR and the control file's hp_color= /
+    // stamina_color= override them.
+    std::string hp_color = "green", stamina_color = "green";
     float hud_distance = 0.9f, hud_down_deg = 24.0f, hud_scale = 1.0f, wrist_scale = 0.7f;
     m3::Vec3 wrist_offset{0.0f, 0.08f, 0.0f};
     double label_s = 1.6;

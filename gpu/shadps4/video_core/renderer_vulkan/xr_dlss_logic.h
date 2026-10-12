@@ -595,6 +595,80 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// True stereo (BB_XR_MODE=stereo, hybrid warp: docs/vr/findings/31-true-stereo.md section 9.8):
+// both eyes every frame, each with its own DLSS feature and history
+
+/// The camera of an eye `m` metres along the camera's x axis. The remap pass draws an eye as
+/// clip.x - P00 * m (Stereo::CurrentView), i.e. view-space x - m with the same projection: the
+/// view's row-0 translation loses m, the inverse view's translation gains m times its rotation's
+/// column 0 (the camera's x axis in world space). m = 0 is the camera itself.
+inline Camera EyeCamera(const Camera& c, float m) {
+    Camera e = c;
+    e.view[3] -= m;
+    for (int r = 0; r < 3; ++r) {
+        e.inv_view[r * 4 + 3] += m * c.inv_view[r * 4 + 0];
+    }
+    return e;
+}
+
+/// Eye R's history in true stereo. Eye L runs through Tracker (one stream, slot 0); eye R follows
+/// it frame by frame with its own feature (slot 1): it resets whenever eye L resets (cuts, menus,
+/// mono/held frames, settings), on its own first frame, after a gap of more than
+/// `max_frame_gap` frames since its last evaluation (eye R skipped while eye L ran: no warp),
+/// and when its feature is (re)created (the caller sets `reset` then). Its motion vectors go to
+/// ITS previous camera (eye L's previous camera moved by that frame's eye R offset).
+class PairEyeR {
+public:
+    struct Step {
+        bool reset = true;
+        Camera previous{};       ///< eye R's previous camera (the current one when reset)
+        const char* reason = ""; ///< why it was reset
+    };
+
+    explicit PairEyeR(uint32_t max_frame_gap = 4) : max_gap_{max_frame_gap} {}
+
+    /// Eye R evaluated at frame `frame` (the presenter's frame counter, eye L's) with
+    /// `camera_r`; `left_reset`: eye L's evaluation of the same frame reset its history.
+    Step OnFrame(const Camera& camera_r, bool left_reset, uint64_t frame) {
+        Step s{};
+        s.previous = camera_r;
+        if (left_reset) {
+            s.reason = "eye L reset";
+        } else if (!valid_) {
+            s.reason = "first frame of eye R";
+        } else if (frame <= last_frame_ || frame - last_frame_ > max_gap_) {
+            s.reason = "frame gap";
+        } else {
+            s.reset = false;
+            s.previous = previous_;
+        }
+        valid_ = true;
+        previous_ = camera_r;
+        last_frame_ = frame;
+        ++frames_;
+        resets_ += s.reset ? 1 : 0;
+        return s;
+    }
+    /// Settings changed, DLSS toggled, the feature released: the next frame resets.
+    void Invalidate() noexcept {
+        valid_ = false;
+    }
+    [[nodiscard]] uint64_t Frames() const noexcept {
+        return frames_;
+    }
+    [[nodiscard]] uint64_t Resets() const noexcept {
+        return resets_;
+    }
+
+private:
+    uint32_t max_gap_;
+    bool valid_ = false;
+    Camera previous_{};
+    uint64_t last_frame_ = 0;
+    uint64_t frames_ = 0, resets_ = 0;
+};
+
+// ---------------------------------------------------------------------------------------------
 // Colour channel order
 
 /// The VkFormat (UNORM, no sRGB decode: DLSS works on the encoded values) DLSS reads the display

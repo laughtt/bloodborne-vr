@@ -20,7 +20,7 @@ import bbvr_settings as S  # noqa: E402
 
 # The env block of the old out/vr_all.sh session (kept here so the test also runs without out/).
 GOLDEN_ENV = {
-    'BB_XR_AA': 'fxaa', 'BB_XR_UPSCALE': 'fsr1', 'BB_XR_SHARPEN': '0.5', 'BB_VR': '1', 'BB_XR_MODE': 'alt',
+    'BB_XR_AA': 'fxaa', 'BB_XR_UPSCALE': 'fsr1', 'BB_XR_SHARPEN': '0.5', 'BB_VR': '1', 'BB_XR_MODE': 'stereo',
     'BB_VR_HEAD': '1', 'BB_VR_HEAD_LEVEL': '1', 'BB_VR_FP': '1', 'BB_VR_FP_LOG': '0', 'BB_VR_DASH': '1',
     'BB_VR_DASH_LOG': '0', 'BB_VR_STEREO_LOG': '0', 'BB_VR_STAMINA': 'defer', 'BB_VR_STAMINA_LOG': '0',
     'BB_VR_STAMINA_TRACE': '0', 'BB_VR_ARMS': '1', 'BB_VR_UI': '1', 'BB_VR_UI_PROBE': '0', 'BB_VR_GUN_AIM': '1',
@@ -32,7 +32,7 @@ GOLDEN_ENV = {
                 'VR Hitbox Scale (attack shape);VR Attack Speed (chr dt)',
 }
 PATH_VARS = {'BB_VR_FP_CONTROL': 'fp.txt', 'BB_VR_STEREO_CONTROL': 'stereo.txt'}
-EXTRA_VARS = {'BB_PROBE', 'BB_GAME_DIR', 'BB_VR_ASSETS', 'BB_XR_IQ_CONTROL'}
+EXTRA_VARS = {'BB_PROBE', 'BB_GAME_DIR', 'BB_VR_ASSETS', 'BB_XR_IQ_CONTROL', 'BB_XR_DLSSNR', 'BB_STEREO_FULL'}  # BB_XR_DLSSNR=0: DLSS-NR off; BB_STEREO_FULL=1: full stereo
 TODAY_FP = (ZIP / 'defaults' / 'fp.txt').read_text(encoding='utf-8')
 TODAY_STEREO = (ZIP / 'defaults' / 'stereo.txt').read_text(encoding='utf-8')
 
@@ -46,7 +46,7 @@ def paths_in(tmp):
 
 def parse_vr_all(text):
     text = text.replace('\\\n', ' ')
-    text = text.replace('$MODE', 'alt')
+    text = text.replace('$MODE', 'stereo')
     text = re.sub(r'\$\{(\w+):-([^}]*)\}', r'\2', text)
     text = re.sub(r'\$\{(\w+)-([^}]*)\}', r'\2', text)
     command = next(line for line in text.splitlines() if 'BB_VR=1' in line or 'BB_GAME_DIR' in line)
@@ -71,6 +71,7 @@ class GoldenTests(unittest.TestCase):
             self.assertEqual(Path(env[key]).name, name)
         extra = set(env) - set(GOLDEN_ENV) - set(PATH_VARS) - EXTRA_VARS
         self.assertEqual(extra, set(), 'the Default profile adds no other variable')
+        self.assertEqual(env['BB_XR_DLSSNR'], '0')
 
     def test_matches_vr_all_sh_when_present(self):
         script = ROOT / 'out' / 'vr_all.sh'
@@ -288,6 +289,98 @@ class DlssTests(unittest.TestCase):
             self.assertNotIn('BB_XR_DLSS_MASK', plan['env'])
 
 
+class DlssNrTests(unittest.TestCase):
+    RTX = [{'name': 'NVIDIA GeForce RTX 4090', 'rtx': True}]
+    NR_IDS = ('dlssnr_passes', 'dlssnr_place', 'dlssnr_style', 'dlssnr_intensity', 'dlssnr_tone', 'dlssnr_structure', 'dlssnr_skin',
+              'dlssnr_fovea', 'dlssnr_inner')
+
+    def make(self, port, exe_nr=True, bridge_nr=True, nr_dll=True):
+        out = Path(port) / 'out'
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'bb-probe.exe').write_bytes(b'MZ BB_XR_DLSS_QUALITY dlss_sharpen' + (b' BB_XR_DLSSNR' if exe_nr else b'') + bytes(64))
+        (out / 'bbport_dlss.dll').write_bytes(b'MZ' + (b' BbDlssGetNrApi' if bridge_nr else b'') + bytes(16))
+        (out / 'nvngx_dlss.dll').write_bytes(b'x')
+        if nr_dll:
+            (out / 'nvngx_dlssnr.dll').write_bytes(b'x')
+        return out
+
+    def test_schema(self):
+        by = {o['id']: o for o in S.SCHEMA}
+        want = {'dlssnr': ('BB_XR_DLSSNR', False), 'dlssnr_passes': ('BB_XR_DLSSNR_PASSES', 1),
+                'dlssnr_place': ('BB_XR_DLSSNR_PLACE', 'post'),
+                'dlssnr_style': ('BB_XR_DLSSNR_STYLE', '0'), 'dlssnr_intensity': ('BB_XR_DLSSNR_INTENSITY', 2.0),
+                'dlssnr_tone': ('BB_XR_DLSSNR_TONE', 0.6), 'dlssnr_structure': ('BB_XR_DLSSNR_STRUCTURE', 1.0),
+                'dlssnr_skin': ('BB_XR_DLSSNR_SKIN', 1.0), 'dlssnr_fovea': ('BB_XR_DLSSNR_FOVEA', 0.66),
+                'dlssnr_inner': ('BB_XR_DLSSNR_INNER', 0.4)}
+        for oid, (env, default) in want.items():
+            o = by[oid]
+            self.assertEqual((o['tab'], o['target'], o['default']), ('dlss', ('iq', oid, env), default), oid)
+            if oid != 'dlssnr':
+                self.assertEqual(o['only_if'], {'dlssnr': True})
+        self.assertFalse(S.base_values()['dlssnr'])
+        for name in S.PROFILE_ORDER:
+            self.assertFalse(S.effective_values({'profile': name}, DlssTests.OK).get('dlssnr'), name)
+
+    def test_detect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            port = Path(tmp)
+            self.make(port)
+            d = S.detect_dlssnr(port, None, self.RTX)
+            self.assertTrue(d['ok'], d)
+            self.assertEqual(Path(d['dir']).name, 'out')
+            self.assertFalse(S.detect_dlssnr(port, None, [{'name': 'AMD', 'rtx': False}])['ok'])
+            self.assertIn('needs DLSS', S.detect_dlssnr(port, None, [{'name': 'AMD', 'rtx': False}])['reason'])
+        for kw, text in (({'nr_dll': False}, 'nvngx_dlssnr.dll'), ({'exe_nr': False}, 'no DLSS-NR support'),
+                         ({'bridge_nr': False}, 'too old')):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.make(Path(tmp), **kw)
+                d = S.detect_dlssnr(Path(tmp), None, self.RTX)
+                self.assertFalse(d['ok'])
+                self.assertIn(text, d['reason'])
+
+    def plan(self, tmp, on, ok, **custom):
+        caps = dict(NO_GPU, dlss=dict(DlssTests.OK['dlss']), dlssnr={'ok': ok, 'reason': 'no dll', 'dir': None})
+        caps['dlss'] = dict(caps['dlss'], dir=None)
+        vals = S.effective_values({'profile': 'Custom', 'custom': dict({'upscale': 'dlss', 'dlssnr': on}, **custom)})
+        return S.build_launch(vals, paths_in(tmp), caps, public=False)
+
+    def test_on_and_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(tmp, True, True, dlssnr_passes=2, dlssnr_fovea=0.5)
+            env, iq = plan['env'], plan['files']['iq']
+            self.assertEqual({k: v for k, v in env.items() if k.startswith('BB_XR_DLSSNR')},
+                             {'BB_XR_DLSSNR': '1', 'BB_XR_DLSSNR_PASSES': '2', 'BB_XR_DLSSNR_PLACE': 'post', 'BB_XR_DLSSNR_STYLE': '0',
+                              'BB_XR_DLSSNR_INTENSITY': '2', 'BB_XR_DLSSNR_TONE': '0.6', 'BB_XR_DLSSNR_STRUCTURE': '1',
+                              'BB_XR_DLSSNR_SKIN': '1', 'BB_XR_DLSSNR_FOVEA': '0.5', 'BB_XR_DLSSNR_INNER': '0.4'})
+            self.assertEqual((iq['dlssnr'], iq['dlssnr_passes'], iq['dlssnr_fovea'], iq['dlssnr_style']), ('1', '2', '0.5', '0'))
+            self.assertEqual([w for w in plan['warnings'] if 'DLSS-NR' in w], [])
+
+    def test_on_but_unavailable_warns_and_writes_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(tmp, True, False)
+            self.assertTrue(any('DLSS-NR is not available (no dll)' in w for w in plan['warnings']))
+            self.assertEqual(plan['env']['BB_XR_DLSSNR'], '0')
+            self.assertEqual(plan['files']['iq']['dlssnr'], '0')
+            self.assertFalse([k for k in plan['env'] if k.startswith('BB_XR_DLSSNR_')])
+
+    def test_off_keeps_only_the_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(tmp, False, True)
+            self.assertEqual(plan['env']['BB_XR_DLSSNR'], '0')
+            self.assertEqual(plan['warnings'], [])
+            iq = plan['files']['iq']
+            self.assertEqual(iq['dlssnr'], '0')
+            for k in self.NR_IDS:
+                self.assertNotIn(k, iq)
+
+    def test_note_and_state(self):
+        caps = dict(NO_GPU, dlssnr={'ok': False, 'reason': 'Put it here.', 'dir': None})
+        self.assertIn('Put it here.', S.dlss_note_text(caps))
+        self.assertIn('available.', S.dlss_note_text(dict(NO_GPU, dlssnr={'ok': True, 'reason': '', 'dir': None})))
+        st = S.page_state(S.default_settings(), caps, public=False)
+        self.assertFalse(st['caps']['dlssnr']['ok'])
+
+
 class RuntimeTests(unittest.TestCase):
     def test_pimax_steamvr_warning(self):
         info = {'active': r'C:\sv\steamxr_win64.json', 'warnings': [],
@@ -303,6 +396,131 @@ class RuntimeTests(unittest.TestCase):
                                   paths_in(tmp), NO_GPU, public=False)
         self.assertEqual(plan['env']['XR_RUNTIME_JSON'], r'C:\x\rt.json')
         self.assertEqual(os.environ.get('XR_RUNTIME_JSON'), before)
+
+
+class DisplaySizeTests(unittest.TestCase):
+    """Display size (docs/vr/findings/41-display-size.md): the render / eye sizes chosen before the game starts."""
+    RTX = [{'name': 'NVIDIA GeForce RTX 4090', 'rtx': True}]
+    AMD = [{'name': 'AMD Radeon RX 7800 XT', 'rtx': False}]
+    PIMAX_RT = {'active': r'C:\Program Files\Pimax\Runtime\PiOpenXR_64.json', 'warnings': [],
+                'runtimes': [{'path': r'C:\Program Files\Pimax\Runtime\PiOpenXR_64.json', 'name': 'Pimax OpenXR',
+                              'kind': 'pimax', 'active': True}]}
+    STEAM_RT = {'active': r'C:\sv\steamxr_win64.json', 'warnings': [],
+                'runtimes': [{'path': r'C:\sv\steamxr_win64.json', 'name': 'SteamVR', 'kind': 'steamvr', 'active': True}]}
+
+    def plan(self, custom, caps=NO_GPU, hw=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            return S.build_launch(S.effective_values({'profile': 'Custom', 'custom': custom, 'hw': hw or {}}, caps),
+                                  paths_in(tmp), caps, public=False)
+
+    def test_quest3_at_100_keeps_todays_sizes(self):
+        # FSR 1: the 1080p frame (no startup patch) and 3840x2160 eyes, as before Display size existed
+        p = self.plan({'upscale': 'fsr1'}, hw={'display_size': 'quest3'})
+        self.assertNotIn('BB_RENDER_RES', p['env'])
+        self.assertEqual(p['env']['BB_XR_EYE_RES'], '3840x2160')
+        self.assertEqual(p['files']['iq']['res'], '3840x2160')
+        # DLSS quality: 1080p -> 2880x1620 (the game sizes the eye from the render size)
+        d = S.display_sizes({'display_size': 'quest3', 'display_scale': '100', 'dlss_quality': 'quality'}, None, 'dlss')
+        self.assertEqual((d['render'], d['eye'], d['native']), ([1920, 1080], [2880, 1620], True))
+
+    def test_smaller_headset_patches_a_smaller_render_size(self):
+        p = self.plan({'upscale': 'fsr1'}, hw={'display_size': 'quest2'})
+        self.assertEqual(p['env']['BB_RENDER_RES'], '1668x938')
+        self.assertEqual(p['env']['BB_OUTPUT_RES'], '1668x938')
+        self.assertNotIn('BB_DMEM_MB', p['env'])
+        self.assertEqual(p['env']['BB_XR_EYE_RES'], '3414x1920')
+        self.assertEqual(p['display']['render'], [1668, 938])
+
+    def test_above_1080p_raises_direct_memory_and_is_clamped(self):
+        p = self.plan({'upscale': 'fsr1', 'display_scale': '150'}, hw={'display_size': 'dreamair'})
+        w, h = (int(x) for x in p['env']['BB_RENDER_RES'].split('x'))
+        self.assertLessEqual(h, 1440)
+        self.assertGreater(w * h, 1920 * 1080)
+        self.assertEqual(p['env']['BB_DMEM_MB'], '9152')
+        self.assertLessEqual(int(p['env']['BB_XR_EYE_RES'].split('x')[1]), 2880)
+        for name in S.HEADSET_BY_ID:  # every preset at every step: 16:9, even, render <= eye, inside the limits
+            for sc in S.DISPLAY_SCALES:
+                for up in ('fsr1', 'dlss', 'off'):
+                    d = S.display_sizes({'display_size': name, 'display_scale': sc}, None, up)
+                    (rw, rh), (ew, eh) = d['render'], d['eye']
+                    self.assertTrue(540 <= rh <= 1440 and 720 <= eh <= 2880 and rh <= eh, (name, sc, up, d))
+                    self.assertTrue(rw % 2 == 0 and rh % 2 == 0 and abs(rw / rh - 16 / 9) < 0.01, (name, sc, d))
+
+    def test_game_default_and_unknown_headset_change_nothing(self):
+        base = self.plan({})['env']
+        self.assertNotIn('BB_XR_EYE_RES', base)  # Auto, no runtime and no log: today's session (golden test too)
+        game = self.plan({'eye_res': '1.5'}, hw={'display_size': 'game'})['env']
+        self.assertEqual(game['BB_XR_EYE_RES'], '1.5')
+        self.assertNotIn('BB_RENDER_RES', game)
+
+    def test_dlss_ratio_sets_the_render_size(self):
+        caps = dict(NO_GPU, dlss={'ok': True, 'reason': '', 'exe': Path('bb-probe.exe'), 'native': True, 'dir': Path('.')})
+        p = self.plan({'upscale': 'dlss', 'dlss_quality': 'performance'}, caps, hw={'display_size': 'quest3'})
+        self.assertEqual(p['upscale'], 'dlss')
+        self.assertEqual(p['env']['BB_RENDER_RES'], '1422x800')  # 2846x1601 eye / 2
+
+    def test_custom_size_and_extra_env_override(self):
+        p = self.plan({'upscale': 'fsr1'}, hw={'display_size': 'custom', 'display_custom': '1832x1920'})
+        self.assertEqual(p['env']['BB_RENDER_RES'], '1668x938')
+        self.assertIsNone(S.display_sizes({'display_size': 'custom', 'display_custom': 'big'}))
+        p = self.plan({'upscale': 'fsr1', 'extra_env': 'BB_RENDER_RES=2560x1440'}, hw={'display_size': 'quest2'})
+        self.assertEqual(p['env']['BB_RENDER_RES'], '2560x1440')
+
+    def test_gpu_tier_and_performance_scale(self):
+        self.assertEqual(S.effective_values(S.default_settings(), dict(NO_GPU, gpus=self.RTX))['display_scale'], '100')
+        self.assertEqual(S.effective_values(S.default_settings(), dict(NO_GPU, gpus=self.AMD))['display_scale'], '85')
+        self.assertEqual(S.effective_values({'profile': 'Performance'}, dict(NO_GPU, gpus=self.RTX))['display_scale'], '70')
+
+    def test_headset_choice_is_sticky_across_profiles(self):
+        s = S.apply_edit(S.default_settings(), dict(S.effective_values(S.default_settings()), display_size='quest2'))
+        self.assertEqual(s['profile'], 'Default')
+        self.assertEqual(s['hw'], {'display_size': 'quest2'})
+        s['profile'] = 'Performance'
+        self.assertEqual(S.effective_values(s)['display_size'], 'quest2')
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / 'settings.json'
+            S.save_settings(f, s)
+            self.assertEqual(S.load_settings(f)['hw'], {'display_size': 'quest2'})
+        back = S.apply_edit(s, dict(S.effective_values(s), display_size='auto'))
+        self.assertEqual(back['hw'], {})
+
+    def write_log(self, folder, runtime, headset, rec):
+        (Path(folder) / 'bbvr-20261011-101704.log').write_text(
+            f'Patches: x\nVR: runtime {runtime}\nVR: headset {headset}, max swapchain 16384x16384\n'
+            f'VR: eye images: recommended {rec} and {rec}, max 16384x16384\n', encoding='utf-8')
+
+    def test_auto_uses_the_last_session_on_the_same_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_log(tmp, 'Pimax OpenXR 0.1.0', 'Pimax Dream Air', '3832x3076')
+            det = S.detect_headset(self.PIMAX_RT, Path(tmp))
+            self.assertEqual((det['source'], det['rec'], det['preset']), ('log', [3832, 3076], 'dreamair'))
+            # another runtime is active now: its typical headset instead of the old log
+            det = S.detect_headset(self.STEAM_RT, Path(tmp))
+            self.assertEqual((det['source'], det['preset'], det['rec']), ('runtime', 'index', [2016, 2240]))
+        self.assertIsNone(S.detect_headset({'active': None, 'runtimes': []}, None)['rec'])
+        caps = dict(NO_GPU, headset={'source': 'log', 'rec': [2064, 2208], 'name': 'Meta Quest 3'})
+        self.assertEqual(self.plan({'upscale': 'fsr1'}, caps)['env']['BB_XR_EYE_RES'], '3840x2160')
+
+    def test_runtime_kinds_and_headset_names(self):
+        self.assertEqual(S.classify_runtime(r'C:\Program Files\Virtual Desktop Streamer\OpenXR\virtualdesktop-openxr.json',
+                                            'VirtualDesktopXR'), 'vdxr')
+        self.assertEqual(S.classify_runtime(r'C:\Program Files\Oculus\Support\oculus-runtime\oculus_openxr_64.json',
+                                            'Oculus'), 'oculus')
+        self.assertEqual(S.classify_runtime(r'C:\Varjo\VarjoOpenXR.json', 'Varjo'), 'varjo')
+        for name, want in (('Meta Quest 3', 'quest3'), ('Meta Quest 3S', 'quest2'), ('Oculus Quest2', 'quest2'),
+                           ('Meta Quest Pro', 'questpro'), ('Oculus Quest', 'quest1'), ('Pimax Dream Air', 'dreamair'),
+                           ('Valve Index', 'index'), ('SteamVR/OpenXR : lighthouse', None)):
+            self.assertEqual(S.headset_preset(name), want, name)
+
+    def test_page_state_reports_detection_and_sizes(self):
+        caps = dict(NO_GPU, headset={'kind': 'oculus', 'source': 'runtime', 'rec': [1832, 1920],
+                                     'name': 'Meta Quest 2 / Quest 3S', 'preset': 'quest2'})
+        st = S.page_state(S.default_settings(), caps, public=False)
+        self.assertEqual(st['display']['detected']['runtime_label'], 'Meta Quest Link / Air Link')
+        self.assertEqual(st['display']['sizes']['render'], [1668, 938])
+        opt = next(o for o in st['options'] if o['id'] == 'display_size')
+        self.assertEqual(opt['tab'], 'display')
+        self.assertIn('quest3', opt['choices'])
 
 
 class PublicTests(unittest.TestCase):

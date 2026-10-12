@@ -275,6 +275,104 @@ uint32_t TakeUse(vrui::GameUi& ui, BbXrUiAction* out, uint32_t capacity) {
     return k;
 }
 
+// The wrist HP and stamina bars (sandbox3d/hud_bars.h, combat_hud.cpp): fill, colours, the control
+// file's keys, and the triangles of the HP bar in the canvas.
+void TestWristBars() {
+    using namespace sb::bars;
+    // Fill.
+    CHECK(BarFraction(0.0f, 100.0f) == 0.0f);
+    CHECK(BarFraction(50.0f, 100.0f) == 0.5f);
+    CHECK(BarFraction(250.0f, 100.0f) == 1.0f);
+    CHECK(BarFraction(-20.0f, 100.0f) == 0.0f);
+    CHECK(BarFraction(10.0f, 0.0f) == 0.0f);
+    CHECK(BarFraction(10.0f, -5.0f) == 0.0f);
+    CHECK(BarFraction(NAN, 100.0f) == 0.0f);
+    // Colours: both default green; words, hex, fractions and bytes.
+    Colors def;
+    CHECK(def.hp.r == kGreen.r && def.hp.g == kGreen.g && def.stamina.g == kGreen.g);
+    sb::UiColor c;
+    CHECK(ParseBarColor("green", c) && c.g == kGreen.g && c.r == kGreen.r);
+    CHECK(ParseBarColor(" RED ", c) && c.r == kRed.r && c.g == kRed.g);
+    CHECK(ParseBarColor("#ff0000", c) && c.r == 1.0f && c.g == 0.0f && c.b == 0.0f);
+    CHECK(ParseBarColor("#000000", c) && c.r == 0.0f && c.a == 1.0f);
+    CHECK(ParseBarColor("1,0,0", c) && c.r == 1.0f && c.g == 0.0f);
+    CHECK(ParseBarColor("255, 0, 0", c) && c.r == 1.0f && c.g == 0.0f);
+    CHECK(ParseBarColor("0.5,0.5,0.5", c) && std::fabs(c.r - 0.2140f) < 0.001f); // sRGB 0.5 -> linear
+    const sb::UiColor keep{0.1f, 0.2f, 0.3f, 1.0f};
+    c = keep;
+    CHECK(!ParseBarColor("", c) && !ParseBarColor("purpleish", c) && !ParseBarColor("#fff", c) &&
+          !ParseBarColor("#gg0000", c) && !ParseBarColor("1,2", c) && !ParseBarColor("1,2,3,4", c) &&
+          !ParseBarColor("-1,0,0", c));
+    CHECK(c.r == keep.r && c.g == keep.g && c.b == keep.b); // untouched on failure
+    // Paused regeneration tint: still green-dominant for the default.
+    const sb::UiColor paused = Paused(kGreen);
+    CHECK(paused.g > paused.r && paused.g > paused.b && paused.g < kGreen.g);
+    // The control file's keys: other keys ignored, bad values skipped, later tokens win.
+    Colors k;
+    CHECK(ApplyControlText("fps=1 hp_color=red upscale=dlss\nstamina_color=#3366ff\n", k));
+    CHECK(k.hp.r == kRed.r && k.hp.g == kRed.g);
+    CHECK(k.stamina.r < 0.2f && k.stamina.b > 0.9f);
+    Colors k2;
+    CHECK(!ApplyControlText("fps=1 hp_color=notacolour hud_center=on", k2));
+    CHECK(k2 == Colors{});
+    Colors k3;
+    CHECK(ApplyControlText("hp_color=red hp_color=blue", k3));
+    CHECK(k3.hp.b > 0.9f);
+    CHECK(!ApplyControlText("", k3));
+
+    // The triangles: the HP bar is drawn over the stamina bar in its colour, only with HP known.
+    sb::UiFont font;
+    const auto count = [&](sb::UiCanvas& cv, sb::UiColor col) {
+        size_t n = 0;
+        for (const auto* list : {&cv.world, &cv.top}) {
+            for (const sb::UiVertex& v : *list) {
+                n += std::fabs(v.color[0] - col.r) < 1e-4f && std::fabs(v.color[1] - col.g) < 1e-4f &&
+                     std::fabs(v.color[2] - col.b) < 1e-4f;
+            }
+        }
+        return n;
+    };
+    const auto draw = [&](sb::UiCanvas& cv, const sb::SwingReadout& r) {
+        sb::SwingHudConfig cfg;
+        cfg.head = false;
+        cfg.wrist = true;
+        cfg.popups = false;
+        cfg.speed = false;
+        sb::UiPose head, grip;
+        head.valid = grip.valid = true;
+        head.position = {0.0f, 1.6f, 0.0f};
+        head.rotation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+        grip.position = {-0.2f, 1.2f, -0.4f};
+        grip.rotation = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+        sb::DrawSwingHud(cv, r, cfg, head, grip);
+    };
+    sb::SwingReadout r;
+    r.stamina = 80.0f;
+    r.max = 91.0f;
+    r.hp = 300.0f;
+    r.hp_max = 400.0f;
+    r.hp_color = kRed;      // told apart from the stamina bar's green
+    r.stamina_color = kGreen;
+    sb::UiCanvas both(nullptr, &font);
+    draw(both, r);
+    const size_t red = count(both, kRed), green = count(both, kGreen);
+    CHECK(red > 0 && green > 0);
+    sb::SwingReadout no_hp = r;
+    no_hp.hp_max = 0.0f;
+    sb::UiCanvas no(nullptr, &font);
+    draw(no, no_hp);
+    CHECK(count(no, kRed) == 0 && count(no, kGreen) > 0);
+    // An empty HP bar draws its frame and track but no fill.
+    sb::SwingReadout dead = r;
+    dead.hp = 0.0f;
+    sb::UiCanvas empty(nullptr, &font);
+    draw(empty, dead);
+    CHECK(count(empty, kRed) == 0);
+    // HP and stamina both green by default: the defaults of a fresh readout.
+    sb::SwingReadout fresh;
+    CHECK(fresh.hp_color.g == kGreen.g && fresh.stamina_color.g == kGreen.g && fresh.hp_max == 0.0f);
+}
+
 void TestGunRay() {
     sb::UiLayout layout;
     std::string error;
@@ -4562,6 +4660,7 @@ int main(int argc, char** argv) {
     TestRoomLine();
     TestIds();
     TestGunRay();
+    TestWristBars();
     TestGameUi(assets);
     TestHeldClassify();
     TestHeldItemLogic();

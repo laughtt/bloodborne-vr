@@ -113,6 +113,14 @@ struct Timer {
 };
 /// Wall time the GPU command thread waited for guest submissions (ns).
 inline std::atomic<std::uint64_t> gpu_idle_ns{0};
+/// Frame pacing, always counted (xr_fps_logic.h, the "Pace:" log line and the VR fps counter;
+/// BB_FRAME_STATS resets the counters above, these are read as running totals): game frames
+/// delivered, and wall time (ns) the GPU command thread waited for the guest, for the GPU
+/// (BB_FRAMES_AHEAD) and for a free presentation frame, the time flips waited for their slot
+/// (frame limiter / vblank), the presenter's work per frame and its part in the XR bridge and
+/// swapchain calls.
+inline std::atomic<std::uint64_t> pace_flips{0}, pace_guest_wait_ns{0}, pace_gpu_wait_ns{0},
+    pace_frame_wait_ns{0}, pace_queue_ns{0}, pace_present_ns{0}, pace_xr_ns{0};
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
 inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// Wall time spent blocked in the scheduler (ns): waiting for the recording thread to drain,
@@ -136,4 +144,40 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+
+/// The "Cmd:" line after "Pace:" (vk_presenter.cpp): where the GPU-side threads' time goes, per
+/// thread (the GPU command thread A, the draw recording thread B, the Vulkan recorder), in TSC
+/// cycles. Always counted: a few TSC reads per draw.
+enum PerfSlot : unsigned {
+    PerfDrainWait,     ///< A waits for B to run dry (DrawPipe::Drain)
+    PerfSyncRecording, ///< waits for the recorder (Scheduler::SyncRecording)
+    PerfTickWait,      ///< waits for a GPU tick (Scheduler::Wait)
+    PerfHostCopyWait,  ///< waits for host copies / deferred signals
+    PerfSubmit,        ///< queue submissions (Scheduler::SubmitExecution)
+    PerfBusy,          ///< B: running packets; recorder: executing chunks
+    PerfArenaEyeL,     ///< recorder: stereo arenas executed for eye L (in PerfBusy)
+    PerfArenaEyeR,     ///< recorder: stereo arenas executed for eye R (in PerfBusy)
+    PerfStereoDraw,    ///< StereoBeginDraw
+    PerfStereoEmit,    ///< StereoBeforeEmit (with the substitutes)
+    PerfStereoSubs,    ///< StereoCollectSubstitutes (in Emit or Dispatch)
+    PerfStereoDispatch, ///< StereoBeginDispatch / StereoAfterDispatch
+    PerfStereoEyeR,    ///< recording eye R's execution at a capture's end
+    PerfStereoProbe,   ///< the "Stereo: probe" readback
+    PerfSlots,
+};
+enum PerfThread : unsigned { PerfThreadA, PerfThreadB, PerfThreadRecorder, PerfThreadOther, PerfThreads };
+inline std::atomic<std::uint64_t> perf_cycles[PerfThreads][PerfSlots]{};
+/// Set once by each thread (DrawPipe, the recorder, the GPU command thread).
+inline thread_local unsigned perf_thread = PerfThreadOther;
+inline void PerfAdd(unsigned slot, std::uint64_t cycles) {
+    perf_cycles[perf_thread][slot].fetch_add(cycles, std::memory_order_relaxed);
+}
+struct PerfScope {
+    unsigned slot;
+    std::uint64_t start = __builtin_ia32_rdtsc();
+    explicit PerfScope(unsigned slot_) : slot{slot_} {}
+    ~PerfScope() {
+        PerfAdd(slot, __builtin_ia32_rdtsc() - start);
+    }
+};
 } // namespace BbStats

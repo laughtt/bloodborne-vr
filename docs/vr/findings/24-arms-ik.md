@@ -306,3 +306,65 @@ finger curls, `WeaponAlignment`, 14 option C.
    position; at 4 m/s that is ~6 cm of lag in the world, none relative to the body.
 6. `rest` is a static pose: the arms do not swing when walking. It answers "too low", not "not like
    the sandbox"; that needs section 6.
+
+## 8. Arms stay with the controllers during a roll (`arm_roll_detach`) [built, untested in the headset]
+
+Player report: "weapons jump when rolling, same with the sleeves - seems the sleeves are still attached to
+the body even when rolling". 
+
+**Cause (from the code, not yet measured in the headset).** The hands are placed from the controllers
+relative to the H1 camera (`vam_grip_to_model`), but the arm chain is rooted at the *animated* UpperArm
+(`old[a->upper].t`, plus the virtual-upper-body turn and the dash shift). In a roll, quickstep or backstep
+(clips 7000-7457 of `vr_dash_moves`) the animated spine, clavicles and shoulders tumble and dive while the
+camera does not follow them. The shoulder therefore jumps about relative to the wrist target: the solve
+stretches, clamps (`arm_soft`, `arm_give` slides the shoulder), the elbow and the forearm twist swing,
+and everything below the UpperArm (forearm, hand, `R_Weapon`/`L_Weapon` and so the held weapon, sleeves
+skinned to the arm and twist bones) follows. Whatever is skinned to the clavicle and the helpers under it
+(shoulder pads, sleeve cloth) is not in the arm subtree at all and keeps the game's tumbling pose.
+The weapon is parented to the Weapon bone below the Hand (section 4), so no separate fix: it jumped
+because the Hand did.
+
+**Options.** (a) Pin shoulder and clavicle in the camera frame: the whole chain is solved in camera
+space, like the hands. (b) Override spine2 and up: touches the body mesh and the camera source, risky. (c)
+Hide sleeve/upper-arm parts: needs mesh-part knowledge we do not have (only `hide=hands_skin` exists),
+and leaves the weapon problem. Chosen: (a), extended to the clavicle and its non-arm descendants.
+
+**How (`src/vr_arms_roll.h`, `arms_edit`).**
+- Detection: the TimeAct ring's newest animation (`arms.anim`) is an evade clip, `vr_evade_move()` of
+  `vr_evade_scale.h` (all rolls, quicksteps incl. 7150-7157, backsteps; not the running jump 7800).
+- Every frame outside an evade (and fully attached) the final shoulder of each side (turned, shifted) and
+  its clavicle are stored relative to the camera (`vr_roll_to_cam`). While an evade plays, the shoulder is
+  `lerp(animated, camera * pin, e)`, the clavicle the same blend, and every other bone below the clavicle
+  outside the arm subtree is moved by the clavicle's rigid step. `e` goes 0 -> 1 and back over 0.1 s
+  (`VR_ROLL_BLEND_S`) so there is no pop. Without a pin (first frames, no first-person camera) or when
+  the UpperArm's parent is not the `Clavicle` bone or is shared by both arms, that part is skipped.
+- Since the pin is camera-relative, a camera that moves (comfort dash follow, `anim_smooth` lag) takes
+  the arms with it; the wrists use the same view, so the target and the root cannot part.
+- Not touched: attack animations (arm weight already drops to `arm_attack`), outside-evade behaviour.
+
+**Settings.** `BB_VR_ARMS_ROLL_DETACH=0|1` (default 1), live `arm_roll_detach=0|1` in fp.txt. With
+`BB_VR_FP_LOG=1` or `BB_VR_EVADE_LOG=1`: "VR arms: detach/attach the arms from/to the body (anim aGGG_SSSSSS,
+pins L R)" per evade.
+
+**Tests.** `tests/test_vr_arms.c` `test_roll_detach` (blend length and no step above dt/0.1, no capture
+while fading, camera-frame pin invariance under a moved camera, blend ends). **Open:** whether the
+upper-body mesh (jacket) is skinned to bones outside the clavicle subtree (spine) and still tumbles;
+tell with `arm_roll_detach=0/1` in the headset.
+
+### 8.1 Headset feedback: "the arms roll faster than me, then come back"
+
+Run19: the detach fired right (40 detach/attach pairs) but the arms still led the eye in the roll direction
+and settled. Cause (reasoned from the frame order, not measured): the IK uses the view of the previous render
+(H1), expressed in the body's model space, `cam_model = R(-yaw) (cam_world - body_pos)`, and the model is then
+drawn at the body of the next render. That is exact only while (camera - body) is constant. In an evade it is not:
+the body moves with the root motion and the evade scale's extra, the camera with the comfort dash's slide
+(0.4 s, "VR dash: move N") and `anim_smooth`, so the hands are off by one frame of their speed difference
+(about 5-10 cm at 9 m/s against 4 m/s) in the roll direction, and the error fades when the speeds meet. The pin
+itself is camera-relative and is not the cause; re-attaching (section 8) only blends over 0.1 s.
+Fix: `vr_arms_view` keeps the last snapshot and stores `rel_vel`, the model-space velocity of (camera - body)
+(`vr_roll_rel_vel`, zero for a gap over 0.1 s or a step over 0.5 m); `arms_edit` advances the view's camera by
+one game frame of it, scaled by the detach amount (`vr_roll_lead`, at most 0.2 m), so outside an evade nothing
+changes. Test: `test_roll_lag` (body 9 m/s, camera 4 m/s: 0.05 m+ error without the lead, < 2 mm with it).
+Not done: a prediction of the camera's acceleration (the slide's ease), the physics step's position
+between the IK and the render.
+

@@ -293,6 +293,12 @@ extern "C" volatile unsigned long long bb_heartbeat_ticks;
 
 void VideoOutDriver::Flip(const Request& req) {
     bb_heartbeat_ticks = bb_heartbeat_ticks + 1;
+    if (req.queued != std::chrono::steady_clock::time_point{}) {
+        BbStats::pace_queue_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 req.queued).count(),
+            std::memory_order_relaxed);
+    }
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
@@ -591,6 +597,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .queued = std::chrono::steady_clock::now(),
         });
     }
     request_cv.notify_one();

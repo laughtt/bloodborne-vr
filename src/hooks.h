@@ -138,6 +138,23 @@ void bb_hook_set_hitscale_impl(BbHookFn shape);
  * the player during an attack it scales xmm0. */
 void bb_hook_set_atkspeed_impl(BbHookFn dt);
 
+/* Hook profiler (src/vr_hook_prof.h; BB_VR_HOOK_PROFILE=0 turns it off): every VR hook handler is timed
+ * and a "VR hooks: 10 s: ..." line names the slow ones. Other code on the game or pad thread can time
+ * itself the same way: `uint64_t t0 = bb_vrprof_t0(); ...; bb_vrprof_end(BB_PROF_xxx, t0);` (t0 is 0
+ * and the end a no-op while the profiler is off). */
+enum {
+    BB_PROF_H1, BB_PROF_H2, BB_PROF_LOD, BB_PROF_FP_STEP, BB_PROF_STAMINA_COST, BB_PROF_HIT_CHR, BB_PROF_HIT_MAP,
+    BB_PROF_HIT_OBJ, BB_PROF_STAMINA_TICK, BB_PROF_PROJ_SETCAMERA, BB_PROF_PROJ_PASS, BB_PROF_ARMS_A1, BB_PROF_ARMS_A2,
+    BB_PROF_ARMS_A3, BB_PROF_ARMS_SYNC, BB_PROF_ARMS_PLAYER, BB_PROF_UI_MENU, BB_PROF_GUN_AIM, BB_PROF_HIT_SCALE,
+    BB_PROF_ATK_SPEED, BB_PROF_VISCERAL_PAD, BB_PROF_GUN_VIEW,
+    /* inside a handler (not added to the totals above): where H1 and the arms hook spend their time */
+    BB_PROF_H1_VIEWS, BB_PROF_H1_FP, BB_PROF_H1_STEREO, BB_PROF_ARMS_LOCK, BB_PROF_ARMS_EDIT,
+    BB_PROF_FP_CUTSCENE, BB_PROF_FP_CHAIN, BB_PROF_FP_HIDE, BB_PROF_FP_LOCK, BB_PROF_FP_TURNFACE, BB_PROF_FP_DASH, BB_PROF_FP_LOG,
+    BB_PROF_COUNT
+};
+uint64_t bb_vrprof_t0(void);
+void bb_vrprof_end(int slot, uint64_t t0);
+
 /* Test hook: increments a counter and, as a demonstration of register write-back, copies ->rdi
  * into ->rsi. Registered as "bb_hook_test_counter". bb_hook_test_counter_value() reads the count
  * (for tests). Never installed by the default patch set. */

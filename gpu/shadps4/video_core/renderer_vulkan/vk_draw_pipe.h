@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "bbport_threads.h"
+#include "bbport_toggles.h"
 
 #include <array>
 #include <atomic>
@@ -118,6 +119,7 @@ public:
             }
         }
         const u64 waited = __rdtsc() - start;
+        BbStats::PerfAdd(BbStats::PerfDrainWait, waited);
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
     }
@@ -159,6 +161,7 @@ private:
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
         on_stage_b = true;
+        BbStats::perf_thread = BbStats::PerfThreadB;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
         u64 at = 0;
         while (true) {
@@ -200,7 +203,9 @@ private:
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            const u64 ran = __rdtsc() - start;
+            busy_cycles.fetch_add(ran, std::memory_order_relaxed);
+            BbStats::PerfAdd(BbStats::PerfBusy, ran);
             at += header->size;
             consumed.store(at, std::memory_order_release);
         }

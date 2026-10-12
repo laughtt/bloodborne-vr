@@ -19,7 +19,7 @@ Layout of BloodborneVR-<version>/ in the zip:
     launcher/{bbvr_launcher,bbvr_menu,bbvr_settings,bbvr_cli,bbvr_update,bbvr_online}.py (settings, web menu, the dashboard's helper,
     update check), defaults/{fp,stereo}.txt + release.json (update-check address),
     python/ (embeddable Python, optional)
-    run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/
+    run.py, scripts/, patches/, bin/ (exes + DLLs), licenses/, docs/dlss-nr.md (help page of the Super High preset)
 bin/ also has NVIDIA's nvngx_dlss.dll and the bbport_dlss.dll bridge (licenses/NVIDIA-DLSS-*.txt; see --dlss-dir).
 No game file, extracted asset or FSR 4 runtime is included.
 
@@ -53,6 +53,8 @@ SYSTEM_DIRS = [Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32']
 SYSTEM_DLLS = {'vulkan-1.dll'}
 # NVIDIA DLSS runtime + our bridge (NVIDIA RTX SDKs LICENSE allows redistribution in an application).
 DLSS_DLLS = ('bbport_dlss.dll', 'nvngx_dlss.dll')
+# Never in a package: NVIDIA's experimental DLSS-NR runtime is not ours to redistribute; players add it themselves.
+NEVER_SHIP = {'nvngx_dlssnr.dll'}
 # Licence file folders in <msys2>/share/licenses for the DLLs that may be shipped: dll prefix -> folder.
 LICENSE_DIRS = {
     'sdl3': 'SDL3', 'libopenxr_loader': 'openxr-sdk', 'libssl': 'openssl', 'libcrypto': 'openssl',
@@ -379,6 +381,9 @@ def main():
     for low, path in sorted(found.items()):
         if not (bin_dir / path.name).exists():
             shutil.copyfile(path, bin_dir / path.name)
+    for banned in NEVER_SHIP:  # explicit guard, whatever the copy rules above picked up (not `name`: it is the release name below)
+        for stray in [p for p in stage.rglob('*') if p.name.lower() == banned]:
+            stray.unlink()
     for dll in sorted(bin_dir.iterdir()):
         folder, lic = license_for(dll.name, share)
         if lic and not (stage / 'licenses' / f'{folder}-{lic.name}').exists():
@@ -427,6 +432,10 @@ def main():
     for item in ('BloodborneVR-console.bat', 'README.txt'):
         text = (ZIPSRC / item).read_text(encoding='utf-8')
         (stage / item).write_bytes(text.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
+    nr_doc = ex / 'docs' / 'vr' / 'dlss-nr.md'  # the "What is this?" page of the Super High preset (no download links)
+    if nr_doc.is_file():
+        (stage / 'docs').mkdir()
+        shutil.copyfile(nr_doc, stage / 'docs' / 'dlss-nr.md')
     controls = REPO / 'docs' / 'images' / 'controls.png'
     if controls.is_file():  # the labelled controller map README.txt points to
         shutil.copyfile(controls, stage / 'controls.png')

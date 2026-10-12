@@ -15,6 +15,7 @@
  * "game" object's "debug_hitboxes" in out/vr_assets/ui_layouts.json). */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "vr_mem_cache.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
 #include "vr_hit_scale.h"
 #include "vr_hitbox.h"
@@ -47,33 +48,9 @@ static double hb_now(void) {
 
 /* ---- guest memory (own guard; the hit hook and the pad poll may run on different threads) ---- */
 #ifdef _WIN32
-static _Thread_local struct { uintptr_t lo, hi; } hb_regions[16];
-static _Thread_local int hb_region_count;
-static _Thread_local double hb_regions_time;
-static int hb_readable(uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const double now = hb_now();
-    if (now - hb_regions_time > 1.0) { hb_region_count = 0; hb_regions_time = now; }
-    for (int i = 0; i < hb_region_count; ++i)
-        if (hb_regions[i].lo <= a && a + n <= hb_regions[i].hi) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (hb_region_count < (int)(sizeof(hb_regions) / sizeof(*hb_regions))) {
-            hb_regions[hb_region_count].lo = lo;
-            hb_regions[hb_region_count].hi = hi;
-            ++hb_region_count;
-        }
-        at = hi;
-    }
-    return 1;
-}
+/* page-probed reads with a per-thread cache (vr_mem_cache.h): VirtualQuery on the guest mappings took ms per cold lookup (run12e/g profiles) */
+static _Thread_local VmCache hb_cache;
+static int hb_readable(uintptr_t a, size_t n) { return vm_readable(&hb_cache, a, n); }
 #else
 static int hb_readable(uintptr_t a, size_t n) {
     int fds[2];

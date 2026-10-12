@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <set>
+#include <string>
 #include "gpu/shadps4/video_core/renderer_vulkan/xr_dlss_logic.h"
 
 using namespace XrDlssLogic;
@@ -404,9 +405,105 @@ void TestJitterPerEyeAndOff() {
     }
 }
 
+/// Pixel (x, y) and hardware depth of world point `w` seen by `c` at `width` x `height`.
+std::array<float, 3> Project(const Camera& c, const std::array<float, 3>& w, float width,
+                             float height) {
+    float v[3];
+    for (int r = 0; r < 3; ++r) {
+        v[r] = c.view[r * 4 + 0] * w[0] + c.view[r * 4 + 1] * w[1] + c.view[r * 4 + 2] * w[2] +
+               c.view[r * 4 + 3];
+    }
+    const float ndc_x = c.proj[0] * v[0] / v[2], ndc_y = c.proj[1] * v[1] / v[2];
+    return {(ndc_x + 1.0f) * 0.5f * width - 0.5f, (1.0f - ndc_y) * 0.5f * height - 0.5f,
+            DepthAt(c, v[2])};
+}
+
+void TestPairEyeCamera() {
+    // True stereo (findings/31 section 9.8): eye cameras are the game camera moved along its x axis.
+    const Camera c = MakeCamera(1.0f, 1.6f, -2.0f, 0.6f);
+    const Camera same = EyeCamera(c, 0.0f);
+    for (int i = 0; i < 12; ++i) {
+        assert(same.view[i] == c.view[i] && same.inv_view[i] == c.inv_view[i]);
+    }
+    const float m = 0.0315f;
+    const Camera r = EyeCamera(c, m);
+    const auto p0 = Position(c.view), p1 = Position(r.view);
+    for (int k = 0; k < 3; ++k) {
+        assert(Near(p1[k] - p0[k], m * c.view[0 * 4 + k], 1e-5f)); // along the camera's x axis
+        assert(Near(r.inv_view[k * 4 + 3], p1[k], 1e-5f));          // inverse view agrees
+    }
+    const auto id = Multiply(r.view, r.inv_view);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            assert(Near(id[row * 4 + col], col == row ? 1.0f : 0.0f, 1e-5f));
+        }
+    }
+    // The remap's clip x: eye at m sees view x - m, i.e. clip.x - P00 * m.
+    const std::array<float, 3> w{1.3f, 1.4f, 0.5f};
+    const auto pc = Project(c, w, 1920, 1080), pr = Project(r, w, 1920, 1080);
+    float vz = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        vz += c.view[2 * 4 + k] * w[k];
+    }
+    vz += c.view[2 * 4 + 3];
+    assert(Near(pr[0] - pc[0], -c.proj[0] * m / vz * 960.0f, 1e-2f));
+    assert(Near(pr[1], pc[1], 1e-3f) && Near(pr[2], pc[2], 1e-7f));
+
+    // Eye R's motion vectors: from eye R's current camera to eye R's previous camera. The head
+    // turns 5 degrees and steps 3 cm between frames; a point 1 m away.
+    const Camera prev = MakeCamera(1.0f, 1.6f, -2.0f, 0.6f);
+    const Camera cur = MakeCamera(1.03f, 1.6f, -2.0f, 0.6f + 0.0873f);
+    const Camera prev_r = EyeCamera(prev, m), cur_r = EyeCamera(cur, m);
+    const auto inv = cur_r.inv_view;
+    std::array<float, 3> point{};
+    for (int k = 0; k < 3; ++k) { // 1 m straight ahead of eye R, 0.2 m right, 0.1 m up
+        point[k] = inv[k * 4 + 0] * 0.2f + inv[k * 4 + 1] * 0.1f + inv[k * 4 + 2] * 1.0f +
+                   inv[k * 4 + 3];
+    }
+    const auto now = Project(cur_r, point, 1920, 1080), then = Project(prev_r, point, 1920, 1080);
+    const auto mv = MotionVector(now[0], now[1], now[2], 1920, 1080, {0.0f, 0.0f},
+                                 Reproject(cur_r, prev_r), cur_r.proj, prev_r.proj);
+    assert(Near(mv[0], then[0] - now[0], 0.02f) && Near(mv[1], then[1] - now[1], 0.02f));
+    // The game camera's reprojection (no eye offset) misses the eye's lever arm: the error is
+    // the offset times the rotation, about 2.6 mm here, over a pixel at 1 m.
+    const auto mv_center = MotionVector(now[0], now[1], now[2], 1920, 1080, {0.0f, 0.0f},
+                                        Reproject(cur, prev), cur.proj, prev.proj);
+    assert(std::fabs(mv_center[0] - (then[0] - now[0])) > 0.5f);
+    // The same jitter in both eyes: the motion pass removes it from eye R's vectors as well.
+    const auto mv_j = MotionVector(now[0] + 0.3f, now[1] - 0.2f, now[2], 1920, 1080,
+                                   {0.3f, -0.2f}, Reproject(cur_r, prev_r), cur_r.proj,
+                                   prev_r.proj);
+    assert(Near(mv_j[0], mv[0], 0.02f) && Near(mv_j[1], mv[1], 0.02f));
+}
+
+void TestPairEyeRHistory() {
+    PairEyeR h;
+    const Camera a = MakeCamera(0, 0, 0), b = MakeCamera(0.01f, 0, 0), c = MakeCamera(0.02f, 0, 0);
+    auto s = h.OnFrame(a, false, 10);
+    assert(s.reset && std::string(s.reason) == "first frame of eye R");
+    s = h.OnFrame(b, false, 11); // follows eye L, frame by frame: its own previous camera
+    assert(!s.reset && s.previous.view == a.view);
+    s = h.OnFrame(c, true, 12); // eye L reset (cut, menu, settings): eye R resets too
+    assert(s.reset && s.previous.view == c.view && std::string(s.reason) == "eye L reset");
+    s = h.OnFrame(a, false, 14); // skipped one frame (no warp): still continuous
+    assert(!s.reset && s.previous.view == c.view);
+    s = h.OnFrame(b, false, 19); // gap of 5 frames
+    assert(s.reset && std::string(s.reason) == "frame gap");
+    s = h.OnFrame(b, false, 19); // the same frame again: never a history step
+    assert(s.reset);
+    h.Invalidate();
+    s = h.OnFrame(c, false, 20);
+    assert(s.reset);
+    s = h.OnFrame(a, false, 21);
+    assert(!s.reset && s.previous.view == c.view);
+    assert(h.Frames() == 8 && h.Resets() == 5);
+}
+
 } // namespace
 
 int main() {
+    TestPairEyeCamera();
+    TestPairEyeRHistory();
     TestFeatureRecreate();
     TestJitterPerEyeAndOff();
     TestColorOrder();

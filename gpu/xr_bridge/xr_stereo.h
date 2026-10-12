@@ -24,6 +24,14 @@
 //
 //   AltEyes (the bridge): when the projection layer shows the two eye images, each with the view
 //   it was rendered with, and the per-eye image ages of the pacing log.
+//
+//   True stereo (BB_XR_MODE=stereo, docs/vr/findings/31-true-stereo.md "P4.6a hand-off"): every
+//   game frame hands BOTH eyes to the bridge as one pair (ReleaseEyes, ABI 10). No eye schedule
+//   and no eye tags: the frame is paired with its one PairView (the head pose and union frustum
+//   of one xrLocateViews snapshot, plus the eyes' offsets from the head in that snapshot) and
+//   PairEyePoses derives both layer poses from it. PairDecider holds frames the pairing missed
+//   and sends the rest (menus, loading, cutscenes) to the flat screen; LatencyTracker is the
+//   bridge's measured release -> display time, which sets the time the host asks views for.
 
 #pragma once
 
@@ -31,8 +39,29 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace xrstereo {
+
+/// BB_XR_MODE: what the bridge and the port's presenter do with the game image (unset or
+/// anything else: the cinema screen).
+enum class XrMode { Cinema, Mono, Alt, Stereo };
+
+inline XrMode ParseMode(const char* mode) {
+    if (!mode) {
+        return XrMode::Cinema;
+    }
+    if (!std::strcmp(mode, "mono")) {
+        return XrMode::Mono;
+    }
+    if (!std::strcmp(mode, "alt")) {
+        return XrMode::Alt;
+    }
+    if (!std::strcmp(mode, "stereo")) {
+        return XrMode::Stereo;
+    }
+    return XrMode::Cinema;
+}
 
 /// What the camera hook published for one frame it set up (BbVrEyeView).
 struct EyeView {
@@ -335,6 +364,11 @@ struct AltEyes {
         ++released[eye & 1];
         released_at[eye & 1] = now;
     }
+    /// Both eyes at once (true stereo): there is no state in which only one of them is new.
+    void ReleasePair(double now) {
+        ReleaseEye(0, now);
+        ReleaseEye(1, now);
+    }
     void ReleaseFlat(double now) {
         flat_at = now;
         valid[0] = valid[1] = false;
@@ -395,5 +429,166 @@ struct AgeStats {
         window = Window{};
     }
 };
+
+// ---- true stereo (BB_XR_MODE=stereo): one pair per game frame -------------------------------------
+
+/// The view one game frame was rendered with (BbVrRenderView): the head pose and the one union
+/// frustum both eyes' images were rendered with, the camera's rotation rows (they pair the
+/// finished frame with this view) and the eyes' offsets from the head in the head's frame
+/// (OpenXR axes), all from the same xrLocateViews snapshot.
+struct PairView {
+    uint64_t seq = 0;
+    int64_t display_time = 0;           // the XrTime the snapshot was predicted for (0 unknown)
+    float head_position[3] = {};
+    float head_orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float fov[4] = {};                  // left, right, up, down (radians; left and down < 0)
+    float rows[3][3] = {};              // camera right, up, forward (world)
+    bool has_eye_offset = false;        // eye_offset is from a headset snapshot
+    float eye_offset[2][3] = {};        // eye position - head position, in the head's frame
+};
+
+/// v rotated by the unit quaternion q (x, y, z, w).
+inline void RotateByQuat(const float q[4], const float v[3], float out[3]) {
+    const float tx = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+    const float ty = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+    const float tz = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+    out[0] = v[0] + q[3] * tx + (q[1] * tz - q[2] * ty);
+    out[1] = v[1] + q[3] * ty + (q[2] * tx - q[0] * tz);
+    out[2] = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
+}
+
+/// Both eyes' layer poses of a pair: the head's orientation for both (the image was rendered along
+/// the head's axes with the union frustum, not along a canted eye axis), each at the head position
+/// plus its offset rotated into the world. Both come from the one snapshot, so the baseline is the
+/// runtime's IPD whatever the head does. False when the view has no eye offsets (flat tests, fake
+/// head): the caller shows the images with the views current at release.
+inline bool PairEyePoses(const PairView& v, float position[2][3], float orientation[4]) {
+    if (!v.has_eye_offset) {
+        return false;
+    }
+    for (int eye = 0; eye < 2; ++eye) {
+        float d[3];
+        RotateByQuat(v.head_orientation, v.eye_offset[eye], d);
+        for (int i = 0; i < 3; ++i) {
+            position[eye][i] = v.head_position[i] + d[i];
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        orientation[i] = v.head_orientation[i];
+    }
+    return true;
+}
+
+/// What the presenter does with a finished frame in true stereo: Eye = the pair (both eyes),
+/// Hold = nothing (both eyes keep their last images), Mono = the flat cinema screen. A frame that
+/// matched no render view is held; after `fallback_frames` held frames in a row (menus, loading
+/// screens) the flat path takes over until a frame matches again. A cutscene goes flat at once.
+class PairDecider {
+public:
+    explicit PairDecider(uint32_t fallback_frames = 30) : fallback_{fallback_frames} {}
+
+    Kind OnFrame(bool cinema, bool matched) {
+        ++frames_;
+        if (cinema) {
+            streak_ = 0;
+            mono_ = true;
+            ++cinema_;
+            return Kind::Mono;
+        }
+        if (matched) {
+            streak_ = 0;
+            mono_ = false;
+            ++pairs_;
+            return Kind::Eye;
+        }
+        ++held_;
+        ++streak_;
+        if (mono_ || streak_ >= fallback_) {
+            mono_ = true;
+            return Kind::Mono;
+        }
+        return Kind::Hold;
+    }
+    uint64_t frames() const {
+        return frames_;
+    }
+    uint64_t pairs() const {
+        return pairs_;
+    }
+    uint64_t held() const {
+        return held_;
+    }
+    uint64_t cinema() const {
+        return cinema_;
+    }
+    bool Mono() const {
+        return mono_;
+    }
+
+private:
+    uint32_t fallback_;
+    uint32_t streak_ = 0;
+    bool mono_ = false;
+    uint64_t frames_ = 0, pairs_ = 0, held_ = 0, cinema_ = 0;
+};
+
+/// The bridge's measured time from ReleaseEyes to the pair's display, in display periods,
+/// smoothed. The frame loop adds one sample the first time it shows a pair: the predicted display
+/// time of that frame minus the (XrTime) time the pair was released.
+class LatencyTracker {
+public:
+    static constexpr double kMaxPeriods = 8.0; // anything longer is a stall, not the pipeline
+    static constexpr double kSmoothing = 0.1;
+    static constexpr uint64_t kMinSamples = 8;
+
+    void Shown(int64_t released_xr, int64_t displayed_xr, int64_t period_ns) {
+        if (period_ns <= 0 || released_xr <= 0 || displayed_xr <= 0) {
+            return;
+        }
+        const double p = double(displayed_xr - released_xr) / double(period_ns);
+        if (!(p >= 0.0 && p <= kMaxPeriods)) {
+            ++rejected_;
+            return;
+        }
+        periods_ = samples_ ? periods_ + kSmoothing * (p - periods_) : p;
+        period_ns_ = period_ns;
+        ++samples_;
+    }
+    bool Valid() const {
+        return samples_ >= kMinSamples;
+    }
+    double Periods() const {
+        return periods_;
+    }
+    int64_t PeriodNs() const {
+        return period_ns_;
+    }
+    uint64_t samples() const {
+        return samples_;
+    }
+    uint64_t rejected() const {
+        return rejected_;
+    }
+
+private:
+    double periods_ = 0.0;
+    int64_t period_ns_ = 0;
+    uint64_t samples_ = 0, rejected_ = 0;
+};
+
+/// The XrTime the host asks views for: when the image of the camera it sets up now will be on the
+/// display. now_xr (the bridge's XrTime now) + the host's own camera -> release time + the bridge's
+/// release -> display latency (periods), clamped to [now, now + kMaxPeriods periods]. Returns 0
+/// when there is no XrTime now or no period (then the host keeps the views of GetViews).
+inline int64_t PredictDisplayTime(int64_t now_xr, int64_t host_ns, double latency_periods,
+                                  int64_t period_ns) {
+    if (now_xr <= 0 || period_ns <= 0 || !(latency_periods >= 0.0)) {
+        return 0;
+    }
+    const double ahead = double(std::max<int64_t>(host_ns, 0)) +
+                         latency_periods * double(period_ns);
+    const double limit = LatencyTracker::kMaxPeriods * double(period_ns);
+    return now_xr + int64_t(std::min(ahead, limit));
+}
 
 } // namespace xrstereo

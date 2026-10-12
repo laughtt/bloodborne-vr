@@ -325,6 +325,60 @@ the eye offset captured while idle; a 0.15 s decaying correction hides the hand-
 sandbox keeps it: nothing blocks the character there). Tests: `TestFollow` (wall, slope, jump) in
 `vr_dash_test.cpp`, `test_follow` in `tests/test_vr_dash.c`.
 
+## 10. Evade distance scale (1.5x in VR by default; first 2x) and co-op
+
+Request: in VR the roll and quickstep should travel about twice as far ("double is good").
+
+**How the distance is decided.** It is the clip's root motion: the table of `src/vr_dash_detect.h` (4.0 m for the quickstep and roll, 3.7 m for the 7150 set, 2.5 m for the backstep, over 0.8-1.5 s). The game applies it as a per-frame change of the physics position (`[[P + 0x3B0] + 0x68] + 0x1E0`). Speed multipliers do not help: the "VR Attack Speed (chr dt)" hook scales the character's time step, which plays the clip faster (same distance, shorter) and would also shrink the i-frame window. The root-motion application itself is not hooked in this port.
+
+**What was added.** `src/vr_evade_scale.h` (pure) and `as_evade` in `src/runtime_vr_atkspeed.c`, in the same hook as the attack speed. Once per player update, while the newest TimeAct ring clip is a roll, quickstep or backstep, the previous frame's real horizontal step is measured from the feet and `(k - 1) * step` is added to the feet along it. Clip time, i-frames and stamina are not touched (they follow the clip and the behaviour, not the position), and walking, running, jumps and attacks are not in the table. Guards: at most `(k - 1) * table distance` per clip; only until the clip's root motion ends; the extra stops for the rest of the clip when the step speed halves (a wall, the end of the motion); none for a step over 1.5 m (a teleport); a restarted clip (its time drops) starts afresh. The extra is not collision-checked: a very thin wall inside the extra metre can be crossed (the next physics step pushes out).
+
+| Setting | Meaning |
+|---|---|
+| `BB_VR_EVADE_SCALE=<k>` | start value, default 1.5 (was 2.0; the player settled on 1.5 live) (1 or less = off, at most 4) |
+| `evade_scale=<k>` in `out/fp.txt` | live (polled 4 Hz with `atk_speed=`; a missing key = the env value, else 1.5; `evade_scale=1` = off; every change of the value is logged as `VR evade: scale <k> (control file)`) |
+| `BB_VR_EVADE_LOG=1` | a line when an evade starts and ends |
+| `BB_VR_EVADE_ONLINE=1` | keep the scale on while online (testing only) |
+
+Needs the hook "VR Attack Speed (chr dt)" in `BB_HOOKS` (the launchers already have it). The comfort dash follows the real feet, so its camera simply covers the longer move.
+
+**Tests.** `tests/test_vr_dash.c` `test_evade_scale` (`ninja -C out/gpu vr-dash-test`): clamp, parse, online flag, table membership (the jump is excluded), a 4 m roll gains up to 4 m, off/walk/jump give nothing, a wall stops it, a teleport and a restart, the end of the motion. **Not verified in game**: whether a write to `+0x1E0` sticks (the position may be re-derived from another copy), and how it feels. Run once with `BB_VR_EVADE_LOG=1` and `BB_VR_DASH_LOG=1`; the dash log prints the table distance against the distance the eye really moved.
+
+**Co-op.**
+
+- The base game replicates the character through its own P2P state, not through anything this port adds. The port's pose channel (findings/34) says explicitly that "the root's own world position and heading come from the game's character sync".
+- In this port that sync has never been seen working: the game's P2P socket carried no traffic in the traced runs, and bell co-op is not end to end yet (private notes, not copied here).
+- So the answer to "does the other player see the longer evade" cannot be measured yet. From the game's design (each client simulates its own hunter and sends position and animation state), a longer step is sent as a faster, longer move: the peer most likely sees a quick slide, and a peer with a position sanity check could snap it back (rubber-band). Unverified.
+- Hit decisions are likewise not verifiable here. The Souls-series model is that the attacker's client decides hits on remote players and the host decides for enemies; i-frames stay the same length, but the dodged attack's hit test happens where the roller is on the roller's own machine, so a 2x roll keeps the i-frame behaviour on the roller's side and may disagree with the peer's view of where the roller was.
+- **Recommendation: auto-disable online.** The scale is a client-side position change the base game's sync and its moveset timing do not expect, and there is no way yet to test it. Implemented: the scale is forced off when `BB_ONLINE=1` or `BB_ONLINE_ROLE` is set (the same flags the port uses elsewhere); `BB_VR_EVADE_ONLINE=1` overrides it for a test session with two instances. Revisit once the P2P sync works end to end and two instances can be compared.
+
+## 11. Backward evade = the backstep
+
+Request: an evade while moving backwards should be the game's backstep (what dodge does with no stick), not a backward roll or quickstep.
+
+**How it is triggered.** In the game the dodge is decided when circle is released after a tap: stick pushed = roll or quickstep along the stick, stick neutral = backstep. The pad thread (`fp_pad_filter` in `src/runtime_vr_fp.c`, first person only) therefore checks each press of circle: if the left stick's world direction is more than `backstep_angle` (default 120 deg) from the character's facing, it sends the game a neutral left stick (128,128) from the press until 0.10 s after the release. The game sees a plain tap with no stick and does its own backstep (same clip, i-frames, stamina, replication). Nothing else is touched: no position write, no animation write. Walking is unchanged; only the stick is held neutral for the length of the tap.
+- "World direction" = the move heading (`fp_target_bits`, the head's yaw with `move=head`; the stick is head-relative in VR) + atan2(stick x, stick y). "Facing" = the character's heading published by H1 each frame (`vr_facing_heading(yaw)`, after the face write, so with `face=` it is the view). The stick may arrive up to 0.08 s after the button and still count; a deadzone of 0.3 applies.
+- A circle held longer than 0.30 s is a sprint, not a dodge: the stick is given back at once, so a backward sprint is untouched.
+- The pure part (classification, hold window, off switch) is `src/vr_backstep.h`, tested by `test_backstep` in `tests/test_vr_dash.c`.
+
+**Lock-on.** In the base game a dodge with the stick back while locked on is a back quickstep (the stick is relative to the target). Decision: the backstep applies there too (default `backstep_lock=1`), because the player asked for backward evades to be the backstep and a lock-on quickstep backwards is the same gesture; `backstep_lock=0` keeps the base game's behaviour while locked on.
+
+| Setting | Meaning |
+|---|---|
+| `BB_VR_BACKSTEP=1\|0` | default on in VR first person |
+| `backstep=1\|0` in `out/fp.txt` | live |
+| `BB_VR_BACKSTEP_ANGLE=<deg>` / `backstep_angle=<deg>` | threshold, default 120 (30..180) |
+| `BB_VR_BACKSTEP_LOCK=1\|0` / `backstep_lock=` | also while locked on (default 1) |
+| `BB_VR_EVADE_LOG=1` | a line `VR backstep: dodge with the stick behind (...)` each time it triggers |
+
+**Online.** Safe, so it is not gated by `BB_ONLINE`: it only changes the input the local game reads, which then performs a normal backstep (the same animation and position an unmodified client produces when the player presses dodge with no stick). Unlike the evade scale (section 10) it adds no position change the peer's sync does not expect.
+
+**The evade scale fix.** A report said `evade_scale=1.5` in `out/fp.txt` was ignored. In the log (`out/vr_all_stereo_run12b_plain.log`) the file was read at start without the key (so 2.00), and `VR evade: scale 1.50 (control file)` appears at line 2543 once the key was added: the live key worked, the evades of that session simply ran before it. Two real weaknesses were fixed: a missing key used to reset to the built-in default, overriding `BB_VR_EVADE_SCALE`; now it falls back to the env value. The change line is now always logged (it needed `BB_VR_EVADE_LOG`/`BB_VR_FP_LOG`), and the startup line names the control file in use. `test_evade_control` covers the parse (last token with LF, CRLF, no newline).
+
+**Fix after the first headset test (run12c never triggered).** The first version compared the stick's world direction with the CHARACTER's facing. Out of lock-on a Souls character turns to its walk direction, so with the stick pulled back it already faces the movement and the angle was ~0. Now "back" is judged against the player's VIEW heading (`fp.turn_out.view_yaw`, published by H1; with `move=head` this is just the stick pulled back from stick-forward); the character's facing is only a fallback when no view is known, and with no heading at all the raw stick angle is used. With `BB_VR_EVADE_LOG=1` every circle press is logged (`VR backstep: circle pressed (buttons, stick, degrees from the view, back, locked, on)`), which shows that the filter runs and the button mask matches.
+
+**Backstep distance (own scale).** The run12d log showed backsteps at x1.50 gaining only 0.34-1.12 m (mean ~0.8 m, the limit 1.25 m): the backstep's root-motion speed decays early, so the roll rule "a step under half the previous speed = a wall" stopped it. Backsteps (clips of the table with kind backstep: 7000, 7050) now use their own multiplier, `BB_VR_BACKSTEP_SCALE` / `backstep_scale=` in `out/fp.txt` (live, default 2.0, 1 = off; a missing key falls back to the env value; changes logged as `VR evade: backstep scale <k> (...)`), and their stop guard only stops on a step under 15% of the previous one (a wall gives ~0) besides the existing end-of-root-motion (clip's motion time + 0.05 s), teleport (> 1.5 m) and total (<= (k - 1) x the table distance, 2.48 m) limits. Rolls and quicksteps keep `evade_scale` and the 50% rule. Same online rule as the evade scale (forced off online). Tests: `test_backstep_scale`.
+
 ## Cross-links
 - **11 §3.2/§3.7/§4.3–4.4:** the first-person comfort design this realises: no rotation from
   animations, the height floor during dodges (superseded by the dash), the vignette.

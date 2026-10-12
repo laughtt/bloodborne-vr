@@ -5,6 +5,7 @@
  * forward. Build: ninja -C out/gpu vr-head-test (no GPU, no game). Prints PASS lines; exit 0. */
 #include "vr_head_math.h"
 #include "vr_fp_math.h"
+#include "vr_stereo_math.h"
 #include <stdio.h>
 
 static int failures, checks;
@@ -313,7 +314,39 @@ static void test_cutscene(void) {
           !vr_cutscene_update(&l, 1), "flicker does not enter");
 }
 
+/* True stereo (BB_XR_MODE=stereo, src/vr_stereo_math.h vrs_pair_offsets): both eyes' offsets from the
+ * head, taken from one views snapshot, in the head's frame. */
+static void test_pair_offsets(void) {
+    const float half_ipd = 0.0315f;
+    for (int k = 0; k < 6; ++k) {
+        /* A head turned and tilted every way; the eyes where the runtime puts them: head + R (+-half, 0.002, -0.01). */
+        const VrQuat head = vr_qnormalize(vr_xr_ypr(0.9f * (float)k, 0.3f * (float)k - 0.6f, 0.2f * (float)k));
+        const VrVec3 hp = vr_v3(0.3f * (float)k, 1.6f, -2.0f + (float)k);
+        const VrVec3 l = vr_add(hp, vr_qrotate(head, vr_v3(-half_ipd, 0.002f, -0.01f)));
+        const VrVec3 r = vr_add(hp, vr_qrotate(head, vr_v3(half_ipd, 0.002f, -0.01f)));
+        VrVec3 off[2];
+        CHECK(vrs_pair_offsets(head, hp, l, r, VRS_DEFAULT_IPD, off) == 1, "plausible offsets, head %d", k);
+        CHECK(near_v(off[0], vr_v3(-half_ipd, 0.002f, -0.01f), 1e-5f), "left offset in the head's frame, head %d", k);
+        CHECK(near_v(off[1], vr_v3(half_ipd, 0.002f, -0.01f), 1e-5f), "right offset in the head's frame, head %d", k);
+        /* the offsets rebuild the eye positions exactly (what the layer poses do) */
+        CHECK(near_v(vr_add(hp, vr_qrotate(head, off[1])), r, 1e-5f), "head . offset = the located eye, head %d", k);
+    }
+    /* Implausible snapshots (eyes swapped, a junk pose): the default IPD split, 0 returned. */
+    const VrQuat id = vr_qidentity();
+    VrVec3 off[2];
+    CHECK(vrs_pair_offsets(id, vr_v3(0, 0, 0), vr_v3(0.03f, 0, 0), vr_v3(-0.03f, 0, 0), 0.064f, off) == 0,
+          "swapped eyes are not plausible");
+    CHECK(near_v(off[0], vr_v3(-0.032f, 0, 0), 1e-6f) && near_v(off[1], vr_v3(0.032f, 0, 0), 1e-6f),
+          "default IPD 64 mm split");
+    CHECK(vrs_pair_offsets(id, vr_v3(0, 0, 0), vr_v3(-0.2f, 0, 0), vr_v3(0.2f, 0, 0), 0.064f, off) == 0,
+          "40 cm apart is not a head");
+    CHECK(vrs_pair_offsets(id, vr_v3(0, 0, 0), vr_v3(-0.03f, 0.1f, 0), vr_v3(0.03f, 0.1f, 0), 0.064f, off) == 0,
+          "10 cm above the head is not an eye");
+    printf("PASS pair offsets\n");
+}
+
 int main(void) {
+    test_pair_offsets();
     test_cutscene();
     test_fp();
     test_identity();

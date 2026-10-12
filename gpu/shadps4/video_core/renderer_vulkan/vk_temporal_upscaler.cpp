@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
+#include "video_core/renderer_vulkan/xr_hud_center.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1433,7 +1434,7 @@ void TemporalUpscaler::StartHud(VideoCore::ImageId color_id, VideoCore::ImageId 
 }
 
 void TemporalUpscaler::SnapshotHud() {
-    constexpr u32 kProbeW = 32, kProbeH = 18;
+    constexpr u32 kProbeW = XrHudCenter::kProbeW, kProbeH = XrHudCenter::kProbeH;
     const auto device = instance.GetDevice();
     const auto allocator = instance.GetAllocator();
     if (!hud_snapshot || hud_width != ui_width || hud_height != ui_height ||
@@ -1494,7 +1495,7 @@ void TemporalUpscaler::SnapshotHud() {
                   vk::ImageCopy{.srcSubresource = layers,
                                 .dstSubresource = layers,
                                 .extent = {hud_width, hud_height, 1}});
-    // The coverage probes (one bilinear sample per 60x60 block) come from ui_image, read with
+    // The coverage probes (one bilinear sample per 15x15 block) come from ui_image, read with
     // the copy; the snapshot is only written.
     cmd.blitImage(vk::Image(ui_image), vk::ImageLayout::eGeneral, vk::Image(hud_probe),
                   vk::ImageLayout::eGeneral,
@@ -1565,8 +1566,11 @@ void TemporalUpscaler::SnapshotHud() {
                 vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
                 const bool covered = UiComposition::FullScreenUi(
                     static_cast<const u8*>(info.pMappedData), kProbeW * kProbeH);
+                // Message content outside the always-on HUD zones (xr_hud_center.h).
+                const u32 activity = XrHudCenter::Activity(
+                    static_cast<const u8*>(info.pMappedData), kProbeW, kProbeH);
                 // BB_XR_HUD_DEBUG=1: alpha of the corners, the center and the subtitle strip of
-                // the HUD image (32x18 probes), and how much of it is not fully transparent.
+                // the HUD image (128x72 probes), and how much of it is not fully transparent.
                 static const bool debug = std::getenv("BB_XR_HUD_DEBUG") != nullptr;
                 static int debug_count = 0;
                 if (debug && (debug_count < 3 || debug_count % 300 == 0)) {
@@ -1581,8 +1585,8 @@ void TemporalUpscaler::SnapshotHud() {
                         return std::array<int, 4>{p[0], p[1], p[2], p[3]};
                     };
                     const auto c0 = fmt(0, 0), c1 = fmt(kProbeW - 1, 0), c2 = fmt(0, kProbeH - 1),
-                               c3 = fmt(kProbeW - 1, kProbeH - 1), mid = fmt(16, 9),
-                               sub = fmt(16, 15);
+                               c3 = fmt(kProbeW - 1, kProbeH - 1), mid = fmt(kProbeW / 2, kProbeH / 2),
+                               sub = fmt(kProbeW / 2, kProbeH * 5 / 6);
                     std::printf("VR HUD debug #%d: RGBA corner TL %d %d %d %d, TR %d %d %d %d, BL "
                                 "%d %d %d %d, BR %d %d %d %d; center %d %d %d %d; subtitle %d %d "
                                 "%d %d; alpha != 0 in %u of %u probes (corners should be A=0)\n",
@@ -1595,6 +1599,7 @@ void TemporalUpscaler::SnapshotHud() {
                 vmaDestroyBuffer(allocator, buffer, allocation);
                 --hud_probes_pending;
                 std::scoped_lock lock{hud_mutex};
+                hud_activity = activity;
                 const bool was = hud_fullscreen;
                 hud_fullscreen = hud_latch.Update(covered);
                 if (was != hud_fullscreen) {
@@ -1616,7 +1621,8 @@ bool TemporalUpscaler::LatestHud(Hud& hud) {
     if (!hud_valid || !hud_snapshot) {
         return false;
     }
-    hud = {vk::Image(hud_snapshot), hud_format, hud_width, hud_height, hud_fullscreen};
+    hud = {vk::Image(hud_snapshot), hud_format, hud_width, hud_height, hud_fullscreen,
+           hud_activity};
     return true;
 }
 

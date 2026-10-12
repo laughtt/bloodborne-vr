@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -55,6 +56,11 @@ public:
     /// At the display pass: closes the frame's last segment, reads an old frame's results.
     void BeginFrame();
 
+    /// The mean GPU time of the frames collected since the last call (the sum of their segments,
+    /// ms per frame), any thread; false when the profiler is off or collected nothing (the
+    /// "Pace:" line and the VR fps counter use it).
+    static bool TakeFrameMs(double& ms_per_frame);
+
 private:
     GpuProfiler(const Instance& instance, Scheduler& scheduler);
     void WriteTimestamp(u64 key);
@@ -81,6 +87,7 @@ private:
     std::unordered_map<u64, Total> totals;
     u64 frames = 0;
     u64 current = 0;
+    static inline std::atomic<u64> taken_ns{0}, taken_frames{0}; ///< for TakeFrameMs
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 

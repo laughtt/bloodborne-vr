@@ -5,7 +5,8 @@
 // thread at the headset rate. Layers, back to front:
 //   1. a projection layer: the host's own stereo images (AcquireStereo, ABI 4; with depth when
 //      the runtime has XR_KHR_composition_layer_depth), else with BB_XR_MODE=alt each eye's
-//      latest game image with the view it was rendered with (AcquireEye, ABI 6), else with
+//      latest game image with the view it was rendered with (AcquireEye, ABI 6; BB_XR_MODE=stereo
+//      shows the same layer with both eyes released as one pair, ReleaseEyes, ABI 10), else with
 //      BB_XR_MODE=mono (or alt between eye frames: menus, loading) the game image itself, else a
 //      solid background per eye (BB_XR_BG). Without one the Pimax compositor never clears, so
 //      moving quads smear;
@@ -52,6 +53,7 @@
 #include "xr_input.h"
 #include "xr_screen_math.h"
 #include "xr_stereo.h"
+#include "xr_view_predict.h"
 
 namespace {
 
@@ -89,6 +91,13 @@ bool EnvFlag(const char* name, bool fallback) {
     }
     return fallback;
 }
+
+#ifdef _WIN32
+#define BB_XR_CONVERT_QPC_EXTENSION "XR_KHR_win32_convert_performance_counter_time"
+using PFN_ConvertQpc = XrResult(XRAPI_PTR*)(XrInstance, const LARGE_INTEGER*, XrTime*);
+#else
+using PFN_ConvertQpc = void*;
+#endif
 
 /// Failures of calls made every frame: the first few are logged, then one in 1000, so a stuck
 /// runtime cannot flood the game log at 90 Hz.
@@ -187,6 +196,16 @@ struct Bridge {
     bool alt_logged = false, alt_view_warned = false;
     std::chrono::steady_clock::time_point alt_next_log{};
 
+    // True stereo (ABI 10, BB_XR_MODE=stereo; implies `alt`): the alt chains and layer, but both
+    // eyes are released together (ReleaseEyes), guarded by state_mutex.
+    bool pair = false;
+    xrstereo::LatencyTracker pair_latency; // release -> display, in display periods
+    int64_t pair_released_xr = 0;          // XrTime of the latest pair's release, until shown
+    uint64_t pairs = 0, half_pairs = 0;
+    bool pair_logged = false;
+    // XR_KHR_win32_convert_performance_counter_time (0 time when the runtime has none).
+    PFN_ConvertQpc convert_qpc = nullptr;
+
     // The HUD layer (ABI 7, xr_hud.h), guarded by state_mutex like the flat chain: the game's UI
     // drawn into its own image, shown as a quad in front of the user while it is fresh.
     xrhud::Config hud_config{};
@@ -241,6 +260,35 @@ struct Bridge {
 
 Bridge* g = nullptr;
 
+/// The XrTime now, or 0 when the runtime has no time conversion.
+int64_t NowXr() {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    XrTime time = 0;
+    if (g && g->convert_qpc && QueryPerformanceCounter(&counter) &&
+        XR_SUCCEEDED(g->convert_qpc(g->instance, &counter, &time))) {
+        return int64_t(time);
+    }
+#endif
+    return 0;
+}
+
+/// The QPC clock in ns (0 off Windows).
+int64_t QpcNs() {
+#ifdef _WIN32
+    static const int64_t freq = [] {
+        LARGE_INTEGER f;
+        return QueryPerformanceFrequency(&f) ? int64_t(f.QuadPart) : int64_t(0);
+    }();
+    LARGE_INTEGER counter;
+    if (freq > 0 && QueryPerformanceCounter(&counter)) {
+        const int64_t c = int64_t(counter.QuadPart);
+        return (c / freq) * 1000000000 + (c % freq) * 1000000000 / freq;
+    }
+#endif
+    return 0;
+}
+
 /// GetViews' snapshot, written by the frame loop once per frame. Outside Bridge so readers on
 /// game threads never race Shutdown's delete.
 struct Published {
@@ -252,9 +300,20 @@ struct Published {
     int64_t next_time = 0;
     uint32_t next_flags = 0;
     bool next_valid = false;
+    // The previous frame's api: GetViewsAt extrapolates from the two (no runtime call on the game thread).
+    BbXrViews prev_api{};
+    bool prev_valid = false;
+    // XrTime minus the QPC clock in ns, refreshed by the frame loop: GetLatency's "now" without a runtime call.
+    int64_t xr_minus_qpc_ns = 0;
+    bool xr_offset_valid = false;
     BbXrPose next_grip[2] = {}, next_aim[2] = {}; // the controllers then, in the world space
     float trigger[2] = {}, squeeze[2] = {};             // the latest analog values
     uint64_t frame = 0; // counts the frame loop's frames (AcquireStereo paces on it)
+    int64_t period_ns = 0; // the runtime's predicted display period (GetLatency)
+    // True stereo, for GetLatency without state_mutex (the frame loop holds it while it submits).
+    bool pair_valid = false;
+    double pair_periods = 0.0;
+    uint64_t pairs = 0, half_pairs = 0;
 };
 std::mutex g_views_mutex;
 std::condition_variable g_frame_cv; // with g_views_mutex: a new frame was published
@@ -386,8 +445,11 @@ int Init(BbXrLogFn log) {
     xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
     std::vector<XrExtensionProperties> available(count, {XR_TYPE_EXTENSION_PROPERTIES});
     xrEnumerateInstanceExtensionProperties(nullptr, count, &count, available.data());
-    bool has_vulkan = false, has_cylinder = false, has_depth = false;
+    bool has_vulkan = false, has_cylinder = false, has_depth = false, has_qpc = false;
     for (const auto& extension : available) {
+#ifdef _WIN32
+        has_qpc |= std::strcmp(extension.extensionName, BB_XR_CONVERT_QPC_EXTENSION) == 0;
+#endif
         has_vulkan |= std::strcmp(extension.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
         has_cylinder |= std::strcmp(extension.extensionName,
                                     XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) == 0;
@@ -422,12 +484,23 @@ int Init(BbXrLogFn log) {
         if (g->depth_layers) {
             extensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
         }
+#ifdef _WIN32
+        if (has_qpc) {
+            extensions.push_back(BB_XR_CONVERT_QPC_EXTENSION); // the XrTime now (true stereo latency)
+        }
+#endif
         create.enabledExtensionCount = uint32_t(extensions.size());
         create.enabledExtensionNames = extensions.data();
         g->instance = XR_NULL_HANDLE;
         return xrCreateInstance(&create, &g->instance);
     };
     XrResult created = create_instance();
+    if (XR_FAILED(created) && has_qpc) {
+        Log(1, "xrCreateInstance with the time conversion extension failed (%d), retrying without",
+            int(created));
+        has_qpc = false;
+        created = create_instance();
+    }
     if (XR_FAILED(created) && g->depth_layers) {
         // Listed but refused: stereo images go without depth.
         Log(1, "xrCreateInstance with the depth layer extension failed (%d), retrying without",
@@ -446,6 +519,10 @@ int Init(BbXrLogFn log) {
     if (!Check(created, "xrCreateInstance")) {
         g->instance = XR_NULL_HANDLE;
         return 0;
+    }
+    if (has_qpc) {
+        xrGetInstanceProcAddr(g->instance, "xrConvertWin32PerformanceCounterToTimeKHR",
+                              reinterpret_cast<PFN_xrVoidFunction*>(&g->convert_qpc));
     }
     XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(g->instance, &properties);
@@ -958,6 +1035,7 @@ void Unpublish() {
     std::scoped_lock lock{g_views_mutex};
     g_published.api.flags = 0;
     g_published.api.head.valid = 0;
+    g_published.prev_valid = false;
 }
 
 void DropOptionalLayer(const OptionalLayers& used) {
@@ -977,7 +1055,9 @@ void DropOptionalLayer(const OptionalLayers& used) {
     } else if (used.alt) {
         g->alt = false;
         g->mono = true;
-        Log(1, "the runtime rejects the alternate-eye projection layer: mono from now on");
+        Log(1, "the runtime rejects the %s projection layer: mono from now on",
+            g->pair ? "true stereo" : "alternate-eye");
+        g->pair = false;
     } else if (used.mono) {
         g->mono = false;
         Log(1, "the runtime rejects the mono projection layer: back to the cinema screen");
@@ -1409,11 +1489,20 @@ void FrameLoop() {
             }
             used.alt = true;
             g->alt_ages.Frame(g->alt_eyes.released);
+            if (g->pair && g->pair_released_xr > 0) {
+                // The first display of this pair: its release -> display time (ABI 10).
+                g->pair_latency.Shown(g->pair_released_xr, int64_t(time),
+                                      int64_t(state.predictedDisplayPeriod));
+                g->pair_released_xr = 0;
+                std::scoped_lock latency_lock{g_views_mutex};
+                g_published.pair_valid = g->pair_latency.Valid();
+                g_published.pair_periods = g->pair_latency.Periods();
+            }
             if (!g->alt_logged) {
                 g->alt_logged = true;
-                Log(0, "first alternate-eye frame on the headset (%ux%u and %ux%u per eye)",
-                    g->alt_chain[0].width, g->alt_chain[0].height, g->alt_chain[1].width,
-                    g->alt_chain[1].height);
+                Log(0, "first %s frame on the headset (%ux%u and %ux%u per eye)",
+                    g->pair ? "true stereo" : "alternate-eye", g->alt_chain[0].width,
+                    g->alt_chain[0].height, g->alt_chain[1].width, g->alt_chain[1].height);
             }
         } else if (g->mono && game && g->flat_views_valid) {
             // Mono (BB_XR_MODE=mono only; alt shows its menus, loading and title frames on the
@@ -1744,16 +1833,32 @@ void FrameLoop() {
                 const auto& w = g->alt_ages.window;
                 if (g->alt_next_log != Clock::time_point{} && g->alt_display_frames) {
                     const double n = w.frames ? double(w.frames) : 1.0;
-                    Log(0, "alt: %llu of %llu display frames showed the eyes; eye images L %llu R "
-                           "%llu (total); age in display frames L mean %.2f max %u, R mean %.2f "
-                           "max %u; one eye new %.0f%%, both new %.0f%%, both old %.0f%%",
-                        static_cast<unsigned long long>(g->alt_shown_frames),
-                        static_cast<unsigned long long>(g->alt_display_frames),
-                        static_cast<unsigned long long>(g->alt_eyes.released[0]),
-                        static_cast<unsigned long long>(g->alt_eyes.released[1]),
-                        g->alt_ages.MeanAge(0), w.max_age[0], g->alt_ages.MeanAge(1), w.max_age[1],
-                        100.0 * double(w.one_fresh) / n, 100.0 * double(w.both_fresh) / n,
-                        100.0 * double(w.both_stale) / n);
+                    if (g->pair) {
+                        Log(0, "stereo: %llu of %llu display frames showed the pair; pairs "
+                               "released %llu (half %llu); one eye new %.0f%%, both new %.0f%%, "
+                               "both old %.0f%%; release to display %.2f display periods (%s, "
+                               "%llu pairs measured)",
+                            static_cast<unsigned long long>(g->alt_shown_frames),
+                            static_cast<unsigned long long>(g->alt_display_frames),
+                            static_cast<unsigned long long>(g->pairs),
+                            static_cast<unsigned long long>(g->half_pairs),
+                            100.0 * double(w.one_fresh) / n, 100.0 * double(w.both_fresh) / n,
+                            100.0 * double(w.both_stale) / n, g->pair_latency.Periods(),
+                            g->pair_latency.Valid() ? "measured" : "not enough samples yet",
+                            static_cast<unsigned long long>(g->pair_latency.samples()));
+                    } else {
+                        Log(0, "alt: %llu of %llu display frames showed the eyes; eye images L "
+                               "%llu R %llu (total); age in display frames L mean %.2f max %u, R "
+                               "mean %.2f max %u; one eye new %.0f%%, both new %.0f%%, both old "
+                               "%.0f%%",
+                            static_cast<unsigned long long>(g->alt_shown_frames),
+                            static_cast<unsigned long long>(g->alt_display_frames),
+                            static_cast<unsigned long long>(g->alt_eyes.released[0]),
+                            static_cast<unsigned long long>(g->alt_eyes.released[1]),
+                            g->alt_ages.MeanAge(0), w.max_age[0], g->alt_ages.MeanAge(1),
+                            w.max_age[1], 100.0 * double(w.one_fresh) / n,
+                            100.0 * double(w.both_fresh) / n, 100.0 * double(w.both_stale) / n);
+                    }
                 }
                 g->alt_ages.ResetWindow();
                 g->alt_display_frames = g->alt_shown_frames = 0;
@@ -1765,6 +1870,18 @@ void FrameLoop() {
         {
             std::scoped_lock views_lock{g_views_mutex};
             BbXrViews& out = g_published.api;
+            if ((out.flags & BBXR_VIEW_ORIENTATION_VALID) && out.head.valid && out.display_time != int64_t(time)) {
+                g_published.prev_api = out;
+                g_published.prev_valid = true;
+            } else if (!(out.flags & BBXR_VIEW_ORIENTATION_VALID)) {
+                g_published.prev_valid = false;
+            }
+            if (const int64_t qpc = QpcNs(); qpc > 0) {
+                if (const int64_t now_xr = NowXr(); now_xr > 0) {
+                    g_published.xr_minus_qpc_ns = now_xr - qpc;
+                    g_published.xr_offset_valid = true;
+                }
+            }
             out.display_time = time;
             out.flags = views_now ? uint32_t(view_state.viewStateFlags) : 0u;
             out.head.valid = head_valid ? 1u : 0u;
@@ -1805,6 +1922,7 @@ void FrameLoop() {
                 g_published.next_aim[hand] = ahead_aim[hand];
             }
             XrInput::Analog(g_published.trigger, g_published.squeeze);
+            g_published.period_ns = int64_t(state.predictedDisplayPeriod);
             ++g_published.frame;
         }
         g_frame_cv.notify_all();
@@ -2243,11 +2361,20 @@ int StartSession(const BbXrSessionInfo* info) {
         }
     }
     const char* mode = std::getenv("BB_XR_MODE");
-    g->mono = mode && std::strcmp(mode, "mono") == 0;
-    g->alt = mode && std::strcmp(mode, "alt") == 0;
+    const xrstereo::XrMode xr_mode = xrstereo::ParseMode(mode);
+    g->mono = xr_mode == xrstereo::XrMode::Mono;
+    // True stereo shows the alt layer (the same chains), its eyes released as pairs.
+    g->pair = xr_mode == xrstereo::XrMode::Stereo;
+    g->alt = xr_mode == xrstereo::XrMode::Alt || g->pair;
     if ((g->mono || g->alt) && !g->stereo) {
         Log(1, "BB_XR_MODE=%s needs the stereo views: cinema screen instead", mode);
-        g->mono = g->alt = false;
+        g->mono = g->alt = g->pair = false;
+    } else if (g->pair) {
+        Log(0, "mode stereo (BB_XR_MODE=stereo, experimental): true stereo, both eyes of every game "
+               "frame as one pair (AcquireEye x2, ReleaseEyes), shown with poses from one head "
+               "snapshot and the union frustum; menus, title and loading screens on the flat "
+               "cinema screen (same image in both eyes)%s",
+            g->convert_qpc ? "" : "; no time conversion: release to display latency unmeasured");
     } else if (g->mono) {
         Log(0, "mode mono (BB_XR_MODE=mono, experimental): the game image is both eyes' "
                "projection layer; it swims with the head until the game camera follows it");
@@ -2274,7 +2401,7 @@ int StartSession(const BbXrSessionInfo* info) {
     g->loop = std::thread(FrameLoop);
     StartGameUi();
     Log(0, "session started (%s screen, %s mode)", g->head_locked ? "head-locked" : "world",
-        g->alt ? "alt" : g->mono ? "mono" : "cinema");
+        g->pair ? "stereo" : g->alt ? "alt" : g->mono ? "mono" : "cinema");
     return 1;
 }
 
@@ -2549,7 +2676,7 @@ int AcquireEye(uint32_t eye, uint32_t width, uint32_t height, VkFormat source, V
         return 0;
     }
     if (!g->alt) {
-        return -1; // not BB_XR_MODE=alt, or the runtime refused the layer: send flat images
+        return -1; // not alt or stereo, or the runtime refused the layer: send flat images
     }
     if (!g->visible || eye > 1 || width == 0 || height == 0) {
         return 0;
@@ -2577,19 +2704,10 @@ int AcquireEye(uint32_t eye, uint32_t width, uint32_t height, VkFormat source, V
     return 1;
 }
 
-void ReleaseEye(uint32_t eye, const BbXrEyeView* view) {
-    if (!g || eye > 1) {
-        return;
-    }
-    std::scoped_lock lock{g->state_mutex};
-    Chain& chain = g->alt_chain[eye];
-    if (!chain.writing) {
-        return;
-    }
-    EndWrite(chain);
-    if (!chain.released) {
-        return;
-    }
+/// The view an eye image was rendered with becomes the eye's layer pose and frustum (state_mutex
+/// held, the eye's image released); without a valid one the views current now. False when there
+/// is neither.
+bool StoreEyeView(uint32_t eye, const BbXrEyeView* view) {
     const bool rendered_view =
         view && view->pose.valid &&
         IsUnit({view->pose.orientation[0], view->pose.orientation[1], view->pose.orientation[2],
@@ -2609,7 +2727,7 @@ void ReleaseEye(uint32_t eye, const BbXrEyeView* view) {
         // No view: the eye's views current now (the image swims, but stays in its eye).
         std::scoped_lock views_lock{g_views_mutex};
         if (!g_published.views_valid) {
-            return;
+            return false;
         }
         g->alt_pose[eye] = g_published.views[eye].pose;
         g->alt_fov[eye] = g_published.views[eye].fov;
@@ -2619,13 +2737,146 @@ void ReleaseEye(uint32_t eye, const BbXrEyeView* view) {
                    "views current at release");
         }
     }
+    return true;
+}
+
+void LogFirstEye(uint32_t eye) {
     if (g->alt_eyes.released[0] + g->alt_eyes.released[1] == 0) {
-        Log(0, "alt: first eye image (%s, seq %llu, fov %.1f x %.1f deg)", eye ? "right" : "left",
-            static_cast<unsigned long long>(g->alt_seq[eye]),
+        Log(0, "%s: first eye image (%s, seq %llu, fov %.1f x %.1f deg)", g->pair ? "stereo" : "alt",
+            eye ? "right" : "left", static_cast<unsigned long long>(g->alt_seq[eye]),
             (g->alt_fov[eye].angleRight - g->alt_fov[eye].angleLeft) * 57.29578f,
             (g->alt_fov[eye].angleUp - g->alt_fov[eye].angleDown) * 57.29578f);
     }
+}
+
+void ReleaseEye(uint32_t eye, const BbXrEyeView* view) {
+    if (!g || eye > 1) {
+        return;
+    }
+    std::scoped_lock lock{g->state_mutex};
+    Chain& chain = g->alt_chain[eye];
+    if (!chain.writing) {
+        return;
+    }
+    EndWrite(chain);
+    if (!chain.released || !StoreEyeView(eye, view)) {
+        return;
+    }
+    LogFirstEye(eye);
     g->alt_eyes.ReleaseEye(int(eye), Steady(std::chrono::steady_clock::now()));
+}
+
+/// ABI 10: both eyes of one game frame under one state_mutex hold. The frame loop takes the same
+/// lock to build its layers, so it sees the previous pair or this one, never one new eye.
+void ReleaseEyes(const BbXrEyeView view[2]) {
+    if (!g) {
+        return;
+    }
+    std::scoped_lock lock{g->state_mutex};
+    bool shown[2] = {};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        Chain& chain = g->alt_chain[eye];
+        if (!chain.writing) {
+            continue; // its acquire failed: nothing to release
+        }
+        EndWrite(chain);
+        shown[eye] = chain.released && StoreEyeView(eye, view ? &view[eye] : nullptr);
+    }
+    if (!shown[0] && !shown[1]) {
+        return;
+    }
+    LogFirstEye(shown[0] ? 0 : 1);
+    const double now = Steady(std::chrono::steady_clock::now());
+    if (shown[0] && shown[1]) {
+        g->alt_eyes.ReleasePair(now);
+        ++g->pairs;
+        {
+            std::scoped_lock views_lock{g_views_mutex};
+            g_published.pairs = g->pairs;
+        }
+        // The XrTime of the release, for the release -> display time of the frame that shows it.
+        g->pair_released_xr = NowXr();
+    } else {
+        // One chain got a new image, the other keeps its old one with its old pose.
+        g->alt_eyes.ReleaseEye(shown[0] ? 0 : 1, now);
+        ++g->half_pairs;
+        {
+            std::scoped_lock views_lock{g_views_mutex};
+            g_published.half_pairs = g->half_pairs;
+        }
+        if (!g->pair_logged) {
+            g->pair_logged = true;
+            Log(1, "stereo: only the %s eye image was released (the other acquire failed): shown "
+                   "next to the older image of the other eye",
+                shown[0] ? "left" : "right");
+        }
+    }
+}
+
+/// ABI 10: GetViews for another display time. Serialized with Shutdown, which destroys the
+/// spaces and the session.
+std::mutex g_locate_mutex;
+
+int GetViewsAt(int64_t display_time, BbXrViews* out) {
+    if (!out) {
+        return 0;
+    }
+    // No runtime call: xrLocateViews / xrLocateSpace from the game thread blocked ~13 ms per call
+    // behind the frame loop's xrWaitFrame / xrEndFrame (headset profile run12e). The pose at
+    // `display_time` is extrapolated from the frame loop's last two located frames.
+    BbXrViews latest, prev;
+    bool have_prev;
+    {
+        std::scoped_lock lock{g_views_mutex};
+        latest = g_published.api;
+        prev = g_published.prev_api;
+        have_prev = g_published.prev_valid;
+    }
+    *out = latest;
+    const bool valid = (latest.flags & BBXR_VIEW_ORIENTATION_VALID) != 0;
+    if (!valid || display_time <= 0 || !have_prev || prev.display_time >= latest.display_time || !latest.head.valid ||
+        !prev.head.valid) {
+        return valid ? 1 : 0;
+    }
+    const auto pose_of = [](const BbXrPose& p) {
+        xrpredict::Pose r;
+        for (int i = 0; i < 3; ++i) r.p[i] = p.position[i];
+        for (int i = 0; i < 4; ++i) r.q[i] = p.orientation[i];
+        return r;
+    };
+    const auto put = [](const xrpredict::Pose& r, BbXrPose& p) {
+        for (int i = 0; i < 3; ++i) p.position[i] = r.p[i];
+        for (int i = 0; i < 4; ++i) p.orientation[i] = r.q[i];
+    };
+    const int64_t ta = prev.display_time, tb = latest.display_time;
+    put(xrpredict::Extrapolate(pose_of(prev.head), ta, pose_of(latest.head), tb, display_time), out->head);
+    for (int eye = 0; eye < 2; ++eye) {
+        put(xrpredict::Extrapolate(pose_of(prev.eye[eye].pose), ta, pose_of(latest.eye[eye].pose), tb, display_time),
+            out->eye[eye].pose);
+    }
+    out->display_time = display_time;
+    return 1;
+}
+
+int GetLatency(BbXrLatency* out) {
+    if (!out) {
+        return 0;
+    }
+    *out = {};
+    {
+        std::scoped_lock lock{g_views_mutex};
+        out->valid = g_published.pair_valid ? 1u : 0u;
+        out->release_to_display_periods = float(g_published.pair_periods);
+        out->display_period_ns = g_published.period_ns;
+        out->pairs = g_published.pairs;
+        out->half_pairs = g_published.half_pairs;
+    }
+    {
+        std::scoped_lock lock{g_views_mutex};
+        const int64_t qpc = QpcNs();
+        out->now_xr = g_published.xr_offset_valid && qpc > 0 ? qpc + g_published.xr_minus_qpc_ns : 0;
+    }
+    return int(out->valid);
 }
 
 // ---- HUD layer (ABI 7) -----------------------------------------------------------------------
@@ -2764,6 +3015,9 @@ void Shutdown() {
         DestroyChain(chain);
     }
     XrInput::Destroy();
+    // GetViewsAt/GetLatency (any host thread) use the spaces and the session: wait for them (they
+    // see running == false from here on).
+    g_locate_mutex.lock();
     for (XrSpace space : {g->space, g->local, g->view}) {
         if (space) {
             xrDestroySpace(space);
@@ -2784,6 +3038,7 @@ void Shutdown() {
     }
     delete g;
     g = nullptr;
+    g_locate_mutex.unlock();
 }
 
 int GetInput(BbXrInput* out) {
@@ -2837,6 +3092,7 @@ const BbXrApi kApi = {
     XrInput::Haptic,      GetViews,      AcquireStereo,      ReleaseStereo,
     ReleaseFlatView,      AcquireEye,    ReleaseEye,         AcquireHud,     ReleaseHud,
     HideHud,              SetGameState,  GameEvent,          TakeUiActions, GetMirrorUi,
+    ReleaseEyes,          GetViewsAt,    GetLatency,
 };
 
 } // namespace

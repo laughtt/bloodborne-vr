@@ -15,6 +15,7 @@
 #include "video_core/host_shaders/xr_dlss_mask_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -136,6 +137,26 @@ struct XrDlss::Impl {
     int jitter_logged = -1;                    ///< dlss_jitter state last logged
     std::array<Eye, 2> eyes;
 
+    // True stereo (Input::pair, findings/31 section 9.8): eye L's evaluated frame, for RunEyeR in
+    // the same PrepareFrame, and eye R's own history.
+    struct PairFrame {
+        bool valid = false;
+        u64 frame_no = 0;
+        XrDlssLogic::Camera center{}; ///< the game camera (eye cameras are moved from it)
+        std::array<float, 2> jitter{};
+        bool reset = true;
+        float frame_ms = 0.0f;
+        u32 w = 0, h = 0, ow = 0, oh = 0;
+        vk::Format sample_format{};
+        bool use_mask = false;
+        float eye_m = 0.0f; ///< eye L's offset along the camera's x axis
+    } pair_l;
+    XrDlssLogic::PairEyeR pair_r;
+    bool pair_mode = false;       ///< the last evaluated frame was eye L of a pair
+    bool pair_r_failed = false;   ///< eye R's feature failed: eye R on FSR 1 until a toggle
+    bool warned_pair_input = false;
+    u64 pair_r_fsr_frames = 0;    ///< 10 s: eye-L-evaluated pair frames whose eye R kept FSR 1
+
     bool requested = false; ///< upscale=dlss in the last frame
     bool failed = false;    ///< a feature creation/evaluation failed (until toggled off and on)
     bool warned_hud = false, warned_input = false;
@@ -168,6 +189,7 @@ struct XrDlss::Impl {
 
     void ReleaseFeatures(const char* why) {
         Dlss* dlss = Dlss::Get();
+        pair_r.Invalidate();
         if (!dlss || !(eyes[0].feature || eyes[1].feature)) {
             return;
         }
@@ -406,12 +428,267 @@ struct XrDlss::Impl {
                         static_cast<unsigned long long>(other_frames),
                         static_cast<unsigned long long>(fallback_frames), eyes[0].width,
                         eyes[0].height, XrDlssLogic::PresetLetter(s.dlss_preset));
+            if (pair_mode) {
+                std::printf("VR DLSS: 10 s: stereo pairs: eye R own feature %llu frames (history "
+                            "resets %llu), eye R on FSR 1 %llu%s\n",
+                            static_cast<unsigned long long>(eyes[1].evaluated),
+                            static_cast<unsigned long long>(eyes[1].resets),
+                            static_cast<unsigned long long>(pair_r_fsr_frames),
+                            pair_r_failed ? " (eye R feature failed)" : "");
+            }
             std::fflush(stdout);
             eyes[0].evaluated = eyes[1].evaluated = 0;
+            eyes[0].resets = eyes[1].resets = 0;
             held_frames = other_frames = fallback_frames = 0;
+            pair_r_fsr_frames = 0;
         }
         next_log = now + 10000.0;
     }
+
+    /// Device-local memory in use by this process (VK_EXT_memory_budget; NGX's allocations
+    /// included), 0 when the driver cannot tell.
+    u64 DeviceLocalUsage() const {
+        if (!instance.CanReportMemoryUsage()) {
+            return 0;
+        }
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        vk::PhysicalDeviceMemoryProperties2 props{.pNext = &budget};
+        instance.GetPhysicalDevice().getMemoryProperties2(&props);
+        u64 used = 0;
+        for (u32 i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+            if (props.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                used += budget.heapUsage[i];
+            }
+        }
+        return used;
+    }
+
+    /// One eye's DLSS evaluation: its output image and feature (created when missing or
+    /// changed), the motion vector and mask passes on its depth, the evaluate. The colour and
+    /// depth images are in eGeneral (the caller's job).
+    struct EyeJob {
+        u32 eye = 0;                     ///< eyes[eye], bridge slot Dlss::EyeSlot0 + eye
+        vk::Image color;
+        vk::Format color_format{};       ///< the UNORM view DLSS reads (DlssColorFormat)
+        bool color_sampled_only = false; ///< view usage restricted to sampling (the warp image)
+        vk::Image depth;
+        vk::Format depth_format{};
+        u32 depth_w = 0, depth_h = 0;
+        XrDlssLogic::Camera camera{}, previous{};
+        std::array<float, 2> jitter{};
+        bool reset = true;
+        float frame_ms = 0.0f;
+        u32 w = 0, h = 0, ow = 0, oh = 0;
+        vk::Format sample_format{};
+        bool use_mask = false;
+        bool profile = false; ///< its own GPU profiler segment ("VR DLSS: eye L/R")
+    };
+    enum class Outcome { Ok, CreateFailed, EvalFailed };
+
+    Outcome Evaluate(vk::CommandBuffer cmdbuf, Dlss* dlss, const XrEyeIq::Settings& s,
+                     EyeJob& job) {
+        const u32 w = job.w, h = job.h, ow = job.ow, oh = job.oh;
+        const u32 slot = Dlss::EyeSlot0 + job.eye;
+        const char letter = job.eye ? 'R' : 'L';
+        auto& eye = eyes[job.eye];
+        EnsureMotion(w, h);
+        if (job.use_mask) {
+            EnsureMaskPipeline();
+            EnsureMask(w, h);
+        }
+        EnsureOutput(eye, ow, oh, job.sample_format);
+
+        const Quality quality = XrDlssLogic::FeatureQuality(
+            s.dlss_quality_set, Quality(s.dlss_quality), w, ow);
+        const Dlss::FeatureDesc desc{w, h, ow, oh, int(quality), false, s.dlss_preset};
+        // Per eye: compared with this eye's own slot/key, not a cache shared with the other eye.
+        const XrDlssLogic::FeatureKey want{w, h, ow, oh, int(quality), s.dlss_preset, false};
+        if (!dlss->HasFeature(desc, slot)) {
+            const XrDlssLogic::CreateReason why = XrDlssLogic::CreateReasonFor(
+                eye.feature ? &eye.key : nullptr, want, eye.released_by_reset);
+            if (eye.feature) {
+                scheduler.WaitSubmitted();
+                dlss->ReleaseFeature(slot);
+                eye.feature = false;
+                std::printf("VR DLSS: eye %c feature released (%s)\n", letter,
+                            XrDlssLogic::CreateReasonName(why));
+            }
+            const u64 used_before = DeviceLocalUsage();
+            if (!dlss->CreateFeature(cmdbuf, desc, slot)) {
+                std::printf("VR DLSS: feature creation failed (eye %u)\n", job.eye);
+                std::fflush(stdout);
+                return Outcome::CreateFailed;
+            }
+            const u64 used_after = DeviceLocalUsage();
+            eye.feature = true;
+            eye.key = want;
+            eye.released_by_reset = false;
+            job.reset = true;
+            char vram[48] = "";
+            if (used_before && used_after) {
+                std::snprintf(vram, sizeof(vram), ", device memory %+.0f MB",
+                              (double(used_after) - double(used_before)) / (1024.0 * 1024.0));
+            }
+            std::printf("VR DLSS: eye %c feature created (%s): render %ux%u -> output %ux%u, %s, "
+                        "preset %c%s\n",
+                        letter, XrDlssLogic::CreateReasonName(why), w, h, ow, oh,
+                        XrDlssLogic::QualityName(quality), XrDlssLogic::PresetLetter(s.dlss_preset),
+                        vram);
+            if (recreate_guard.Note(int(job.eye), NowMs())) {
+                std::printf("VR DLSS: WARNING: eye %c feature created %u times within 2 s (last "
+                            "reason: %s): a recreate loop drops the history every time\n",
+                            letter, recreate_guard.InWindow(int(job.eye)),
+                            XrDlssLogic::CreateReasonName(why));
+            }
+            std::fflush(stdout);
+        }
+
+        // Per-frame views of the inputs (destroyed once the GPU is past them).
+        const auto device = instance.GetDevice();
+        const vk::ImageViewUsageCreateInfo sampled_only{.usage = vk::ImageUsageFlagBits::eSampled};
+        const vk::ImageView color_view = Check(device.createImageView({
+            .pNext = job.color_sampled_only ? &sampled_only : nullptr,
+            .image = job.color,
+            .viewType = vk::ImageViewType::e2D,
+            .format = job.color_format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        const vk::ImageView depth_view = Check(device.createImageView({
+            .image = job.depth,
+            .viewType = vk::ImageViewType::e2D,
+            .format = job.depth_format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
+        }));
+        scheduler.DeferOperation([device, color_view, depth_view] {
+            device.destroyImageView(color_view);
+            device.destroyImageView(depth_view);
+        });
+
+        auto* profiler = GpuProfiler::Get();
+        const bool mark = job.profile && profiler && profiler->Records(&scheduler);
+        const u64 resume = mark ? profiler->Current() : 0;
+        if (mark) {
+            profiler->Mark(0x5A1Dull << 40 | job.eye, [&] {
+                return std::string{job.eye ? "VR DLSS: eye R (motion, mask, evaluate)"
+                                           : "VR DLSS: eye L (motion, mask, evaluate)"};
+            });
+        }
+
+        const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout,
+                                 vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                                 vk::ImageLayout new_layout, vk::PipelineStageFlags2 dst_stage,
+                                 vk::AccessFlags2 dst_access) {
+            const vk::ImageMemoryBarrier2 b{
+                .srcStageMask = src_stage,
+                .srcAccessMask = src_access,
+                .dstStageMask = dst_stage,
+                .dstAccessMask = dst_access,
+                .oldLayout = old_layout,
+                .newLayout = new_layout,
+                .image = image,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+        };
+        const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+        const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+        // Previous contents are not needed (DLSS keeps its history inside the feature). The
+        // motion and mask images are shared by the eyes: each eye rewrites them after the
+        // previous evaluate read them (these barriers order that).
+        barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, all,
+                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+        barrier(vk::Image(eye.image), vk::ImageLayout::eUndefined, all,
+                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral, all, rw);
+        if (job.use_mask) {
+            barrier(vk::Image(mask_image), vk::ImageLayout::eUndefined, all,
+                    vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+        }
+
+        // Camera motion from this eye's previous frame (two game frames back with alternate
+        // eyes, one with true stereo).
+        const auto reproject = XrDlssLogic::Reproject(job.camera, job.previous);
+        // (CameraMotion::RecordMotionWith is stateless apart from its pipeline.)
+        motion_pass->RecordMotionWith(cmdbuf, depth_view, *motion_view, w, h, reproject,
+                                      job.camera.proj, job.previous.proj, job.jitter);
+        barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+
+        // Near surfaces (the arms and weapon follow the hands, the motion vectors only the
+        // camera): DLSS is told to trust the current colour there.
+        if (job.use_mask) {
+            const MaskConstants push{
+                .proj = job.camera.proj,
+                .size = {float(w), float(h)},
+                .jitter = job.jitter,
+                .threshold = s.dlss_mask_m,
+            };
+            const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
+                                                     .imageLayout = vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo mask_info{.imageView = *mask_view,
+                                                    .imageLayout = vk::ImageLayout::eGeneral};
+            const std::array<vk::WriteDescriptorSet, 2> writes = {{
+                {.dstBinding = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eSampledImage,
+                 .pImageInfo = &depth_info},
+                {.dstBinding = 1,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage,
+                 .pImageInfo = &mask_info},
+            }};
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *mask_pipeline);
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *mask_pipeline_layout,
+                                        0, writes);
+            cmdbuf.pushConstants(*mask_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                 sizeof(push), &push);
+            cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            barrier(vk::Image(mask_image), vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                    vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+        }
+
+        const bool ok = dlss->Evaluate(
+            cmdbuf,
+            {
+                .color = {job.color, color_view, job.color_format,
+                          vk::ImageAspectFlagBits::eColor, w, h},
+                .depth = {job.depth, depth_view, job.depth_format,
+                          vk::ImageAspectFlagBits::eDepth, job.depth_w, job.depth_h},
+                .motion = {vk::Image(motion_image), *motion_view, vk::Format::eR16G16Sfloat,
+                           vk::ImageAspectFlagBits::eColor, w, h},
+                .output = {vk::Image(eye.image), *eye.storage_view, vk::Format::eR8G8B8A8Unorm,
+                           vk::ImageAspectFlagBits::eColor, ow, oh},
+                .jitter_x = jitter_sign * job.jitter[0],
+                .jitter_y = jitter_sign * job.jitter[1],
+                .reset = job.reset,
+                .frame_ms = job.frame_ms,
+                .sharpness = s.dlss_sharpen, // NGX sharpening: ignored by the DLSS 4 models
+                .bias_mask = job.use_mask
+                                 ? Dlss::Resource{vk::Image(mask_image), *mask_view,
+                                                  vk::Format::eR8Unorm,
+                                                  vk::ImageAspectFlagBits::eColor, w, h}
+                                 : Dlss::Resource{},
+            },
+            slot);
+        if (mark && resume) {
+            profiler->Resume(resume);
+        }
+        if (!ok) {
+            std::printf("VR DLSS: evaluation failed (eye %u)\n", job.eye);
+            std::fflush(stdout);
+            return Outcome::EvalFailed;
+        }
+        barrier(vk::Image(eye.image), vk::ImageLayout::eGeneral, all, rw,
+                vk::ImageLayout::eShaderReadOnlyOptimal, all, vk::AccessFlagBits2::eShaderRead);
+        ++eye.evaluated;
+        eye.resets += job.reset ? 1 : 0;
+        return Outcome::Ok;
+    }
+
+    const CameraMotion* motion_pass = nullptr; ///< the frame's Input::motion
 };
 
 XrDlss::XrDlss(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
@@ -444,7 +721,11 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
     if (!impl->requested) {
         impl->requested = true;
         impl->failed = false; // switched on again: retry after a failure
+        impl->pair_r_failed = false;
+        impl->warned_pair_input = false;
     }
+    impl->pair_l.valid = false;
+    impl->motion_pass = in.motion;
 
     Dlss* dlss = Dlss::Get();
     const std::string problem = dlss ? dlss->Problem() : std::string{};
@@ -497,6 +778,14 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
                         first ? " (initial)" : "");
             std::fflush(stdout);
         }
+    }
+
+    if (in.reset_history) {
+        JitterState& jit = State();
+        std::scoped_lock lock{jit.mutex};
+        jit.tracker.Reset();
+        std::printf("VR DLSS: histories start over (the input changed: pre-SR DLSS-NR)\n");
+        std::fflush(stdout);
     }
 
     // The finished frame's jitter (its display pass came before this flip).
@@ -557,85 +846,50 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
         return result;
     }
 
+    // True stereo: eye L's own camera (the game camera moved to eye L), so its motion vectors
+    // carry the eye's lever arm under head rotation; RunEyeR moves it to eye R.
+    const XrDlssLogic::Camera center = camera;
+    if (in.pair) {
+        camera = XrDlssLogic::EyeCamera(camera, in.eye_m);
+    }
     XrDlssLogic::EyeFrame eye_frame;
     {
         std::scoped_lock lock{js.mutex};
         eye_frame = js.tracker.OnEyeFrame(in.stereo ? in.eye : 0, camera, jitter, impl->frame_no,
                                           NowMs());
     }
-    const u32 slot = Dlss::EyeSlot0 + u32(eye_frame.slot);
-    auto& eye = impl->eyes[eye_frame.slot];
-    impl->EnsureMotion(w, h);
     const bool mask_on = s.dlss_mask && s.dlss_mask_m > 0.0f;
     impl->LogMask(mask_on, s.dlss_mask_m, dlss);
     const bool use_mask = mask_on && dlss->HasBiasMask();
-    if (use_mask) {
-        impl->EnsureMaskPipeline();
-        impl->EnsureMask(w, h);
-    }
-    impl->EnsureOutput(eye, ow, oh, in.sample_format);
 
-    const Quality quality = XrDlssLogic::FeatureQuality(
-        s.dlss_quality_set, Quality(s.dlss_quality), w, ow);
-    const Dlss::FeatureDesc desc{w, h, ow, oh, int(quality), false, s.dlss_preset};
-    // Per eye: compared with this eye's own slot/key, not a cache shared with the other eye.
-    const XrDlssLogic::FeatureKey want{w, h, ow, oh, int(quality), s.dlss_preset, false};
-    if (!dlss->HasFeature(desc, slot)) {
-        const XrDlssLogic::CreateReason why = XrDlssLogic::CreateReasonFor(
-            eye.feature ? &eye.key : nullptr, want, eye.released_by_reset);
-        if (eye.feature) {
-            impl->scheduler.WaitSubmitted();
-            dlss->ReleaseFeature(slot);
-            eye.feature = false;
-            std::printf("VR DLSS: eye %c feature released (%s)\n", eye_frame.slot ? 'R' : 'L',
-                        XrDlssLogic::CreateReasonName(why));
-        }
-        if (!dlss->CreateFeature(cmdbuf, desc, slot)) {
-            impl->failed = true;
-            std::printf("VR DLSS: feature creation failed (eye %d)\n", eye_frame.slot);
-            std::fflush(stdout);
-            result.fallback_fxaa = true;
-            return result;
-        }
-        eye.feature = true;
-        eye.key = want;
-        eye.released_by_reset = false;
-        eye_frame.reset = true;
-        std::printf("VR DLSS: eye %c feature created (%s): render %ux%u -> output %ux%u, %s, "
-                    "preset %c\n",
-                    eye_frame.slot ? 'R' : 'L', XrDlssLogic::CreateReasonName(why), w, h, ow, oh,
-                    XrDlssLogic::QualityName(quality), XrDlssLogic::PresetLetter(s.dlss_preset));
-        if (impl->recreate_guard.Note(eye_frame.slot, NowMs())) {
-            std::printf("VR DLSS: WARNING: eye %c feature created %u times within 2 s (last "
-                        "reason: %s): a recreate loop drops the history every time\n",
-                        eye_frame.slot ? 'R' : 'L', impl->recreate_guard.InWindow(eye_frame.slot),
-                        XrDlssLogic::CreateReasonName(why));
-        }
-        std::fflush(stdout);
+    float frame_ms = eye_frame.frame_ms;
+    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
+        frame_ms = 27.8f; // two frames at 72 Hz
     }
-
-    // Per-frame views of the game's images (the texture cache owns them; destroyed after use).
-    const auto device = impl->instance.GetDevice();
     // The presenter reads the display buffer in the video-out format (in.sample_format), whose
     // channel order can differ from the image's own: read it the same way (swapped red/blue
     // otherwise). Same 8888 class, so the image's mutable format covers it.
-    const vk::Format color_format = vk::Format(XrDlssLogic::DlssColorFormat(u32(in.sample_format)));
-    const vk::ImageView color_view = Check(device.createImageView({
-        .image = color.GetImage(),
-        .viewType = vk::ImageViewType::e2D,
-        .format = color_format,
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-    }));
-    const vk::ImageView depth_view = Check(device.createImageView({
-        .image = depth.GetImage(),
-        .viewType = vk::ImageViewType::e2D,
-        .format = depth_format,
-        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
-    }));
-    impl->scheduler.DeferOperation([device, color_view, depth_view] {
-        device.destroyImageView(color_view);
-        device.destroyImageView(depth_view);
-    });
+    Impl::EyeJob job{
+        .eye = u32(eye_frame.slot),
+        .color = in.color_override ? in.color_override : color.GetImage(),
+        .color_format = vk::Format(XrDlssLogic::DlssColorFormat(u32(in.sample_format))),
+        .depth = depth.GetImage(),
+        .depth_format = depth_format,
+        .depth_w = depth.info.size.width,
+        .depth_h = depth.info.size.height,
+        .camera = camera,
+        .previous = eye_frame.previous,
+        .jitter = jitter,
+        .reset = eye_frame.reset,
+        .frame_ms = frame_ms,
+        .w = w,
+        .h = h,
+        .ow = ow,
+        .oh = oh,
+        .sample_format = in.sample_format,
+        .use_mask = use_mask,
+        .profile = in.pair,
+    };
 
     impl->runtime.Transit(&depth, vk::ImageLayout::eGeneral,
                           vk::PipelineStageFlagBits2::eComputeShader,
@@ -644,128 +898,126 @@ XrDlss::Result XrDlss::Run(vk::CommandBuffer cmdbuf, const Input& in) {
                           vk::PipelineStageFlagBits2::eComputeShader,
                           vk::AccessFlagBits2::eShaderRead);
     impl->runtime.FlushBarriers();
-
-    const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout,
-                             vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
-                             vk::ImageLayout new_layout, vk::PipelineStageFlags2 dst_stage,
-                             vk::AccessFlags2 dst_access) {
-        const vk::ImageMemoryBarrier2 b{
-            .srcStageMask = src_stage,
-            .srcAccessMask = src_access,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_access,
-            .oldLayout = old_layout,
-            .newLayout = new_layout,
-            .image = image,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
-    };
-    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
-    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
-    // Previous contents are not needed (DLSS keeps its history inside the feature).
-    barrier(vk::Image(impl->motion_image), vk::ImageLayout::eUndefined, all,
-            vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
-            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
-    barrier(vk::Image(eye.image), vk::ImageLayout::eUndefined, all,
-            vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral, all, rw);
-    if (use_mask) {
-        barrier(vk::Image(impl->mask_image), vk::ImageLayout::eUndefined, all,
-                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
-                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
-    }
-
-    // Camera motion from this eye's previous frame (two game frames back with alternate eyes).
-    const auto reproject = XrDlssLogic::Reproject(camera, eye_frame.previous);
-    in.motion->RecordMotionWith(cmdbuf, depth_view, *impl->motion_view, w, h, reproject,
-                                camera.proj, eye_frame.previous.proj, jitter);
-    barrier(vk::Image(impl->motion_image), vk::ImageLayout::eGeneral,
-            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
-            vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
-
-    // Near surfaces (the arms and weapon follow the hands, the motion vectors only the camera):
-    // DLSS is told to trust the current colour there.
-    if (use_mask) {
-        const MaskConstants push{
-            .proj = camera.proj,
-            .size = {float(w), float(h)},
-            .jitter = jitter,
-            .threshold = s.dlss_mask_m,
-        };
-        const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
-                                                 .imageLayout = vk::ImageLayout::eGeneral};
-        const vk::DescriptorImageInfo mask_info{.imageView = *impl->mask_view,
-                                                .imageLayout = vk::ImageLayout::eGeneral};
-        const std::array<vk::WriteDescriptorSet, 2> writes = {{
-            {.dstBinding = 0,
-             .descriptorCount = 1,
-             .descriptorType = vk::DescriptorType::eSampledImage,
-             .pImageInfo = &depth_info},
-            {.dstBinding = 1,
-             .descriptorCount = 1,
-             .descriptorType = vk::DescriptorType::eStorageImage,
-             .pImageInfo = &mask_info},
-        }};
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *impl->mask_pipeline);
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *impl->mask_pipeline_layout,
-                                    0, writes);
-        cmdbuf.pushConstants(*impl->mask_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                             sizeof(push), &push);
-        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        barrier(vk::Image(impl->mask_image), vk::ImageLayout::eGeneral,
-                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
-                vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
-    }
-
-    float frame_ms = eye_frame.frame_ms;
-    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
-        frame_ms = 27.8f; // two frames at 72 Hz
-    }
-    const bool ok = dlss->Evaluate(
-        cmdbuf,
-        {
-            .color = {color.GetImage(), color_view, color_format,
-                      vk::ImageAspectFlagBits::eColor, w, h},
-            .depth = {depth.GetImage(), depth_view, depth_format, vk::ImageAspectFlagBits::eDepth,
-                      depth.info.size.width, depth.info.size.height},
-            .motion = {vk::Image(impl->motion_image), *impl->motion_view,
-                       vk::Format::eR16G16Sfloat, vk::ImageAspectFlagBits::eColor, w, h},
-            .output = {vk::Image(eye.image), *eye.storage_view, vk::Format::eR8G8B8A8Unorm,
-                       vk::ImageAspectFlagBits::eColor, ow, oh},
-            .jitter_x = impl->jitter_sign * jitter[0],
-            .jitter_y = impl->jitter_sign * jitter[1],
-            .reset = eye_frame.reset,
-            .frame_ms = frame_ms,
-            .sharpness = s.dlss_sharpen, // NGX sharpening: ignored by the DLSS 4 models
-            .bias_mask = use_mask
-                             ? Dlss::Resource{vk::Image(impl->mask_image), *impl->mask_view,
-                                              vk::Format::eR8Unorm,
-                                              vk::ImageAspectFlagBits::eColor, w, h}
-                             : Dlss::Resource{},
-        },
-        slot);
-
+    const Impl::Outcome outcome = impl->Evaluate(cmdbuf, dlss, s, job);
     // The display buffer goes back to the layout the presenter's passes sample it in.
     impl->runtime.Transit(&color, vk::ImageLayout::eShaderReadOnlyOptimal,
                           vk::PipelineStageFlagBits2::eFragmentShader |
                               vk::PipelineStageFlagBits2::eComputeShader,
                           vk::AccessFlagBits2::eShaderRead);
     impl->runtime.FlushBarriers();
-    if (!ok) {
+    if (outcome != Impl::Outcome::Ok) {
         impl->failed = true;
-        std::printf("VR DLSS: evaluation failed (eye %d)\n", eye_frame.slot);
-        std::fflush(stdout);
         result.fallback_fxaa = true;
         return result;
     }
-    barrier(vk::Image(eye.image), vk::ImageLayout::eGeneral, all, rw,
-            vk::ImageLayout::eShaderReadOnlyOptimal, all, vk::AccessFlagBits2::eShaderRead);
-    ++eye.evaluated;
-    eye.resets += eye_frame.reset ? 1 : 0;
+    impl->pair_mode = in.pair;
+    if (in.pair) {
+        impl->pair_l = {
+            .valid = true,
+            .frame_no = impl->frame_no,
+            .center = center,
+            .jitter = jitter,
+            .reset = job.reset,
+            .frame_ms = frame_ms,
+            .w = w,
+            .h = h,
+            .ow = ow,
+            .oh = oh,
+            .sample_format = in.sample_format,
+            .use_mask = use_mask,
+            .eye_m = in.eye_m,
+        };
+        ++impl->pair_r_fsr_frames; // undone when RunEyeR evaluates eye R
+    }
+    auto& eye = impl->eyes[eye_frame.slot];
     result.view = *eye.sample_view;
     result.width = ow;
     result.height = oh;
     result.fallback_fsr1 = false;
+    return result;
+}
+
+XrDlss::Result XrDlss::RunEyeR(vk::CommandBuffer cmdbuf, const EyeRInput& in) {
+    Result result{};
+    auto& p = impl->pair_l;
+    if (!p.valid || p.frame_no != impl->frame_no) {
+        return result; // eye L was not evaluated this frame: eye R keeps FSR 1 too
+    }
+    p.valid = false;
+    Dlss* dlss = Dlss::Get();
+    if (impl->pair_r_failed || !dlss || !dlss->Available()) {
+        return result;
+    }
+    const bool depth_ok = in.depth && (in.depth_format == vk::Format::eD32Sfloat ||
+                                       in.depth_format == vk::Format::eD32SfloatS8Uint);
+    if (!in.color || in.width != p.w || in.height != p.h || !depth_ok ||
+        in.depth_width < p.w || in.depth_height < p.h) {
+        if (!impl->warned_pair_input) {
+            impl->warned_pair_input = true;
+            std::printf("VR DLSS: eye R frame skipped (FSR 1): warp image %ux%u, depth twin %s "
+                        "%ux%u, eye L render %ux%u\n",
+                        in.width, in.height, vk::to_string(in.depth_format).c_str(),
+                        in.depth_width, in.depth_height, p.w, p.h);
+            std::fflush(stdout);
+        }
+        impl->pair_r.Invalidate();
+        return result;
+    }
+    const XrDlssLogic::Camera camera = XrDlssLogic::EyeCamera(p.center, in.eye_m);
+    const XrDlssLogic::PairEyeR::Step step =
+        impl->pair_r.OnFrame(camera, p.reset, impl->frame_no);
+    const XrEyeIq::Settings s = XrEyeIq::Current();
+    Impl::EyeJob job{
+        .eye = 1,
+        .color = in.color,
+        .color_format = vk::Format(XrDlssLogic::DlssColorFormat(u32(p.sample_format))),
+        .color_sampled_only = true,
+        .depth = in.depth,
+        .depth_format = in.depth_format,
+        .depth_w = in.depth_width,
+        .depth_h = in.depth_height,
+        .camera = camera,
+        .previous = step.previous,
+        .jitter = p.jitter, // one jittered render for both eyes (findings/31 section 9.8)
+        .reset = step.reset,
+        .frame_ms = p.frame_ms,
+        .w = p.w,
+        .h = p.h,
+        .ow = p.ow,
+        .oh = p.oh,
+        .sample_format = p.sample_format,
+        .use_mask = p.use_mask,
+        .profile = true,
+    };
+    // Both inputs are in eGeneral already (the warp's output and the depth twin it read).
+    const Impl::Outcome outcome = impl->Evaluate(cmdbuf, dlss, s, job);
+    if (outcome != Impl::Outcome::Ok) {
+        // Eye L keeps DLSS; eye R goes back to FSR 1 (likely out of video memory).
+        impl->pair_r_failed = true;
+        impl->pair_r.Invalidate();
+        std::printf("VR DLSS: eye R's own DLSS feature %s: eye R stays on FSR 1 (eye L keeps "
+                    "DLSS) until DLSS is switched off and on\n",
+                    outcome == Impl::Outcome::CreateFailed ? "could not be created (video memory?)"
+                                                           : "failed to evaluate");
+        std::fflush(stdout);
+        return result;
+    }
+    if (impl->pair_r_fsr_frames) {
+        --impl->pair_r_fsr_frames;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::printf("VR DLSS: stereo pairs: eye R has its own feature and history (slot 2): "
+                    "warped colour, its depth twin, camera at %+.4f m (eye L at %+.4f m) along "
+                    "the camera's x axis, the same jitter\n",
+                    in.eye_m, p.eye_m);
+        std::fflush(stdout);
+    }
+    auto& eye = impl->eyes[1];
+    result.view = *eye.sample_view;
+    result.width = p.ow;
+    result.height = p.oh;
     return result;
 }
 

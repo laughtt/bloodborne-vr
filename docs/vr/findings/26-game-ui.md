@@ -453,3 +453,35 @@ The menus, wrist counters, toasts and held-item visuals reach the headset as a p
   - The view is the one of the last flat image (up to a frame old); wrist and hand menus can trail by that much in fast motion.
   - The image is premultiplied, ImGui blends straight: translucent edges come out slightly thinner, opaque parts are exact.
   - The 2D game HUD layer (`BB_XR_HUD`) is not part of this; it is in or over the game image as before.
+
+## HP and stamina on the wrist, the middle screen gone
+
+Player: "the hp bar and estamina should be in the wrist - we already have the stamina there just make the hp and estamina green - remove the screen we have in the middle". Status: built, unit-tested, **not seen in the headset** (nothing was launched).
+
+**What the "screen in the middle" was.** The HUD layer of findings/25: the game's whole 2D UI (Scaleform: its HP/stamina/insight bars top left, the item cross, souls, boss bar, lock-on markers, subtitles, prompts, pickup messages, menus over the scene) drawn into its own 1920x1080 image and shown as a head-locked quad 2.5 m ahead, 55 deg wide. The wrist stamina bar was never on it; it is the bridge's own 3D panel (`DrawSwingHud`, `combat_hud.cpp`).
+
+### The wrist
+- The left-wrist panel (`wrist_scale` 0.7, 8 cm above the grip, facing the eyes) now has **HP over stamina**: `HP 412 / 412` with its bar, then `SP 71 / 91` with its bar, both the same width. Shown when the host sends HP (`hp_max > 0`).
+- **Values.** `src/runtime_vr_ui.c` `vu_player()` already read them from the player's ChrData (PlayerIns +0x3B0 -> +0x20): stamina +0x134 / max +0x138, HP +0xF8 / max +0xFC, sent each pad poll in `BbXrGameState` (`hp`, `hp_max`, valid with `BBXR_GAME_STAMINA`). The bridge only had to draw `hp`.
+- **Colour.** Both bars are green (the stamina bar's colour since findings/20, linear 0.30 0.88 0.38). Stamina below 0 is still red (the floor of the bar). Each colour is configurable, later sources win:
+  1. `ui_layouts.json`, `game.hud.hp_color` / `stamina_color` (a word, `"#rrggbb"`, or `"r,g,b"`; default `"green"`);
+  2. env `BB_VR_HP_COLOR` / `BB_VR_STAMINA_COLOR`;
+  3. live, in the file `BB_XR_IQ_CONTROL` names (the image-quality control file): `hp_color=red stamina_color=green`, polled twice a second, logged as `game UI: wrist bar colours`.
+  Words: green red blue cyan yellow orange purple white. For the game's own colours: `hp_color=red`.
+- Pure code: `gpu/xr_bridge/sandbox3d/hud_bars.h` (fill fraction, colour parse, control-file keys); `combat_hud.cpp` (`HpBar`). Tests: `bbport_xr_game_ui_test` `TestWristBars`.
+
+### The middle screen
+- **Plain gameplay: hidden.** **Shown** while a game menu is open or the UI image has message content (below). `src/.../xr_hud_center.h` (pure) decides; `vk_presenter.cpp` applies it where it hands the HUD image to the bridge. Only the quad is hidden; the UI is still redirected into its image, so detection keeps working.
+- **Signals.**
+  1. *Menu*: `BBXR_GAME_MENU_OPEN` from the host (the same MenuMan mask that routes the sticks to the d-pad in menus: pause/Options, inventory, shops, talk panels). Reaches the presenter through `Xr::GameMenuState()` (set in `Xr::SetGameState`). Held 0.4 s after it clears.
+  2. *Message content*: the HUD snapshot is probed on a 128x72 grid (was 32x18; one bilinear sample per 15x15 px, so thin text is hit about one probe in five). Probes with alpha >= 40 outside the always-on zones (top-left bars x<0.36 y<0.24, bottom-left items x<0.26 y>0.70, bottom-right souls x>0.74 y>0.82) are counted; >= 14 shows the quad, held 2.5 s after the last sign. A lock-on reticle, one damage number or an enemy bar lights a handful; a subtitle line, pickup message, prompt box, YOU DIED or a boss bar lights dozens.
+  3. Full-screen UI (loading, title, big menus) still goes to the flat cinema screen, unchanged.
+- **If there is no menu state** (BB_VR_UI off, no pad polling for 1 s) the quad stays shown: nothing could show the menus otherwise.
+- **Modes**: `BB_XR_HUD_CENTER=menus|subtitles|auto|on|off`, live `hud_center=` in the `BB_XR_IQ_CONTROL` file. **`menus` is the default** (headset verdict on run19: `auto` still popped the quad in gameplay, 277/1142/52 probes, and `off` was clean): the quad only while a game menu is open. `subtitles`: menus, plus message content shown as the **message band only** (x 0.15-0.85, y 0.66-0.97 of the UI image, the rest of the HUD layer cleared transparent by `MaskHudOutsideBand`; no bridge change), so subtitles and prompts show without the game's bars. `auto`: menus plus the whole quad for message content (baseline detector below). `on`: always, the old behaviour. `off`: never, menus too. `subtitles` and `auto` are opt-in and unverified in the headset; their detector is the baseline gate of the next bullet.
+- **Trade-offs / unverified.** The zone rectangles and the 14-probe limit are estimates from the Bloodborne HUD layout, not measured. Expected failure modes: a message with very sparse glyphs stays hidden (use `hud_center=on` for that moment, or tell us the probe count from the log with `BB_XR_HUD_DEBUG=1`); markers in combat (lock-on, enemy bars, damage numbers) could pop the quad. The boss bar and "interact" prompts count as messages, so they show the whole quad (with the game's own, now redundant, HP bars) while they are up. World markers sit shifted on the quad as before (findings/25).
+
+### The fps counter
+`BB_XR_FPS=1` is drawn by `DrawFpsText` into the HUD layer image. With the centre screen hidden it still gets that layer: the image is cleared transparent (`CopyToFlat(..., blank)`) and the counter drawn on it, at its corner of the 55 deg quad (`fps_pos`, default top right), exactly where it was. No bridge change (a wrist counter would need the presenter's pace numbers in the bridge: an ABI change). With the counter off and the centre hidden the layer is hidden (HideHud) as for frames that carry their own UI.
+
+### Tests
+`xr-hud-center-test` (new: mode words, zones, detector, gate/hold), `bbport_xr_game_ui_test` (4383 checks, adds the wrist bars), `ui-composition-test`, `xr-fps-test`, `stereo-warp-test`, `vr-dash-test`, `bbport_xr_math_test`, `bbport_xr_swing_test`.

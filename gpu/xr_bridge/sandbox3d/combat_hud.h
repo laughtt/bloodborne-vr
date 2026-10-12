@@ -9,7 +9,8 @@
 //     waits; an orange flash where a cost was taken; a red blink when something was refused), the
 //     last swing's label and result ("HEAVY  HIT -35", "LIGHT  MISS  free", "NO STAMINA"), a
 //     detail line and (optionally) the live speed on a scale with the classifier's thresholds;
-//   - above the left wrist, facing you: the bar and "SP 71 / 91";
+//   - above the left wrist, facing you: the HP bar ("HP 412 / 412", hud_bars.h) over the stamina
+//     bar ("SP 71 / 91"), both green by default (colours: readout.hp_color / stamina_color);
 //   - where a swing connected: its cost, floating up.
 // Only UiCanvas (ui_render.h) and the readout: no scene, no physics, no GPU.
 
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include "math3d.h"
+#include "hud_bars.h"
 #include "swing_logic.h"
 #include "ui_render.h"
 
@@ -45,6 +47,9 @@ struct SwingReadout {
     bool enabled = true;
     // Stamina.
     float stamina = 0.0f, max = 1.0f, floor = -50.0f, pending = 0.0f;
+    // HP (the wrist's top bar; shown when hp_max > 0) and the two bars' colours.
+    float hp = 0.0f, hp_max = 0.0f;
+    UiColor hp_color = bars::kGreen, stamina_color = bars::kGreen;
     bool can_act = true, regen_paused = false;
     double regen_at = 0.0;
     double charged_at = -1e9;    // the last cost taken (the bar flashes)

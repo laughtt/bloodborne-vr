@@ -17,8 +17,13 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_xr.h"
+#include "video_core/renderer_vulkan/vk_stereo_eye_r.h"
+#include "video_core/renderer_vulkan/vk_stereo.h"
 #include "video_core/renderer_vulkan/vk_xr_eye_iq.h"
 #include "video_core/renderer_vulkan/vk_xr_dlss.h"
+#include "video_core/renderer_vulkan/xr_fps_logic.h"
+#include "video_core/renderer_vulkan/xr_hud_center.h"
+#include "video_core/renderer_vulkan/vk_xr_dlssnr.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
@@ -168,7 +173,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     xr_fxaa_pass.Create(device, instance.GetAllocator(), num_images); // bbport VR (BB_XR_AA)
+    if (XrStereo::Get().PairEnabled()) {
+        fsr_pass_r.Create(device, instance.GetAllocator(), num_images);
+        xr_fxaa_pass_r.Create(device, instance.GetAllocator(), num_images);
+    }
     xr_dlss = std::make_unique<XrDlss>(instance, draw_scheduler, runtime, texture_cache);
+    xr_dlssnr = std::make_unique<XrDlssNr>(instance, draw_scheduler);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
@@ -185,6 +195,7 @@ Presenter::~Presenter() {
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
+        DestroyEyeROut(&frame);
         if (frame.hud_image) {
             vmaDestroyImage(instance.GetAllocator(), frame.hud_image, frame.hud_allocation);
         }
@@ -196,6 +207,149 @@ Presenter::~Presenter() {
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
+}
+
+void Presenter::DestroyEyeROut(Frame* frame) {
+    if (frame->eye_r_out_view) {
+        instance.GetDevice().destroyImageView(frame->eye_r_out_view);
+        frame->eye_r_out_view = vk::ImageView{};
+    }
+    if (frame->eye_r_out) {
+        vmaDestroyImage(instance.GetAllocator(), frame->eye_r_out, frame->eye_r_out_allocation);
+        frame->eye_r_out = vk::Image{};
+    }
+}
+
+/// The frame's eye R output image, at the frame's size and the swapchain format (created and
+/// recreated lazily: the frame is free here, GetRenderFrame waited for its present).
+bool Presenter::EnsureEyeROut(Frame* frame) {
+    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    if (frame->eye_r_out && frame->eye_r_out_width == frame->width &&
+        frame->eye_r_out_height == frame->height && frame->eye_r_out_format == format) {
+        return true;
+    }
+    DestroyEyeROut(frame);
+    const vk::ImageCreateInfo image_info = {
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {frame->width, frame->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage unsafe_image{};
+    VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+    if (vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info, &unsafe_image,
+                       &frame->eye_r_out_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    frame->eye_r_out = vk::Image{unsafe_image};
+    SetObjectName(instance.GetDevice(), frame->eye_r_out, "Frame eye R image #{}", frame->id);
+    auto view = instance.GetDevice().createImageView({
+        .image = frame->eye_r_out,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (view.result != vk::Result::eSuccess) {
+        DestroyEyeROut(frame);
+        return false;
+    }
+    frame->eye_r_out_view = view.value;
+    frame->eye_r_out_width = frame->width;
+    frame->eye_r_out_height = frame->height;
+    frame->eye_r_out_format = format;
+    return true;
+}
+
+/// Eye R through eye L's image-quality chain (own FXAA / FSR instances), post pass into the
+/// frame's eye R image, left in eGeneral for the eye copy. The warp image (eGeneral, compute-
+/// written earlier on this queue) is sampled in eShaderReadOnlyOptimal and put back after.
+/// With `dlss_view` (eye R's own DLSS output, eShaderReadOnlyOptimal, `dlss_size`) the chain
+/// starts from it instead and the warp image is not touched.
+void Presenter::RecordEyeRChain(Frame* frame, const Stereo::EyeRImage& hybrid, bool fxaa,
+                                const HostPasses::FsrPass::Settings& fsr, bool dlss_on,
+                                vk::ImageView dlss_view, vk::Extent2D dlss_size) {
+    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const bool from_dlss = bool(dlss_view);
+    const std::array in_barriers{
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = hybrid.image,
+            .subresourceRange = range,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->eye_r_out,
+            .subresourceRange = range,
+        },
+    };
+    // From DLSS: only the output image's barrier (the second).
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = from_dlss ? 1u : u32(in_barriers.size()),
+                             .pImageMemoryBarriers = in_barriers.data() + (from_dlss ? 1 : 0)});
+
+    vk::ImageView view = from_dlss ? dlss_view : hybrid.view;
+    const vk::Extent2D size = from_dlss ? dlss_size : vk::Extent2D{hybrid.width, hybrid.height};
+    if (fxaa && !from_dlss) {
+        view = xr_fxaa_pass_r.Render(cmdbuf, view, size, {});
+    }
+    view = fsr_pass_r.Render(cmdbuf, view, size, {frame->width, frame->height}, fsr, frame->is_hdr);
+    Frame out = *frame; // the post pass writes image / image_view / width / height
+    out.image = frame->eye_r_out;
+    out.image_view = frame->eye_r_out_view;
+    pp_pass.Render(cmdbuf, view, size, out, pp_settings);
+
+    // Back to eGeneral for the warp's writer (its ring reuses the image three frames later).
+    if (!from_dlss) {
+        const vk::ImageMemoryBarrier2 back{
+            .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = hybrid.image,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &back});
+    }
+
+    frame->eye_r_valid = true;
+    frame->eye_r_image = frame->eye_r_out;
+    frame->eye_r_layout = vk::ImageLayout::eGeneral;
+
+    static std::atomic<u64> logged{0};
+    const u64 key = (u64(fxaa) << 40) | (u64(fsr.enable) << 41) | (u64(dlss_on) << 42) |
+                    (u64(from_dlss) << 43) | (u64(fsr.rcas_only) << 44) |
+                    (u64(frame->width) << 16) | frame->height;
+    if (logged.exchange(key) != key) {
+        std::printf("VR stereo: eye R chain:%s%s%s %ux%u -> %ux%u%s\n",
+                    from_dlss ? " dlss (own feature)" : "", fxaa && !from_dlss ? " fxaa" : "",
+                    fsr.enable ? (fsr.rcas_only ? " rcas" : " fsr1") : "", size.width,
+                    size.height, frame->width, frame->height,
+                    dlss_on && !from_dlss ? " (DLSS active on eye L: eye R's own DLSS did not run, "
+                                            "FSR 1)"
+                                          : "");
+    }
 }
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
@@ -477,6 +631,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
+    // bbport VR (BB_XR_MODE=stereo): the frame's render view, matched by its scene camera. The
+    // frame is a pair when one matched; the others are held, then shown flat (menus, loading).
+    PreparePair(frame);
+
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
@@ -506,6 +664,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // taken at the display pass that wrote it) into the frame's own HUD image.
     frame->hud_valid = false;
     frame->hud_fullscreen = false;
+    frame->hud_activity = 0;
     if (TemporalUpscaler::Hud hud{}; XrHud::Separating() && rasterizer->GetUpscaler().LatestHud(hud)) {
         CopyHud(instance, cmdbuf, frame, hud);
         if (frame_dump) {
@@ -521,6 +680,36 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
+
+    // bbport VR DLSS-NR, pre-SR placement (vk_xr_dlssnr.h, dlssnr_place=pre): the display
+    // buffer's processed copy replaces it as the input of DLSS (or FSR 1 / FXAA) and of the
+    // hybrid warp below (eye R then carries eye L's result). A change of the input's kind
+    // (pre-SR on/off, placement) starts DLSS's histories over.
+    const bool nr_sr_reset = xr_dlssnr->SrInputChanged();
+    XrDlssNr::PreResult nr_pre{};
+    if (const XrDlssNrLogic::Settings nr = XrEyeIq::Current().nr;
+        !upscaled && nr.on && nr.place == XrDlssNrLogic::Place::Pre) {
+        auto& display_image = texture_cache.GetImage(image_id);
+        runtime.Transit(&display_image, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        nr_pre = xr_dlssnr->RunPre(cmdbuf, *frame, display_image.GetImage(), view_info.format,
+                                   display_image.info.size.width,
+                                   display_image.info.size.height);
+    }
+
+    // bbport VR hybrid stereo: eye R's final image warped from this display buffer (the game's
+    // finished frame, as eye L gets it: its display pass's brightness curve and channel order,
+    // HUD-free with the HUD layer) with the frame's depth and eye R's depth twin.
+    if (upscaled) {
+        rasterizer->StereoWarpAtFlip(cpu_address, {}, display.image, display.width,
+                                     display.height, view_info.format);
+    } else {
+        const auto& display_image = texture_cache.GetImage(image_id);
+        rasterizer->StereoWarpAtFlip(cpu_address, image_id, nr_pre.image,
+                                     display_image.info.size.width,
+                                     display_image.info.size.height, view_info.format);
+    }
 
     vk::ImageView image_view{};
     vk::Extent2D image_size{};
@@ -556,6 +745,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
                     vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
                     image.info.size.height, "display", frame_dump_index);
+            std::printf("VR stereo: frame dump %d: display buffer image %s %ux%u\n",
+                        frame_dump_index, vk::to_string(image.info.pixel_format).c_str(),
+                        image.info.size.width, image.info.size.height);
         }
         image_view = *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
@@ -588,7 +780,30 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // bbport VR DLSS (vk_xr_dlss.h, BB_XR_UPSCALE=dlss): per-eye DLSS from the display buffer to
     // the eye image size. Frames it does not take (menus, held frames, no RTX/DLL) get FSR 1 to
     // the same size, and FXAA when DLSS cannot run at all (the log says why).
+    // True stereo (findings/31 section 9.8): this flip's hybrid eye R (warped above), still
+    // current (its depth twin holds this frame until the next frame's G-buffer pass): eye L's
+    // DLSS takes its eye offset, eye R gets its own DLSS evaluation right after eye L's.
+    std::optional<Stereo::EyeRImage> hybrid_r;
+    if (frame->pair_on) {
+        hybrid_r = Stereo::EyeRForDisplay(cpu_address);
+        if (hybrid_r && (!hybrid_r->image || hybrid_r->frame + 1 != Stereo::Frame())) {
+            hybrid_r.reset();
+        }
+    }
+    // Pre-SR DLSS-NR on full stereo's own eye R image (stream 1); the hybrid's eye R was warped
+    // from eye L's processed image above (XrDlssNrLogic::PreEyeR).
+    XrDlssNr::PreResult nr_pre_r{};
+    if (hybrid_r && hybrid_r->format == view_info.format &&
+        XrDlssNrLogic::PreEyeR(bool(nr_pre.image), hybrid_r->rendered)) {
+        nr_pre_r = xr_dlssnr->RunPre(cmdbuf, *frame, hybrid_r->image, view_info.format,
+                                     hybrid_r->width, hybrid_r->height, true);
+        if (nr_pre_r.image) {
+            hybrid_r->image = nr_pre_r.image;
+            hybrid_r->view = nr_pre_r.view;
+        }
+    }
     XrDlss::Result dlss{};
+    XrDlss::Result dlss_r{};
     {
         int eye = 0; // without alternate eyes: one stream
         if (frame->stereo_on) {
@@ -609,13 +824,50 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                         .flat_temporal = rasterizer->GetUpscaler().FlatJitterOn(),
                                         .out_width = frame->width,
                                         .out_height = frame->height,
+                                        .pair = frame->pair_on,
+                                        .eye_m = hybrid_r ? hybrid_r->eye_l : 0.0f,
+                                        .color_override = nr_pre.image,
+                                        .reset_history = nr_sr_reset,
                                     });
+        // Every frame eye L's DLSS ran (also held and flat-test frames: the two histories stay
+        // in step), not only the pairs whose eye R chain runs below.
+        if (dlss.view && hybrid_r && hybrid_r->format == view_info.format &&
+            hybrid_r->depth_image) {
+            dlss_r = xr_dlss->RunEyeR(cmdbuf, {
+                                                  .color = hybrid_r->image,
+                                                  .width = hybrid_r->width,
+                                                  .height = hybrid_r->height,
+                                                  .depth = hybrid_r->depth_image,
+                                                  .depth_format = hybrid_r->depth_format,
+                                                  .depth_width = hybrid_r->depth_width,
+                                                  .depth_height = hybrid_r->depth_height,
+                                                  .eye_m = hybrid_r->eye_r,
+                                              });
+        }
     }
     if (dlss.view) {
         image_view = dlss.view;
         image_size = vk::Extent2D{dlss.width, dlss.height};
-    } else if ((iq.fxaa || dlss.fallback_fxaa) && frame->has_camera_view && !frame->is_hdr) {
-        image_view = xr_fxaa_pass.Render(cmdbuf, image_view, image_size, {});
+    } else {
+        if (nr_pre.image) {
+            // Pre-SR DLSS-NR without DLSS: its result goes through FSR 1 / FXAA instead.
+            const vk::ImageMemoryBarrier2 to_read{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                                vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = nr_pre.image,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+            image_view = nr_pre.view;
+        }
+        if ((iq.fxaa || dlss.fallback_fxaa) && frame->has_camera_view && !frame->is_hdr) {
+            image_view = xr_fxaa_pass.Render(cmdbuf, image_view, image_size, {});
+        }
     }
     HostPasses::FsrPass::Settings iq_fsr = fsr_settings;
     if (iq.fsr1 || dlss.fallback_fsr1) {
@@ -640,6 +892,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    // bbport VR DLSS-NR (vk_xr_dlssnr.h, BB_XR_DLSSNR=1, off by default): neural rendering on the
+    // finished eye image, in place (frame dumps show its result).
+    xr_dlssnr->Run(cmdbuf, *frame, swapchain.GetSurfaceFormat().format);
     if (frame_dump) {
         // The presented image as the swapchain blit reads it (General after the pass).
         const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -651,6 +906,96 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 frame->width, frame->height, "output", frame_dump_index);
         ++frame_dump_index;
     }
+
+    // bbport VR (BB_XR_MODE=stereo): eye R's final image, recorded before the flush so the frame's
+    // ready tick covers it. The hybrid warp's eye R (warped from this display buffer above,
+    // sampled with eye L's view format, eGeneral) goes through eye L's image-quality chain into
+    // the frame's own eye R image; another provider (vk_stereo_eye_r.h) is taken as is.
+    // BB_STEREO_EYE_R_FLAT=1 (tests): the chain also runs for frame dumps of flat frames
+    // ("output_r"), so a flat run can compare the eyes' final images.
+    static const bool eye_r_flat = [] {
+        const char* env = std::getenv("BB_STEREO_EYE_R_FLAT");
+        return env && env[0] == '1';
+    }();
+    frame->eye_r_valid = false;
+    // (BB_XR_DLSSNR_FLAT_PAIRS=1, tests: a flat run's 3D frames count as pairs.)
+    const bool pair_eye = frame->pair_on && (frame->pair_kind == xrstereo::Kind::Eye ||
+                                             (XrDlssNr::FlatPairs() && frame->has_camera_view));
+    if (pair_eye || (eye_r_flat && frame_dump)) {
+        bool hybrid_seen = false;
+        if (auto hybrid = Stereo::EyeRForDisplay(cpu_address); hybrid && hybrid->image) {
+            hybrid_seen = true;
+            if (nr_pre_r.image && hybrid_r && hybrid->frame == hybrid_r->frame) {
+                hybrid->image = nr_pre_r.image; // pre-SR DLSS-NR's copy (full stereo)
+                hybrid->view = nr_pre_r.view;
+            }
+            if (hybrid->format == view_info.format && EnsureEyeROut(frame)) {
+                // Eye R's own DLSS output (evaluated above) goes through eye L's post-DLSS chain
+                // (the same RCAS settings); without it eye R gets FSR 1 to the frame size.
+                const bool own_dlss = dlss_r.view && hybrid->frame == hybrid_r->frame;
+                const bool dlss_on = dlss.view || dlss.fallback_fsr1 || iq.dlss;
+                const bool r_fxaa =
+                    (iq.fxaa || dlss.fallback_fxaa) && frame->has_camera_view && !frame->is_hdr;
+                HostPasses::FsrPass::Settings r_fsr = fsr_settings;
+                if (iq.fsr1 || dlss_on) {
+                    const float sharp = iq.fsr1 ? iq.sharpen : iq.dlss_sharpen;
+                    r_fsr.enable = true;
+                    r_fsr.use_rcas = sharp > 0.0f;
+                    r_fsr.rcas_attenuation = 2.0f * (1.0f - sharp);
+                }
+                if (own_dlss) {
+                    RecordEyeRChain(frame, *hybrid, false, iq_fsr, dlss_on, dlss_r.view,
+                                    {dlss_r.width, dlss_r.height});
+                } else {
+                    RecordEyeRChain(frame, *hybrid, r_fxaa, r_fsr, dlss_on);
+                }
+                frame->eye_r_valid = pair_eye; // a flat frame's eye R is for the dump only
+                if (frame_dump) {
+                    // Eye R as presented ("output_r", the frame image's twin) and the warp's
+                    // image it came from ("eyer_warp": the display buffer's size and bytes).
+                    const vk::MemoryBarrier2 done{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+                    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
+                    DumpRaw(instance, draw_scheduler, cmdbuf, frame->eye_r_out,
+                            vk::ImageLayout::eGeneral, frame->width, frame->height, "output_r",
+                            frame_dump_index - 1);
+                    DumpRaw(instance, draw_scheduler, cmdbuf, hybrid->image,
+                            vk::ImageLayout::eGeneral, hybrid->width, hybrid->height,
+                            "eyer_warp", frame_dump_index - 1);
+                    std::printf("VR stereo: frame dump %d: eye R warp %s %ux%u, frame %s, "
+                                "display view %s\n",
+                                frame_dump_index - 1, vk::to_string(hybrid->format).c_str(),
+                                hybrid->width, hybrid->height,
+                                vk::to_string(frame->eye_r_out_format).c_str(),
+                                vk::to_string(view_info.format).c_str());
+                }
+            } else {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    std::printf("VR stereo: hybrid eye R format %d unsupported or no eye R image; "
+                                "eye L is shown in both eyes\n",
+                                int(hybrid->format));
+                }
+            }
+        }
+        if (!hybrid_seen) {
+            if (const auto eye_r = StereoEyeR::Take({frame->id, frame->width, frame->height,
+                                                     swapchain.GetSurfaceFormat().format,
+                                                     frame->image, frame->pair_view.seq,
+                                                     cpu_address});
+                eye_r && eye_r->image) {
+                frame->eye_r_valid = true;
+                frame->eye_r_image = eye_r->image;
+                frame->eye_r_layout = eye_r->layout;
+            }
+        }
+    }
+
+    // bbport VR DLSS-NR on true stereo's own eye R image (only when it has one).
+    xr_dlssnr->Run(cmdbuf, *frame, swapchain.GetSurfaceFormat().format, true);
 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
@@ -673,6 +1018,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const u64 tick = recent_frame_ticks.front();
             recent_frame_ticks.pop_front();
             if (recent_frame_ticks.size() == frames_ahead) {
+                BbStats::WaitTimer gpu_wait{BbStats::pace_gpu_wait_ns};
                 draw_scheduler.Wait(tick);
             }
         }
@@ -759,6 +1105,48 @@ static void CopyHud(const Instance& instance, vk::CommandBuffer cmdbuf, Frame* f
     cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &after});
     frame->hud_valid = true;
     frame->hud_fullscreen = hud.fullscreen;
+    frame->hud_activity = hud.activity;
+}
+
+/// True stereo: pairs the frame being prepared with the render view its camera was rendered with
+/// and decides what it goes to (xrstereo::PairDecider): the pair, nothing, or the flat screen.
+void Presenter::PreparePair(Frame* frame) {
+    frame->pair_on = XrStereo::Get().PairEnabled();
+    frame->eye_r_valid = false;
+    if (!frame->pair_on) {
+        return;
+    }
+    Xr* xr = Xr::Get();
+    std::optional<Xr::RenderView> view;
+    if (xr && frame->has_camera_view) {
+        view = xr->MatchRenderView(frame->camera_view.data());
+    }
+    frame->pair_kind = XrStereo::Get().OnPairFrame(view.has_value());
+    if (!view) {
+        return;
+    }
+    xrstereo::PairView& out = frame->pair_view;
+    out = {};
+    out.seq = view->seq;
+    out.display_time = view->display_time;
+    std::memcpy(out.head_position, view->head.position, sizeof(out.head_position));
+    std::memcpy(out.head_orientation, view->head.orientation, sizeof(out.head_orientation));
+    out.fov[0] = view->fov_left;
+    out.fov[1] = view->fov_right;
+    out.fov[2] = view->fov_up;
+    out.fov[3] = view->fov_down;
+    std::memcpy(out.rows, view->rows, sizeof(out.rows));
+    out.has_eye_offset = view->has_eye_offset;
+    std::memcpy(out.eye_offset, view->eye_offset, sizeof(out.eye_offset));
+    frame->pair_camera_ns = view->set_ns;
+    // The runtime's eye distance (the bridge's eye offsets of this frame's snapshot) is the
+    // hybrid warp's IPD; without offsets (fake head) it keeps BB_STEREO_IPD / 0.063.
+    if (view->has_eye_offset) {
+        const float dx = view->eye_offset[1][0] - view->eye_offset[0][0];
+        const float dy = view->eye_offset[1][1] - view->eye_offset[0][1];
+        const float dz = view->eye_offset[1][2] - view->eye_offset[0][2];
+        Stereo::SetIpd(std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
 }
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
@@ -771,6 +1159,11 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     if (frame->stereo_on) {
         frame->stereo = XrStereo::Get().OnFrame(nullptr, nullptr, 0, nullptr,
                                                 BbStats::draws.load(std::memory_order_relaxed));
+    }
+    frame->pair_on = XrStereo::Get().PairEnabled();
+    frame->eye_r_valid = false;
+    if (frame->pair_on) {
+        frame->pair_kind = XrStereo::Get().OnPairFrame(false);
     }
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
@@ -883,6 +1276,26 @@ void ForgetFlatViews(vk::Device device) {
     flat_views.clear();
 }
 
+/// A colour view of a headset swapchain image, cached per image (see ForgetFlatViews).
+vk::ImageView FlatViewFor(vk::Device device, vk::Extent2D extent, const Xr::FlatTarget& flat) {
+    auto& entry = flat_views[VkImage(flat.image)];
+    if (!entry.view || entry.extent != extent || entry.format != flat.format) {
+        // The images of a chain are idle here (see ForgetFlatViews); a changed entry is stale.
+        if (entry.view) {
+            retired_flat_views.push_back(entry.view);
+        }
+        entry.view = Check<"create xr flat view">(device.createImageView(vk::ImageViewCreateInfo{
+            .image = flat.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = flat.format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        entry.extent = extent;
+        entry.format = flat.format;
+    }
+    return entry.view;
+}
+
 /// Sets alpha to 1 over the headset screen image (eColorAttachmentOptimal): an alpha-only write.
 void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D extent,
                     const Xr::FlatTarget& flat) {
@@ -947,22 +1360,7 @@ void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D ex
         pipeline = created;
         pipeline_format = flat.format;
     }
-    auto& entry = flat_views[VkImage(flat.image)];
-    if (!entry.view || entry.extent != extent || entry.format != flat.format) {
-        // The images of a chain are idle here (see ForgetFlatViews); a changed entry is stale.
-        if (entry.view) {
-            retired_flat_views.push_back(entry.view);
-        }
-        entry.view = Check<"create xr flat view">(device.createImageView(vk::ImageViewCreateInfo{
-            .image = flat.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = flat.format,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        }));
-        entry.extent = extent;
-        entry.format = flat.format;
-    }
-    const vk::ImageView view = entry.view;
+    const vk::ImageView view = FlatViewFor(device, extent, flat);
     const vk::RenderingAttachmentInfo attachment{
         .imageView = view,
         .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -984,12 +1382,285 @@ void MakeFlatOpaque(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D ex
     cmdbuf.endRendering();
 }
 
+// ---- the VR fps counter (BB_XR_FPS) and the "Pace:" log line (xr_fps_logic.h) ----------------
+// Single threaded: all of it runs in Presenter::Present (the swap thread, or the present thread
+// without BB_PRESENT_THREAD).
+
+struct PaceSnap {
+    std::chrono::steady_clock::time_point time{};
+    u64 flips = 0, guest = 0, gpu = 0, frame = 0, queue = 0, present = 0, xr = 0;
+};
+
+PaceSnap TakePaceSnap() {
+    constexpr auto relaxed = std::memory_order_relaxed;
+    PaceSnap s;
+    s.time = std::chrono::steady_clock::now();
+    s.flips = BbStats::pace_flips.load(relaxed);
+    s.guest = BbStats::pace_guest_wait_ns.load(relaxed);
+    s.gpu = BbStats::pace_gpu_wait_ns.load(relaxed);
+    s.frame = BbStats::pace_frame_wait_ns.load(relaxed);
+    s.queue = BbStats::pace_queue_ns.load(relaxed);
+    s.present = BbStats::pace_present_ns.load(relaxed);
+    s.xr = BbStats::pace_xr_ns.load(relaxed);
+    return s;
+}
+
+XrFpsLogic::Window PaceWindow(const PaceSnap& a, const PaceSnap& b) {
+    XrFpsLogic::Window w;
+    w.seconds = std::chrono::duration<double>(b.time - a.time).count();
+    w.flips = b.flips - a.flips;
+    w.guest_wait_ns = b.guest - a.guest;
+    w.gpu_wait_ns = b.gpu - a.gpu;
+    w.frame_wait_ns = b.frame - a.frame;
+    w.queue_ns = b.queue - a.queue;
+    w.present_ns = b.present - a.present;
+    w.xr_ns = b.xr - a.xr;
+    return w;
+}
+
+struct PaceState {
+    XrFpsLogic::RateMeter meter;
+    PaceSnap detail_start, log_start;
+    bool started = false;
+    double hz = 0.0;
+    double log_gpu_sum = 0.0;
+    int log_gpu_n = 0;
+    XrFpsLogic::Verdict verdict = XrFpsLogic::Verdict::Cpu;
+    XrFpsLogic::Color color = XrFpsLogic::Color::Unknown;
+    char rate[24] = "";
+    char detail[32] = "";
+};
+PaceState pace;
+
+/// The "Cmd:" line (BbStats::PerfSlot): per delivered frame, where the GPU command thread (A),
+/// the draw recording thread (B) and the Vulkan recorder spent their time since the last line.
+void PrintCmdLine(u64 flips, double seconds) {
+    using namespace BbStats;
+    static std::uint64_t last[PerfThreads][PerfSlots]{};
+    static std::uint64_t last_tsc = 0;
+    static auto last_time = std::chrono::steady_clock::now();
+    std::uint64_t now[PerfThreads][PerfSlots];
+    for (u32 t = 0; t < PerfThreads; ++t) {
+        for (u32 s = 0; s < PerfSlots; ++s) {
+            now[t][s] = perf_cycles[t][s].load(std::memory_order_relaxed);
+        }
+    }
+    const std::uint64_t tsc = __builtin_ia32_rdtsc();
+    const auto time = std::chrono::steady_clock::now();
+    const double ns = std::chrono::duration<double, std::nano>(time - last_time).count();
+    const bool first = last_tsc == 0;
+    const double cycles_per_ms = first || ns <= 0.0 ? 0.0 : double(tsc - last_tsc) / ns * 1e6;
+    const auto ms = [&](u32 t, u32 s) {
+        return cycles_per_ms > 0.0 && flips ? double(now[t][s] - last[t][s]) / cycles_per_ms / flips
+                                            : 0.0;
+    };
+    if (!first && flips) {
+        const auto stereo = [&](u32 t) {
+            return ms(t, PerfStereoDraw) + ms(t, PerfStereoEmit) + ms(t, PerfStereoDispatch) +
+                   ms(t, PerfStereoProbe);
+        };
+        std::printf("Cmd: ms/frame: thread A waits: draw pipe %.2f, recorder sync %.2f, GPU tick "
+                    "%.2f, host copies %.2f; A submit %.2f, A stereo hooks %.2f | stage B busy "
+                    "%.2f (recorder sync %.2f, submit %.2f, stereo hooks %.2f: begin draw %.2f, "
+                    "emit %.2f (substitutes %.2f), dispatch %.2f, eye-R record %.2f) | recorder "
+                    "busy %.2f (stereo arenas eye L %.2f, eye R %.2f) | probe %.2f\n",
+                    ms(PerfThreadA, PerfDrainWait), ms(PerfThreadA, PerfSyncRecording),
+                    ms(PerfThreadA, PerfTickWait), ms(PerfThreadA, PerfHostCopyWait),
+                    ms(PerfThreadA, PerfSubmit), stereo(PerfThreadA), ms(PerfThreadB, PerfBusy),
+                    ms(PerfThreadB, PerfSyncRecording), ms(PerfThreadB, PerfSubmit),
+                    stereo(PerfThreadB), ms(PerfThreadB, PerfStereoDraw),
+                    ms(PerfThreadB, PerfStereoEmit), ms(PerfThreadB, PerfStereoSubs),
+                    ms(PerfThreadB, PerfStereoDispatch), ms(PerfThreadB, PerfStereoEyeR),
+                    ms(PerfThreadRecorder, PerfBusy), ms(PerfThreadRecorder, PerfArenaEyeL),
+                    ms(PerfThreadRecorder, PerfArenaEyeR),
+                    ms(PerfThreadA, PerfStereoProbe) + ms(PerfThreadB, PerfStereoProbe));
+    }
+    (void)seconds;
+    std::memcpy(last, now, sizeof(last));
+    last_tsc = tsc;
+    last_time = time;
+}
+
+/// After every delivered game frame: the smoothed rate twice a second, the verdict every 2 s,
+/// the log line every 10 s.
+void PaceTick() {
+    using namespace XrFpsLogic;
+    static const auto epoch = std::chrono::steady_clock::now();
+    static const bool log_on = [] {
+        const char* env = std::getenv("BB_PACE_LOG");
+        return !(env && env[0] == '0');
+    }();
+    const PaceSnap now = TakePaceSnap();
+    const double t = std::chrono::duration<double>(now.time - epoch).count();
+    if (!pace.started) {
+        pace.started = true;
+        pace.detail_start = pace.log_start = now;
+        pace.meter.Push(t, now.flips);
+        return;
+    }
+    if (pace.meter.Push(t, now.flips)) {
+        Xr* xr = Xr::Get();
+        pace.hz = xr ? xr->DisplayHz() : 0.0;
+        pace.color = Classify(pace.meter.Value(), pace.hz);
+        FormatRate(pace.rate, sizeof(pace.rate), pace.meter.Value(), pace.hz);
+        FormatDetail(pace.detail, sizeof(pace.detail),
+                     pace.meter.Value() > 0.5 ? 1000.0 / pace.meter.Value() : 0.0, pace.verdict);
+    }
+    if (now.time - pace.detail_start.time >= std::chrono::seconds(2)) {
+        Window w = PaceWindow(pace.detail_start, now);
+        double gpu_ms = 0.0;
+        if (GpuProfiler::TakeFrameMs(gpu_ms)) {
+            w.gpu_ms_per_frame = gpu_ms;
+            pace.log_gpu_sum += gpu_ms;
+            ++pace.log_gpu_n;
+        }
+        pace.verdict = Analyze(w, pace.hz).verdict;
+        pace.detail_start = now;
+    }
+    if (now.time - pace.log_start.time >= std::chrono::seconds(10)) {
+        Window w = PaceWindow(pace.log_start, now);
+        if (pace.log_gpu_n) {
+            w.gpu_ms_per_frame = pace.log_gpu_sum / pace.log_gpu_n;
+        }
+        const PerFrame p = Analyze(w, pace.hz);
+        if (log_on && w.flips) {
+            char display[24], gpu[48];
+            if (pace.hz > 0.0) {
+                std::snprintf(display, sizeof(display), "%.0f Hz", pace.hz);
+            } else {
+                std::snprintf(display, sizeof(display), "display rate unknown");
+            }
+            if (p.gpu_ms >= 0.0) {
+                std::snprintf(gpu, sizeof(gpu), "GPU %.1f ms (BB_GPU_PROFILE)", p.gpu_ms);
+            } else {
+                std::snprintf(gpu, sizeof(gpu), "GPU ms n/a (BB_GPU_PROFILE=1)");
+            }
+            std::printf("Pace: 10 s: %llu frames, %.1f fps (%s): %.1f ms/frame = guest wait %.1f "
+                        "+ command thread work %.1f + GPU wait %.1f + free-frame wait %.1f; %s; "
+                        "flip slot wait %.1f, presenter %.1f (xr/swapchain %.1f) => %s\n",
+                        static_cast<unsigned long long>(w.flips), p.fps, display, p.frame_ms,
+                        p.guest_wait_ms, p.work_ms, p.gpu_wait_ms, p.frame_wait_ms, gpu,
+                        p.queue_ms, p.present_ms, p.xr_ms, VerdictName(p.verdict));
+            PrintCmdLine(w.flips, w.seconds);
+            std::fflush(stdout);
+        }
+        pace.log_start = now;
+        pace.log_gpu_sum = 0.0;
+        pace.log_gpu_n = 0;
+    }
+}
+
+/// BB_XR_FPS: the counter's text over the HUD image (eColorAttachmentOptimal): a dark panel and
+/// two lines of bitmap text, every lit pixel a rectangle of vkCmdClearAttachments (no pipeline,
+/// no staging). The HUD layer only: the eye images never get it.
+void DrawFpsText(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D extent,
+                 const Xr::FlatTarget& flat, int corner) {
+    using namespace XrFpsLogic;
+    if (!pace.meter.Valid() || extent.width < 160 || extent.height < 90) {
+        return;
+    }
+    constexpr size_t kMaxRects = 192;
+    const int scale1 = std::max(2, int(extent.width) / 600);
+    const int scale2 = std::max(1, scale1 * 2 / 3);
+    const int pad = scale1 * 2, gap = scale1;
+    const int w1 = TextWidth(pace.rate, scale1), w2 = TextWidth(pace.detail, scale2);
+    const int h1 = kGlyphH * scale1, h2 = kGlyphH * scale2;
+    const int panel_w = std::max(w1, w2) + 2 * pad, panel_h = h1 + gap + h2 + 2 * pad;
+    const int margin_x = int(extent.width) / 12, margin_y = int(extent.height) / 12;
+    if (panel_w + 2 * margin_x > int(extent.width) || panel_h + 2 * margin_y > int(extent.height)) {
+        return;
+    }
+    const int px = (corner & 1) ? int(extent.width) - margin_x - panel_w : margin_x;
+    const int py = (corner & 2) ? int(extent.height) - margin_y - panel_h : margin_y;
+    std::array<Rect, kMaxRects> rect1, rect2;
+    const size_t n1 = TextRects(pace.rate, scale1, px + pad, py + pad, rect1.data(), rect1.size());
+    const size_t n2 =
+        TextRects(pace.detail, scale2, px + pad, py + pad + h1 + gap, rect2.data(), rect2.size());
+
+    const bool srgb = flat.format == vk::Format::eR8G8B8A8Srgb ||
+                      flat.format == vk::Format::eB8G8R8A8Srgb;
+    const auto channel = [&](float c) { return srgb ? std::pow(c, 2.2f) : c; };
+    const auto clear = [&](float r, float g, float b, float a, const Rect* rects, size_t count) {
+        std::array<vk::ClearRect, kMaxRects> out;
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = vk::ClearRect{
+                vk::Rect2D{{rects[i].x, rects[i].y}, {u32(rects[i].w), u32(rects[i].h)}}, 0, 1};
+        }
+        const vk::ClearAttachment attachment{
+            vk::ImageAspectFlagBits::eColor, 0,
+            vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{r, g, b, a}}}};
+        cmdbuf.clearAttachments(attachment,
+                                vk::ArrayProxy<const vk::ClearRect>{u32(count), out.data()});
+    };
+
+    const vk::ImageView view = FlatViewFor(device, extent, flat);
+    const vk::RenderingAttachmentInfo attachment{
+        .imageView = view,
+        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .loadOp = vk::AttachmentLoadOp::eLoad,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+    };
+    cmdbuf.beginRendering(vk::RenderingInfo{
+        .renderArea = vk::Rect2D{{0, 0}, extent},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &attachment,
+    });
+    // Premultiplied alpha: black stays black at any alpha, so the panel is right for the
+    // straight and premultiplied blend modes of the layer.
+    const Rect panel{px, py, panel_w, panel_h};
+    clear(0.0f, 0.0f, 0.0f, 0.6f, &panel, 1);
+    const Rgb c = ColorRgb(pace.color);
+    clear(channel(c.r), channel(c.g), channel(c.b), 1.0f, rect1.data(), n1);
+    clear(channel(0.85f), channel(0.85f), channel(0.85f), 1.0f, rect2.data(), n2);
+    cmdbuf.endRendering();
+}
+
+/// hud_center=subtitles: the HUD layer keeps only the message band (XrHudCenter::kMessageBand);
+/// everything outside it is cleared to transparent (four clear rectangles, like DrawFpsText).
+void MaskHudOutsideBand(vk::Device device, vk::CommandBuffer cmdbuf, vk::Extent2D extent,
+                        const Xr::FlatTarget& flat) {
+    const XrHudCenter::Zone z = XrHudCenter::kMessageBand;
+    const s32 x0 = s32(z.x0 * float(extent.width)), x1 = s32(z.x1 * float(extent.width));
+    const s32 y0 = s32(z.y0 * float(extent.height)), y1 = s32(z.y1 * float(extent.height));
+    const s32 w = s32(extent.width), h = s32(extent.height);
+    const std::array<vk::Rect2D, 4> rects{
+        vk::Rect2D{{0, 0}, {u32(w), u32(y0)}},
+        vk::Rect2D{{0, y1}, {u32(w), u32(h - y1)}},
+        vk::Rect2D{{0, y0}, {u32(x0), u32(y1 - y0)}},
+        vk::Rect2D{{x1, y0}, {u32(w - x1), u32(y1 - y0)}},
+    };
+    const vk::ImageView view = FlatViewFor(device, extent, flat);
+    const vk::RenderingAttachmentInfo attachment{
+        .imageView = view,
+        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .loadOp = vk::AttachmentLoadOp::eLoad,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+    };
+    cmdbuf.beginRendering(vk::RenderingInfo{
+        .renderArea = vk::Rect2D{{0, 0}, extent},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &attachment,
+    });
+    const vk::ClearAttachment clear{
+        vk::ImageAspectFlagBits::eColor, 0,
+        vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}}}};
+    for (const vk::Rect2D& r : rects) {
+        if (r.extent.width && r.extent.height) {
+            const vk::ClearRect rect{r, 0, 1};
+            cmdbuf.clearAttachments(clear, vk::ArrayProxy<const vk::ClearRect>{1, &rect});
+        }
+    }
+    cmdbuf.endRendering();
+}
+
 /// An image of the window's format (the window image in ePresentSrcKHR, or a frame image in
 /// eGeneral for an eye, BB_XR_MODE=alt) into a headset swapchain image; both end where they began.
 void CopyToFlat(vk::Device device, vk::CommandBuffer cmdbuf, vk::Image swapchain_image,
                 vk::Format swapchain_format, vk::Extent2D extent, const Xr::FlatTarget& flat,
                 vk::ImageLayout source_layout = vk::ImageLayout::ePresentSrcKHR,
-                bool opaque = true) {
+                bool opaque = true, bool blank = false) {
     const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
     const auto barrier = [&](vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
                              vk::AccessFlags src, vk::AccessFlags dst) {
@@ -1015,7 +1686,12 @@ void CopyToFlat(vk::Device device, vk::CommandBuffer cmdbuf, vk::Image swapchain
     const vk::ImageSubresourceLayers layers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
     // BB_XR_TEST_FILL=1: solid magenta instead of the game, to tell the layer from its contents.
     static const bool test_fill = std::getenv("BB_XR_TEST_FILL") && *std::getenv("BB_XR_TEST_FILL") == '1';
-    if (test_fill) {
+    if (blank) {
+        // The HUD layer with nothing on it (the centre screen is hidden): transparent, so the
+        // fps counter can still be drawn on it.
+        const vk::ClearColorValue clear{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+        cmdbuf.clearColorImage(flat.image, vk::ImageLayout::eTransferDstOptimal, clear, range);
+    } else if (test_fill) {
         const vk::ClearColorValue magenta{std::array<float, 4>{1.0f, 0.0f, 1.0f, 1.0f}};
         cmdbuf.clearColorImage(flat.image, vk::ImageLayout::eTransferDstOptimal, magenta, range);
     } else if (SameChannelOrder(swapchain_format, flat.format)) {
@@ -1077,6 +1753,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    // Pacing (xr_fps_logic.h): the presenter's time per delivered game frame, and its part in
+    // the swapchain and XR bridge calls.
+    std::atomic<u64> pace_sink{0};
+    BbStats::WaitTimer pace_present{(!is_reusing_frame && is_game_frame) ? BbStats::pace_present_ns
+                                                                       : pace_sink};
+    const auto pace_acquire_start = std::chrono::steady_clock::now();
+    const auto pace_add_xr = [&](std::chrono::steady_clock::time_point from) {
+        if (!is_reusing_frame && is_game_frame) {
+            BbStats::pace_xr_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - from).count(),
+                std::memory_order_relaxed);
+        }
+    };
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
@@ -1087,6 +1777,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    pace_add_xr(pace_acquire_start);
+
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
@@ -1096,7 +1788,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // bbport: the game frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
-    std::optional<Xr::FlatTarget> xr_flat, xr_eye, xr_hud;
+    std::optional<Xr::FlatTarget> xr_flat, xr_eye, xr_eye_r, xr_hud;
     bool hide_hud = false;
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1269,11 +1961,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         // transparent black). ImGui draws once per frame, so the window then needs that image
         // blended back in (or no menu on the desktop while in VR).
         if (Xr* xr = Xr::Get()) {
+            const auto pace_xr_start = std::chrono::steady_clock::now();
             // bbport VR (BB_XR_MODE=alt, vk_xr_stereo.h): a frame set up for an eye goes to that
             // eye's swapchain, the game image itself (no window letterbox, no menu overlay); a
             // held frame goes nowhere (both eyes keep their last image); the others (menus,
             // loading screens) take the mono path below.
             const bool alt = frame->stereo_on && xr->HasEyes();
+            // True stereo (BB_XR_MODE=stereo): a matched frame goes to both eyes as one pair.
+            const bool pair = frame->pair_on && xr->HasPair();
             // bbport VR HUD layer: a separated UI that covers the screen (in-game loading
             // screens, full-screen menus) goes to the flat cinema screen like the menus without
             // a scene, instead of being stretched over the eye frustum.
@@ -1305,7 +2000,33 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                    vk::ImageLayout::eGeneral);
                     }
                 }
-            } else if (!alt || frame->stereo.kind == xrstereo::Kind::Mono) {
+            } else if (pair && frame->pair_kind == xrstereo::Kind::Eye) {
+                if (!is_reusing_frame) {
+                    const vk::Format eye_format = swapchain.GetSurfaceFormat().format;
+                    const vk::Extent2D eye_extent{frame->width, frame->height};
+                    XrChainResize(0, frame->width, frame->height);
+                    XrChainResize(1, frame->width, frame->height);
+                    xr_eye = xr->AcquireEye(0, frame->width, frame->height, eye_format);
+                    xr_eye_r = xr->AcquireEye(1, frame->width, frame->height, eye_format);
+                    if (xr_eye) {
+                        xr_chain_sizes[0].Acquired({frame->width, frame->height});
+                        CopyToFlat(instance.GetDevice(), cmdbuf, frame->image, eye_format,
+                                   eye_extent, *xr_eye, vk::ImageLayout::eGeneral);
+                    }
+                    if (xr_eye_r) {
+                        xr_chain_sizes[1].Acquired({frame->width, frame->height});
+                        // Eye R from the stereo renderer when it made one this frame, else eye
+                        // L's image again.
+                        CopyToFlat(instance.GetDevice(), cmdbuf,
+                                   frame->eye_r_valid ? frame->eye_r_image : frame->image,
+                                   eye_format, eye_extent, *xr_eye_r,
+                                   frame->eye_r_valid ? frame->eye_r_layout
+                                                      : vk::ImageLayout::eGeneral);
+                        XrStereo::Get().NoteEyeR(frame->eye_r_valid);
+                    }
+                }
+            } else if ((!alt && !pair) || (alt && frame->stereo.kind == xrstereo::Kind::Mono) ||
+                       (pair && frame->pair_kind == xrstereo::Kind::Mono)) {
                 XrChainResize(2, extent.width, extent.height);
                 xr_flat = xr->AcquireFlat(extent.width, extent.height,
                                           swapchain.GetSurfaceFormat().format);
@@ -1318,7 +2039,42 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             // The HUD quad: this frame's UI (premultiplied alpha kept), or hidden when the frame
             // carries its UI itself or went to the cinema screen.
             if (!is_reusing_frame && XrHud::Separating()) {
+                // The centre screen (xr_hud_center.h): hidden in plain gameplay, HP and stamina are
+                // on the wrist. Without the game's menu flag (BB_VR_UI off) it stays shown.
+                const XrEyeIq::Settings hud_iq = XrEyeIq::Current();
+                bool center = true, band = false;
+                static double last_cover_s = -1e9; // when the UI last covered the screen
+                const double now_s = std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count();
+                if (hud_cinema) {
+                    last_cover_s = now_s;
+                }
                 if (hud && !hud_cinema) {
+                    static XrHudCenter::Gate gate;
+                    static bool logged = false, last_shown = true;
+                    static XrHudCenter::Reason last_reason = XrHudCenter::Reason::Forced;
+                    const Xr::MenuState menu = Xr::GameMenuState();
+                    XrHudCenter::Mode mode = hud_iq.hud_center;
+                    if (!menu.known && mode != XrHudCenter::Mode::Off) {
+                        mode = XrHudCenter::Mode::On;
+                    }
+                    // Right after a loading screen / full-screen menu the UI image is not a baseline.
+                    const bool ignore = now_s - last_cover_s < XrHudCenter::kIgnoreAfterCoverS;
+                    center = gate.Update(now_s, mode, menu.open, frame->hud_activity, ignore);
+                    band = center && gate.band_only;
+                    if (!logged || center != last_shown || gate.reason != last_reason) {
+                        logged = true;
+                        last_shown = center;
+                        last_reason = gate.reason;
+                        std::printf("VR HUD: centre screen %s (%s; hud_center=%s%s, %u message probes)\n",
+                                    center ? "shown" : "hidden", XrHudCenter::ReasonName(gate.reason),
+                                    XrHudCenter::ModeName(hud_iq.hud_center),
+                                    menu.known ? "" : ", no game menu state: kept shown",
+                                    frame->hud_activity);
+                    }
+                }
+                if (hud && !hud_cinema && (center || hud_iq.fps)) {
                     XrChainResize(3, frame->hud_width, frame->hud_height);
                     xr_hud = xr->AcquireHud(frame->hud_width, frame->hud_height,
                                             frame->hud_format);
@@ -1326,12 +2082,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                         xr_chain_sizes[3].Acquired({frame->hud_width, frame->hud_height});
                         CopyToFlat(instance.GetDevice(), cmdbuf, frame->hud_image,
                                    frame->hud_format, {frame->hud_width, frame->hud_height},
-                                   *xr_hud, vk::ImageLayout::eGeneral, false);
+                                   *xr_hud, vk::ImageLayout::eGeneral, false, !center);
+                        if (band) {
+                            MaskHudOutsideBand(instance.GetDevice(), cmdbuf,
+                                               {frame->hud_width, frame->hud_height}, *xr_hud);
+                        }
+                        // BB_XR_FPS: the counter, in the HUD layer only (never in an eye image).
+                        if (const auto iq = hud_iq; iq.fps) {
+                            DrawFpsText(instance.GetDevice(), cmdbuf,
+                                        {frame->hud_width, frame->hud_height}, *xr_hud,
+                                        iq.fps_corner);
+                        }
                     }
                 } else {
                     hide_hud = true;
                 }
             }
+            pace_add_xr(pace_xr_start);
         }
     }
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -1345,6 +2112,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    const auto pace_release_start = std::chrono::steady_clock::now();
     scheduler.Flush(info);
     if (xr_flat) {
         const bool hud_cinema = frame->hud_valid && frame->hud_fullscreen;
@@ -1358,7 +2126,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     } else if (hide_hud) {
         Xr::Get()->HideHud();
     }
-    if (xr_eye) {
+    if (frame->pair_on && (xr_eye || xr_eye_r)) {
+        // Both eyes under one bridge lock: the headset never shows one new image with an old one.
+        Xr::Get()->ReleaseEyes(frame->pair_view, frame->pair_camera_ns);
+        xr_eye.reset();
+        xr_eye_r.reset();
+    } else if (xr_eye) {
         Xr::Get()->ReleaseEye(frame->stereo.eye, frame->stereo.view);
         xr_eye.reset();
     }
@@ -1370,14 +2143,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
+    pace_add_xr(pace_release_start);
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        BbStats::pace_flips.fetch_add(1, std::memory_order_relaxed);
+        PaceTick();
     }
 }
 
 Frame* Presenter::GetRenderFrame() {
+    BbStats::WaitTimer frame_wait{BbStats::pace_frame_wait_ns};
     // Wait for free presentation frames
     Frame* frame;
     {

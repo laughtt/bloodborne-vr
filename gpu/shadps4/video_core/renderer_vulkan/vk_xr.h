@@ -52,6 +52,14 @@ public:
     /// After the commands writing the acquired eye image were submitted: with the view (pose,
     /// frustum) the frame was rendered with.
     void ReleaseEye(int eye, const xrstereo::EyeView& view);
+    /// True stereo (BB_XR_MODE=stereo, bridge ABI 10, docs/vr/findings/31): both eyes of a frame
+    /// as one pair. HasPair: the bridge has ReleaseEyes (the eye chains are AcquireEye 0 and 1).
+    [[nodiscard]] bool HasPair() const;
+    /// After the commands writing both acquired eye images were submitted (an eye whose acquire
+    /// failed is simply not released): the pair with the view it was rendered with. The layer
+    /// poses are the view's (head pose plus each eye's offset, one snapshot) and the one union
+    /// frustum. camera_set_ns: RenderView::set_ns of the frame (the camera -> release time).
+    void ReleaseEyes(const xrstereo::PairView& view, s64 camera_set_ns);
     /// The HUD layer (bridge ABI 7, docs/vr/findings/25): the bridge takes the game's UI image
     /// (premultiplied alpha) and shows it as a quad in front of the user.
     [[nodiscard]] bool HasHud() const;
@@ -87,6 +95,14 @@ public:
     void SetGameState(const void* state, u32 size);
     void GameEvent(u32 kind, s32 a, s32 b, s32 c);
     u32 TakeUiActions(void* out, u32 capacity);
+    /// The game's menu flag from the latest SetGameState (BBXR_GAME_MENU_OPEN), any thread:
+    /// `known` is false when no state came in the last second (BB_VR_UI off, or the pad thread is
+    /// not polling), then the HUD quad cannot be gated on it. Used by the HUD centre gate
+    /// (xr_hud_center.h).
+    struct MenuState {
+        bool known = false, open = false;
+    };
+    static MenuState GameMenuState();
     /// The VR UI for the desktop window (bridge ABI 9, BB_XR_MIRROR_UI): the latest finished
     /// image (premultiplied alpha, SHADER_READ_ONLY_OPTIMAL) or nothing. Present thread.
     struct MirrorUi {
@@ -127,8 +143,31 @@ public:
         Pose head;
         float fov_left, fov_right, fov_up, fov_down; // radians; left and down are negative
         float rows[3][3];
+        // True stereo: the eyes' offsets from the head (head frame), from the same snapshot.
+        bool has_eye_offset;
+        float eye_offset[2][3];
+        s64 set_ns; // steady clock when SetRenderView stored it (camera -> release time)
     };
     void SetRenderView(const RenderView& view);
+    /// True stereo: the render view whose camera rows match the presented frame's scene camera
+    /// (world to view, 3x4 rows), or nothing (menus, loading, no camera seen). Any thread.
+    std::optional<RenderView> MatchRenderView(const float* camera_view);
+    /// The views for another display time (bridge ABI 10), or LatestViews() when the bridge
+    /// cannot. Any thread.
+    std::optional<Views> ViewsAt(s64 display_time_ns);
+    /// True stereo: when the image of a camera set up now will be displayed (the host's smoothed
+    /// camera -> release time plus the bridge's measured release -> display time). Nothing before
+    /// both are measured or when the runtime cannot convert time. Any thread.
+    struct DisplayAhead {
+        s64 display_time_ns, ahead_ns, period_ns;
+        float release_to_display_periods, camera_to_release_ms;
+        u64 pairs, half_pairs;
+    };
+    std::optional<DisplayAhead> LatestDisplayAhead();
+    /// The headset's display rate (1e9 / the runtime's predicted display period), 0 while unknown
+    /// or with a bridge older than ABI 10. Any thread; takes the bridge's locate lock, so call it
+    /// a few times a second at most (the fps counter does).
+    double DisplayHz();
 
 private:
     Xr();

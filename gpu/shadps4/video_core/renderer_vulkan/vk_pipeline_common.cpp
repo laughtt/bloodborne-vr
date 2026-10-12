@@ -11,6 +11,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stereo.h"
+#include "video_core/renderer_vulkan/vk_stereo_substitute.h"
 
 namespace Vulkan {
 
@@ -70,6 +72,23 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
+        if (scheduler.IsCapturing()) [[unlikely]] {
+            // bbport (VR Phase 4 stereo, P4.4 slice 3): a command executed once per eye; eye R's
+            // execution pushes the writes with this draw's or dispatch's twins substituted.
+            if (const auto subs = Stereo::TakeSubstitutes(); !subs.empty()) {
+                const auto table = scheduler.RecordData(subs);
+                scheduler.Record([bind_point, layout, writes, table](vk::CommandBuffer cmdbuf) {
+                    if (!RecordArena::ExecutingEyeR()) {
+                        cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+                        return;
+                    }
+                    Stereo::SubstitutedWrites eye_r;
+                    eye_r.Build(writes, table);
+                    cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, eye_r.Writes());
+                });
+                return;
+            }
+        }
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });
@@ -82,6 +101,23 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
+    if (scheduler.IsCapturing()) [[unlikely]] {
+        // bbport (P4.4 slice 3, without push descriptors): eye R binds a second set.
+        if (const auto subs = Stereo::TakeSubstitutes(); !subs.empty()) {
+            const auto desc_set_r = desc_heap.Commit(*desc_layout);
+            Stereo::SubstitutedWrites eye_r;
+            eye_r.Build(set_writes, subs);
+            for (auto& set_write : eye_r.Writes()) {
+                set_write.dstSet = desc_set_r;
+            }
+            instance.GetDevice().updateDescriptorSets(eye_r.Writes(), {});
+            scheduler.Record([bind_point, layout, desc_set, desc_set_r](vk::CommandBuffer cmdbuf) {
+                cmdbuf.bindDescriptorSets(bind_point, layout, 0,
+                                          RecordArena::ExecutingEyeR() ? desc_set_r : desc_set, {});
+            });
+            return;
+        }
+    }
     scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });

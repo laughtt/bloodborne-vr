@@ -60,7 +60,7 @@ UsePreviousTasks=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-FinishedLabel=Setup has installed [name] on your computer.%n%nWindows SmartScreen may warn about "BloodborneVR.exe" the first time (the alpha is not code-signed): click "More info", then "Run anyway".%n%nStart "Bloodborne VR" from the Start menu, choose your game folder and press START VR.
+FinishedLabel=Setup has installed [name] on your computer.%n%nWindows SmartScreen may warn about "BloodborneVR.exe" the first time (the alpha is not code-signed): click "More info", then "Run anyway".%n%nStart "Bloodborne VR" from the Start menu, choose your game folder and press PLAY.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

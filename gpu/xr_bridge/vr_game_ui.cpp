@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 #include "sandbox3d/json.h"
@@ -1127,9 +1128,50 @@ void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::str
     readout.stamina = stamina ? float(s.stamina) : 0.0f;
     readout.max = stamina ? float(std::max(s.stamina_max, 1)) : 1.0f;
     readout.can_act = !stamina || s.stamina > 0;
+    readout.hp = stamina ? float(s.hp) : 0.0f;
+    readout.hp_max = stamina && s.hp_max > 0 ? float(s.hp_max) : 0.0f;
+    RefreshBarColors(log);
+    readout.hp_color = bar_colors.hp;
+    readout.stamina_color = bar_colors.stamina;
     const bool recent = now - last_activity < kActivityS ||
                         readout.result == Result::Pending;
     readout.enabled = layout.game.hud && stamina && (layout.game.bar != "action" || recent);
+}
+
+/// The wrist bars' colours, twice a second: the layout's "hud" strings, then BB_VR_HP_COLOR /
+/// BB_VR_STAMINA_COLOR, then hp_color= / stamina_color= in the file BB_XR_IQ_CONTROL names (the
+/// control file the image-quality keys use; a later source wins). A change is logged.
+void GameUi::RefreshBarColors(std::string& log) {
+    if (now - bar_colors_at < 0.5) {
+        return;
+    }
+    bar_colors_at = now;
+    const sb::UiGameLayout& g = menus.Layout().game;
+    sb::bars::Colors c;
+    sb::bars::ParseBarColor(g.hp_color, c.hp);
+    sb::bars::ParseBarColor(g.stamina_color, c.stamina);
+    if (const char* e = std::getenv("BB_VR_HP_COLOR"); e && *e) {
+        sb::bars::ParseBarColor(e, c.hp);
+    }
+    if (const char* e = std::getenv("BB_VR_STAMINA_COLOR"); e && *e) {
+        sb::bars::ParseBarColor(e, c.stamina);
+    }
+    if (const char* path = std::getenv("BB_XR_IQ_CONTROL"); path && *path) {
+        std::ifstream file(path);
+        if (file) {
+            const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            sb::bars::ApplyControlText(text, c);
+        }
+    }
+    if (!(c == bar_colors)) {
+        bar_colors = c;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "game UI: wrist bar colours: HP (%.2f %.2f %.2f), stamina (%.2f %.2f %.2f) linear "
+                      "(hp_color= / stamina_color=)\n",
+                      c.hp.r, c.hp.g, c.hp.b, c.stamina.r, c.stamina.g, c.stamina.b);
+        log += buf;
+    }
 }
 
 void GameUi::DrawGunRay(const sb::UiGameLayout& g) {

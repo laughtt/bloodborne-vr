@@ -179,8 +179,7 @@ void Bar(UiCanvas& cv, const UiPanel& p, float cx, float cy, float w, float h,
     seg(lo, 0.0f, h, {0.28f, 0.05f, 0.05f, 0.92f});
     seg(0.0f, hi, h, {0.09f, 0.09f, 0.10f, 0.92f});
     if (r.stamina >= 0.0f) {
-        seg(0.0f, r.stamina, h,
-            r.regen_paused ? UiColor{0.46f, 0.62f, 0.46f, 1.0f} : UiColor{0.30f, 0.88f, 0.38f, 1.0f});
+        seg(0.0f, r.stamina, h, r.regen_paused ? bars::Paused(r.stamina_color) : r.stamina_color);
     } else {
         seg(r.stamina, 0.0f, h, {0.95f, 0.22f, 0.16f, 1.0f});
     }
@@ -192,6 +191,18 @@ void Bar(UiCanvas& cv, const UiPanel& p, float cx, float cy, float w, float h,
         seg(r.charged_to, r.charged_from, h, {1.0f, 0.55f, 0.1f, float(1.0 - since / 0.5)});
     }
     cv.Box(p, u(0.0f), cy, std::max(0.006f * w, 0.0006f), 1.7f * h, {1.0f, 1.0f, 1.0f, 0.9f});
+}
+
+/// The HP bar: 0 to max, centered at (cx, cy), the same frame and size as the stamina bar.
+void HpBar(UiCanvas& cv, const UiPanel& p, float cx, float cy, float w, float h,
+           const SwingReadout& r) {
+    const float edge = 0.12f * h;
+    cv.Box(p, cx, cy, w + 2.0f * edge, h + 2.0f * edge, {0.0f, 0.0f, 0.0f, 0.75f}, edge);
+    cv.Box(p, cx, cy, w, h, {0.09f, 0.09f, 0.10f, 0.92f});
+    const float f = bars::BarFraction(r.hp, r.hp_max);
+    if (f > 0.0f) {
+        cv.Box(p, cx - 0.5f * w + 0.5f * w * f, cy, w * f, h, r.hp_color);
+    }
 }
 
 /// The live probe speed on a scale with the classifier's thresholds.
@@ -296,6 +307,11 @@ void DrawSwingHud(UiCanvas& cv, const SwingReadout& r, const SwingHudConfig& c,
         cv.Text(p, 0.0f, 0.012f * s, 0.016f * s, Fmt("SP %.0f / %.0f", r.stamina, r.max),
                 r.can_act ? kWhite : kTired, UiAlign::Center);
         Bar(cv, p, 0.0f, 0.0f, 0.14f * s, 0.013f * s, r);
+        if (r.hp_max > 0.0f) { // HP over the stamina bar, the same width
+            cv.Text(p, 0.0f, 0.056f * s, 0.016f * s, Fmt("HP %.0f / %.0f", r.hp, r.hp_max), kWhite,
+                    UiAlign::Center);
+            HpBar(cv, p, 0.0f, 0.044f * s, 0.14f * s, 0.013f * s, r);
+        }
         if (label_alpha > 0.0f) {
             cv.alpha = label_alpha;
             LabelLine(cv, p, 0.0f, -0.026f * s, 0.013f * s, text);

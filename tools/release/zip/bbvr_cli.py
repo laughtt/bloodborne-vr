@@ -5,9 +5,13 @@ settings (user/bbvr_settings.json, out/fp.txt, stereo.txt, iq.txt, ui_layouts) a
 built for the game. Every command prints one JSON document on stdout. Standard library only.
 
     bbvr_cli.py state                       settings, options, hardware, game folder, crash consent
-    bbvr_cli.py save                        stdin: {"profile"?, "values"?, "show_menu"?}  -> state
+    bbvr_cli.py save                        stdin: {"mode"? vr|coop|flat, "coop_view"? vr|flat, "quality"? Low|Medium|High|Super High,
+                                            "set"? {option: value} (kept as the player's overrides), "reset"? [option],
+                                            "profile"?, "values"? (older), "show_menu"?}  -> state (with "ready", "pages", "quality_table")
     bbvr_cli.py game-dir PATH               remember the game folder (must contain eboot.bin) -> state
     bbvr_cli.py alpha-ack                   remember that the early-alpha notice was read (for this version)
+    bbvr_cli.py nr-dll [PATH]               copy YOUR OWN nvngx_dlssnr.dll next to the game exe (no PATH: a file dialog) -> state with "nr_dll"
+    bbvr_cli.py nr-help                     open the DLSS-NR help page (local copy, else the public repo's) -> state with "nr_help"
     bbvr_cli.py accept                      remember that the legal note was accepted -> state
     bbvr_cli.py update-check                ask GitHub for a newer release (quiet when unavailable) -> state
     bbvr_cli.py update-opt on|off           switch the start-up update check on / off -> state
@@ -56,7 +60,7 @@ def dlss_files(port):
 
 
 def make_menu(caps=None):
-    caps = caps or S.detect_all(L.PORT)
+    caps = caps or S.detect_all(L.PORT, data=L.DATA)  # data: where logs/ is (Display size = Auto reads the last session)
     config = L.load_config()
     game = config.get('game_dir') or ''
     paths = S.make_paths(L.PORT, Path(game) if game else L.PORT, L.DATA)
@@ -66,6 +70,7 @@ def make_menu(caps=None):
 def full_state(menu, config):
     st = menu.state()
     game = config.get('game_dir') or ''
+    info = S.game_info(game)
     st['app'] = {
         'version': version(), 'port': str(L.PORT), 'game_dir': game,
         'eboot': bool(game) and (Path(game) / 'eboot.bin').is_file(),
@@ -74,7 +79,10 @@ def full_state(menu, config):
         'dlss_files': dlss_files(L.PORT), 'public': S.is_public(),
         'online_play': S.ONLINE_PLAY, 'play_mode': play_mode(config), 'online_step': config.get('online_step', 'host'),
         'lobby': lobby_info(config), 'data_dir': str(L.DATA), 'installed': (L.PORT / S.INSTALLED_FLAG).is_file(),
+        'game': info, 'log_dir': str(L.LOGS),
     }
+    built = (L.OUT / 'vr_assets' / 'ui' / 'icons.json').is_file() and config.get('assets_for') == game
+    st['ready'] = S.ready_check(st['app'], st['caps'], st.get('view', 'vr'), info, built)
     defaults = S.release_defaults(L.PORT)
     st['update'] = bbvr_update.summary(config.get('update_check', True), version(), defaults, L.DATA)
     crash = st.get('crash') or {}
@@ -266,6 +274,17 @@ def run(argv, stdin_text=''):
     elif cmd == 'accept':
         config['accepted'] = True
         L.save_config(config)
+    elif cmd == 'nr-dll':
+        path = ' '.join(argv[1:]).strip().strip('"') or S.pick_file('Select your nvngx_dlssnr.dll', 'DLSS-NR model (nvngx_dlssnr.dll)|nvngx_dlssnr.dll')
+        result = S.install_nr_dll(path, L.PORT)
+        menu.caps = S.detect_all(L.PORT)  # the file is there now: Super High is available
+        st = full_state(menu, config)
+        st['nr_dll'] = result
+        return st
+    elif cmd == 'nr-help':
+        st = full_state(menu, config)
+        st['nr_help'] = S.open_nr_doc(L.PORT, L.DATA)
+        return st
     elif cmd == 'alpha-ack':  # OK on the early-alpha notice: not shown again until the version changes
         config['alpha_notice_seen'] = version()
         L.save_config(config)

@@ -31,6 +31,10 @@ struct Liverpool;
 
 namespace Vulkan {
 
+namespace Stereo {
+struct EyeRImage;
+}
+
 struct Frame {
     u32 width;
     u32 height;
@@ -50,6 +54,24 @@ struct Frame {
     // the flip was prepared; Present hands it to that eye (Hold: to no eye; Mono: the flat path).
     bool stereo_on{false};
     xrstereo::Decision stereo{};
+    // bbport VR true stereo (BB_XR_MODE=stereo, vk_xr_stereo.h): what this frame goes to (Eye: the
+    // pair of both eyes with pair_view; Hold: nothing; Mono: the flat screen), decided when the
+    // flip was prepared. eye_r: the stereo renderer's final eye R image (vk_stereo_eye_r.h), else
+    // eye L's image goes to both eyes.
+    bool pair_on{false};
+    xrstereo::Kind pair_kind{xrstereo::Kind::Hold};
+    xrstereo::PairView pair_view{};
+    s64 pair_camera_ns{};
+    bool eye_r_valid{false};
+    vk::Image eye_r_image{};
+    vk::ImageLayout eye_r_layout{};
+    // bbport VR (hybrid stereo): the frame's own eye R output, the hybrid warp's eye R run through
+    // the same image-quality chain as eye L; width x height, swapchain format, eGeneral after.
+    vk::Image eye_r_out{};
+    vk::ImageView eye_r_out_view{};
+    VmaAllocation eye_r_out_allocation{};
+    u32 eye_r_out_width{}, eye_r_out_height{};
+    vk::Format eye_r_out_format{};
     // bbport VR HUD layer (vk_xr.h XrHud): the frame's UI, drawn apart from its image (eGeneral),
     // copied when the flip was prepared; Present hands it to the bridge's HUD quad, or, when it
     // covers the screen (in-game loading screens, full-screen menus), to the flat cinema screen.
@@ -59,6 +81,7 @@ struct Frame {
     u32 hud_width{}, hud_height{};
     bool hud_valid{false};
     bool hud_fullscreen{false};
+    u32 hud_activity{0}; ///< lit probes outside the always-on HUD zones (xr_hud_center.h)
 };
 
 enum SchedulerType {
@@ -69,6 +92,7 @@ enum SchedulerType {
 
 class Rasterizer;
 class XrDlss;
+class XrDlssNr;
 
 class Presenter {
 public:
@@ -120,6 +144,9 @@ public:
 
     Frame* PrepareBlankFrame(bool present_thread);
 
+    /// BB_XR_MODE=stereo: the frame's render view and what it goes to (Frame::pair_*).
+    void PreparePair(Frame* frame);
+
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
@@ -127,6 +154,11 @@ private:
     Frame* GetRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
+    bool EnsureEyeROut(Frame* frame);
+    void RecordEyeRChain(Frame* frame, const Stereo::EyeRImage& hybrid, bool fxaa,
+                         const HostPasses::FsrPass::Settings& fsr, bool dlss_on,
+                         vk::ImageView dlss_view = {}, vk::Extent2D dlss_size = {});
+    void DestroyEyeROut(Frame* frame);
 
     XrResize::Size FitGameSize(s32 width, s32 height) const;
 
@@ -155,6 +187,10 @@ private:
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
+    /// bbport VR (hybrid stereo): eye R's own chain instances (each pass keeps one intermediate
+    /// ring, so eye L's instances cannot be run twice per frame).
+    HostPasses::FsrPass fsr_pass_r;
+    HostPasses::XrFxaaPass xr_fxaa_pass_r;
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     std::deque<u64> recent_frame_ticks; ///< bbport: BB_FRAMES_AHEAD bound (PrepareFrame)
@@ -165,6 +201,7 @@ private:
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;
     std::unique_ptr<XrDlss> xr_dlss; ///< bbport VR: BB_XR_UPSCALE=dlss (vk_xr_dlss.h)
+    std::unique_ptr<XrDlssNr> xr_dlssnr; ///< bbport VR: BB_XR_DLSSNR=1 (vk_xr_dlssnr.h)
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;

@@ -1,0 +1,356 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport VR hybrid stereo (docs/vr/findings/31-true-stereo.md, "Hybrid stereo warp"): eye R's
+// final image from eye L's (the display buffer at the flip: the game's finished frame, HUD-free
+// with the HUD layer) and eye R's own depth (the G-buffer drawn a second time into twins).
+// Sub-pixel: eye L is sampled linearly between two columns, each depth-tested. Disoccluded
+// pixels get eye R's albedo times the lighting of the background beside them (GuidedFill).
+// The algorithm is renderer_vulkan/vk_stereo_warp.h (WarpPixel, GuidedFill, WarpColor,
+// unit-tested on the CPU); keep both the same.
+// Two dispatches: the warp (8x8 tiles; a hole pixel gets the mirrored fill and, with the albedo
+// bound, is appended to `holes`), then with FLAG_GUIDED_PASS one thread per listed hole pixel
+// (GuidedFill: 80 neighbours each, run by full warps of hole pixels instead of inside the
+// tiles that contain a few).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D color_l; // eye L (the display buffer), UNORM view: its bytes
+layout(binding = 1) uniform texture2D depth_l; // eye L's depth (the guest image), depth aspect
+layout(binding = 2) uniform texture2D depth_r; // eye R's depth twin, depth aspect
+layout(binding = 3, rgba8) uniform image2D out_r;
+layout(binding = 4) uniform texture2D albedo_r; // eye R's albedo twin, sRGB view: linear R G B
+layout(binding = 5) uniform texture2D normal_r; // eye R's normal twin, UNORM: rgb * 2 - 1
+// Hole pixels for the guided pass: (x | y << 16, side + 1 | k << 8, view z bits, 0).
+layout(binding = 6, std430) buffer HoleList {
+    uint hole_count;    // zeroed before the warp
+    uint hole_capacity; // entries
+    uint hole_pad0, hole_pad1;
+    uvec4 holes[];
+};
+
+layout(push_constant) uniform Constants {
+    vec2 size;        // color / output pixels
+    vec2 depth_size;  // depth pixels
+    float shift;      // P00 * (eye R - eye L) * width / 2: x_L = x_R + shift / z (pixels)
+    float zs;         // depth = zs + zo / z
+    float zo;
+    float tolerance_rel; // same surface: |z_L - z_R| <= rel * z_R + abs
+    float tolerance_abs;
+    int search;       // disocclusion fill: pixels searched each way along the row
+    float tolerance_px; // or same surface: disparities within this many pixels (far, sky)
+    int flags;        // FLAG_*: the guided fill's inputs
+};
+
+// vk_stereo_warp.h: Flag*, Guided*, DisplayCurve.
+const int FLAG_ALBEDO = 1;
+const int FLAG_NORMAL = 2;
+const int FLAG_SWAP_RB = 4;
+const int FLAG_SRGB = 8;
+const int FLAG_GUIDED_PASS = 16;
+const float DISPLAY_CURVE = 0.85;
+// GuidedTuning's defaults.
+const int GUIDED_REACH = 48;
+const int GUIDED_STEP = 3;
+const int GUIDED_ROWS = 2;
+const int GUIDED_ROW_STEP = 4;
+const float GUIDED_DEPTH_REL = 0.08;
+const float GUIDED_MIN_NORMAL = 0.7;
+const float GUIDED_MIN_WEIGHT = 2.0;
+const float GUIDED_FAR_Z = 1000.0;
+const float GUIDED_RIDGE = 0.05;
+const float GUIDED_MAX_LIGHT = 16.0;
+const float GUIDED_MAX_SHAPE = 4.0;
+
+float ViewZ(float depth) {
+    const float denom = depth - zs;
+    const float z = abs(denom) < 1e-12 ? 1e30 : zo / denom;
+    return z > 0.0 ? z : 1e30;
+}
+
+ivec2 DepthPixel(int x, int y) {
+    return clamp(ivec2((vec2(x, y) + 0.5) * depth_size / size), ivec2(0),
+                 ivec2(depth_size) - 1);
+}
+
+int SourceColumn(int x, float z) {
+    return int(floor(float(x) + 0.5 + shift / z));
+}
+
+// Eye L's column xl shows the surface at view z (in the image, same surface)?
+bool TapValid(int xl, int y, float z) {
+    if (xl < 0 || xl >= int(size.x)) {
+        return false;
+    }
+    const float z_l = ViewZ(texelFetch(depth_l, DepthPixel(xl, y), 0).r);
+    return abs(z_l - z) <= tolerance_rel * z + tolerance_abs ||
+           abs(shift) * abs(1.0 / z_l - 1.0 / z) <= tolerance_px;
+}
+
+// Eye R's pixel from eye L where eye L sees the same surface: source u = x + shift / z,
+// linear between its two columns, each tap depth-tested. False for a disocclusion.
+bool DirectSample(int x, int y, out float z_r, out float u, out ivec3 cols, out vec3 w,
+                  out int n) {
+    z_r = ViewZ(texelFetch(depth_r, DepthPixel(x, y), 0).r);
+    cols = ivec3(x, 0, 0);
+    w = vec3(1.0, 0.0, 0.0);
+    n = 1;
+    u = float(x);
+    if (shift == 0.0) {
+        return true; // eyes together (same=1): eye L's own pixel, bit for bit
+    }
+    u = float(x) + shift / z_r;
+    const float base = floor(u);
+    const float f = u - base;
+    const int x0 = int(base);
+    const bool v0 = TapValid(x0, y, z_r);
+    const bool v1 = f > 0.0 && TapValid(x0 + 1, y, z_r);
+    if (v0 && v1) {
+        cols = ivec3(x0, x0 + 1, 0);
+        w = vec3(1.0 - f, f, 0.0);
+        n = 2;
+    } else if (v0 || v1) {
+        cols.x = v0 ? x0 : x0 + 1;
+        n = 1;
+    } else {
+        n = 0;
+    }
+    return n > 0;
+}
+
+vec3 DisplayToLinear(vec3 v, bool srgb) {
+    const vec3 e = pow(clamp(v, 0.0, 1.0), vec3(1.0 / DISPLAY_CURVE));
+    if (!srgb) {
+        return e;
+    }
+    return mix(pow((e + 0.055) / 1.055, vec3(2.4)), e / 12.92, lessThanEqual(e, vec3(0.04045)));
+}
+
+vec3 LinearToDisplay(vec3 l, bool srgb) {
+    l = clamp(l, 0.0, 1.0);
+    const vec3 e = !srgb ? l
+                         : mix(1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, l * 12.92,
+                               lessThanEqual(l, vec3(0.0031308)));
+    return pow(e, vec3(DISPLAY_CURVE));
+}
+
+vec3 NormalAt(ivec2 d) {
+    return texelFetch(normal_r, d, 0).rgb * 2.0 - 1.0;
+}
+
+// Solves the symmetric 4x4 system m x = v (Gaussian elimination, as Solve4).
+bool Solve4(mat4 m, vec4 v, out vec4 x) {
+    x = vec4(0.0);
+    for (int i = 0; i < 4; ++i) {
+        if (!(abs(m[i][i]) > 1e-12)) {
+            return false;
+        }
+        for (int j = i + 1; j < 4; ++j) {
+            const float f = m[j][i] / m[i][i];
+            for (int k = i; k < 4; ++k) {
+                m[j][k] -= f * m[i][k];
+            }
+            v[j] -= f * v[i];
+        }
+    }
+    for (int i = 3; i >= 0; --i) {
+        float s = v[i];
+        for (int k = i + 1; k < 4; ++k) {
+            s -= m[i][k] * x[k];
+        }
+        x[i] = s / m[i][i];
+    }
+    return true;
+}
+
+// A disoccluded pixel at view z `z` whose fill found the background `side`, `k0` px along the
+// row: eye R's albedo times the lighting of direct pixels past the hole on that side (5 rows),
+// near its depth and facing its way, in linear light: the per-channel least-squares ratio
+// sum(w A C) / sum(w A^2) times the luminance lighting's shape in the normal (Y = l0 + l . n,
+// ridge on the normal terms, over its plain ratio). False: keep the mirrored fill.
+bool GuidedFill(int x, int y, float z, int side, int k0, out vec3 result) {
+    result = vec3(0.0);
+    if ((flags & FLAG_ALBEDO) == 0 || side == 0 || z >= GUIDED_FAR_Z) {
+        return false;
+    }
+    const bool srgb = (flags & FLAG_SRGB) != 0;
+    const bool swap = (flags & FLAG_SWAP_RB) != 0;
+    const bool normals = (flags & FLAG_NORMAL) != 0;
+    const ivec2 d = DepthPixel(x, y);
+    vec3 a_p = texelFetch(albedo_r, d, 0).rgb; // the albedo in the display's channel order
+    a_p = swap ? a_p.bgr : a_p;
+    const vec3 n_p = normals ? NormalAt(d) : vec3(0.0);
+    vec3 rn = vec3(0.0), rd = vec3(0.0);
+    mat4 m = mat4(0.0);
+    vec4 v = vec4(0.0);
+    float sum_w = 0.0;
+    const float sigma = 0.25 * GUIDED_DEPTH_REL;
+    for (int ry = -GUIDED_ROWS; ry <= GUIDED_ROWS; ++ry) {
+        const int qy = y + ry * GUIDED_ROW_STEP;
+        if (qy < 0 || qy >= int(size.y)) {
+            continue;
+        }
+        for (int k = k0; k < k0 + GUIDED_REACH; k += GUIDED_STEP) {
+            const int qx = x + side * k;
+            if (qx < 0 || qx >= int(size.x)) {
+                break;
+            }
+            // Cheapest tests first: eye R's depth, its normal, then eye L's two taps.
+            const ivec2 qd = DepthPixel(qx, qy);
+            const float z_q = ViewZ(texelFetch(depth_r, qd, 0).r);
+            const float rel = abs(z_q - z) / z;
+            if (rel > GUIDED_DEPTH_REL) {
+                continue; // another surface
+            }
+            const vec3 n_q = normals ? NormalAt(qd) : vec3(0.0);
+            if (normals && dot(n_p, n_q) < GUIDED_MIN_NORMAL) {
+                continue; // another surface at a similar depth
+            }
+            const float u_q = float(qx) + shift / z_q;
+            const float base = floor(u_q);
+            const float f = u_q - base;
+            const int x0 = int(base);
+            const bool v0 = TapValid(x0, qy, z_q);
+            const bool v1 = f > 0.0 && TapValid(x0 + 1, qy, z_q);
+            if (!v0 && !v1) {
+                continue; // a hole pixel too: no lighting known there
+            }
+            vec3 c;
+            if (v0 && v1) {
+                c = texelFetch(color_l, ivec2(x0, qy), 0).rgb * (1.0 - f) +
+                    texelFetch(color_l, ivec2(x0 + 1, qy), 0).rgb * f;
+            } else {
+                c = texelFetch(color_l, ivec2(v0 ? x0 : x0 + 1, qy), 0).rgb;
+            }
+            const float w = 1.0 / (1.0 + (rel / sigma) * (rel / sigma));
+            c = DisplayToLinear(c, srgb);
+            vec3 a_q = texelFetch(albedo_r, qd, 0).rgb;
+            a_q = swap ? a_q.bgr : a_q;
+            const vec4 phi = vec4(1.0, n_q);
+            rn += w * a_q * c;
+            rd += w * a_q * a_q;
+            const float ya = (a_q.r + a_q.g + a_q.b) / 3.0;
+            const float yc = (c.r + c.g + c.b) / 3.0;
+            v += (w * ya * yc) * phi;
+            m += (w * ya * ya) * outerProduct(phi, phi);
+            sum_w += w;
+        }
+    }
+    if (sum_w < GUIDED_MIN_WEIGHT) {
+        return false;
+    }
+    const float floor_m = 1e-4 * sum_w;
+    float shape = 1.0;
+    if (normals && m[0][0] > floor_m) {
+        const float plain = v.x / m[0][0];
+        const float ridge = GUIDED_RIDGE * m[0][0];
+        for (int i = 1; i < 4; ++i) {
+            m[i][i] += ridge;
+        }
+        vec4 l;
+        if (plain > 1e-6 && Solve4(m, v, l)) {
+            shape = clamp(dot(l, vec4(1.0, n_p)) / plain, 0.0, GUIDED_MAX_SHAPE);
+        }
+    }
+    result = a_p * min(rn / max(rd, vec3(floor_m)), vec3(GUIDED_MAX_LIGHT)) * shape;
+    result = LinearToDisplay(result, srgb);
+    return true;
+}
+
+// The second dispatch: listed hole pixels get GuidedFill's colour (else keep the mirrored fill).
+void GuidedPass() {
+    const uint index = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+    if (index >= min(hole_count, hole_capacity)) {
+        return;
+    }
+    const uvec4 e = holes[index];
+    const ivec2 pixel = ivec2(e.x & 0xffffu, e.x >> 16);
+    vec3 guided_color;
+    if (GuidedFill(pixel.x, pixel.y, uintBitsToFloat(e.z), int(e.y & 0xffu) - 1, int(e.y >> 8),
+                   guided_color)) {
+        // Alpha: the mirrored fill's (the presenter's view ignores it).
+        imageStore(out_r, pixel, vec4(guided_color, imageLoad(out_r, pixel).a));
+    }
+}
+
+void main() {
+    if ((flags & FLAG_GUIDED_PASS) != 0) {
+        GuidedPass();
+        return;
+    }
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    float z_r, u;
+    ivec3 cols;
+    vec3 w;
+    int n;
+    if (!DirectSample(pixel.x, pixel.y, z_r, u, cols, w, n)) {
+        // Disocclusion: the nearest direct pixel along the row on the farther side (the
+        // background the foreground uncovers), its source mirrored into the hole and averaged
+        // over three depth-tested columns of that background.
+        ivec3 bg_cols = ivec3(0);
+        vec3 bg_w = vec3(0.0);
+        int bg_n = 0, bg_side = 0, bg_k = 0;
+        float bg_z = -1.0, bg_u = 0.0;
+        for (int side = -1; side <= 1; side += 2) {
+            for (int k = 1; k <= search; ++k) {
+                const int nx = pixel.x + side * k;
+                if (nx < 0 || nx >= int(size.x)) {
+                    break;
+                }
+                float nz, nu;
+                ivec3 nc;
+                vec3 nw;
+                int nn;
+                if (DirectSample(nx, pixel.y, nz, nu, nc, nw, nn)) {
+                    if (nz > bg_z) {
+                        bg_cols = nc, bg_w = nw, bg_n = nn;
+                        bg_z = nz, bg_u = nu, bg_side = side, bg_k = k;
+                    }
+                    break;
+                }
+            }
+        }
+        if ((flags & FLAG_ALBEDO) != 0 && bg_side != 0 && z_r < GUIDED_FAR_Z) {
+            // One atomic per subgroup: its hole pixels take consecutive slots.
+            const uvec4 ballot = subgroupBallot(true);
+            uint base = 0u;
+            if (subgroupElect()) {
+                base = atomicAdd(hole_count, subgroupBallotBitCount(ballot));
+            }
+            const uint slot = subgroupBroadcastFirst(base) + subgroupBallotExclusiveBitCount(ballot);
+            if (slot < hole_capacity) {
+                holes[slot] = uvec4(uint(pixel.x) | (uint(pixel.y) << 16),
+                                    uint(bg_side + 1) | (uint(bg_k) << 8), floatBitsToUint(z_r),
+                                    0u);
+            }
+        }
+        if (bg_side == 0) {
+            cols = ivec3(clamp(SourceColumn(pixel.x, z_r), 0, int(size.x) - 1), 0, 0);
+            w = vec3(1.0, 0.0, 0.0);
+            n = 1;
+        } else {
+            const int centre = int(floor(bg_u + 0.5)) + bg_side * bg_k;
+            n = 0;
+            for (int j = -1; j <= 1; ++j) {
+                if (TapValid(centre + j, pixel.y, bg_z)) {
+                    cols[n] = centre + j;
+                    ++n;
+                }
+            }
+            if (n == 0) {
+                cols = bg_cols, w = bg_w, n = bg_n;
+            } else {
+                w = vec3(1.0 / float(n));
+            }
+        }
+    }
+    vec4 color = texelFetch(color_l, ivec2(cols.x, pixel.y), 0) * w.x;
+    for (int i = 1; i < n; ++i) {
+        color += texelFetch(color_l, ivec2(cols[i], pixel.y), 0) * w[i];
+    }
+    imageStore(out_r, pixel, color);
+}

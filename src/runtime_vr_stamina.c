@@ -60,6 +60,7 @@
 #include "vr_stamina_tickets.h"
 #include "vr_hitbox.h"
 #include "vr_visceral.h"
+#include "vr_mem_cache.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h" /* BBXR_EV_*: the tickets for the VR UI's swing labels */
 #include <math.h>
 #include <stdio.h>
@@ -127,40 +128,10 @@ static void vs_init(void) {
 /* ---- guest memory: read only what is mapped (the player chain dangles during loads) ----
  * The same guard as src/runtime_vr_fp.c (fp_readable); writes also need a writable page. */
 #ifdef _WIN32
-static struct { uintptr_t lo, hi; } vs_regions[16];
-static int vs_region_count;
-static double vs_regions_time;
-static int vs_readable(uintptr_t a, size_t n) {
-    if (a < 0x10000 || a + n < a) return 0;
-    const double now = vs_now();
-    if (now - vs_regions_time > 1.0) { vs_region_count = 0; vs_regions_time = now; }
-    for (int i = 0; i < vs_region_count; ++i)
-        if (vs_regions[i].lo <= a && a + n <= vs_regions[i].hi) return 1;
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        const uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
-        if (vs_region_count < (int)(sizeof(vs_regions) / sizeof(*vs_regions))) {
-            vs_regions[vs_region_count].lo = lo;
-            vs_regions[vs_region_count].hi = hi;
-            ++vs_region_count;
-        }
-        at = hi;
-    }
-    return 1;
-}
-static int vs_writable(uintptr_t a, size_t n) {
-    if (!vs_readable(a, n)) return 0;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((const void *)a, &mbi, sizeof(mbi))) return 0;
-    if ((uintptr_t)mbi.BaseAddress + mbi.RegionSize < a + n) return 0;
-    return (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-}
+/* VirtualQuery of the guest mappings took ms on a cold lookup (run12e: Stamina cost 3-5 ms per call): see vr_mem_cache.h */
+static _Thread_local VmCache vs_cache;
+static int vs_readable(uintptr_t a, size_t n) { return vm_readable(&vs_cache, a, n); }
+static int vs_writable(uintptr_t a, size_t n) { return vs_readable(a, n); } /* the stamina and request words are live game data */
 #else
 static int vs_readable(uintptr_t a, size_t n) {
     static int fds[2] = {-1, -1};

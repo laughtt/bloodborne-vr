@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define BBPORT_XR_BRIDGE_ABI 9u
+#define BBPORT_XR_BRIDGE_ABI 10u
 
 /* Pad buttons, the PS4 pad bit layout (sceePadReadState). */
 #define BBXR_BTN_L3 0x2u
@@ -395,6 +395,29 @@ typedef struct BbXrMirrorUi {
     uint64_t seq;
 } BbXrMirrorUi;
 
+/* ABI 10: true stereo (BB_XR_MODE=stereo, docs/vr/findings/31-true-stereo.md "P4.6a hand-off"). The
+ * host renders ONE frame with the head's orientation and one frustum that covers both eyes, makes
+ * both eyes' images from it (the renderer shifts per eye) and hands them over as one pair:
+ * AcquireEye(0) and AcquireEye(1), copy, then ReleaseEyes once. The bridge releases both chains
+ * under one lock, so the projection layer never shows one new image next to an old one of the
+ * other eye, and shows them with poses the host derived from one GetViews snapshot (the head, plus
+ * each eye's offset from it). Frames that belong to no pair (menus, loading, cutscenes) go through
+ * AcquireFlat/ReleaseFlat(View) to the cinema screen as in alt mode. AcquireEye returns -1 unless
+ * the bridge runs BB_XR_MODE=alt or stereo.
+ *
+ * GetViewsAt: the views for any display time (xrLocateViews at that time), so the camera hook can
+ * render for when the image will be seen, not for the bridge's current frame. GetLatency says how
+ * far ahead that is: the XrTime now, the display period and the smoothed time from ReleaseEyes
+ * to the display (in periods); the host adds its own camera -> release time. */
+typedef struct BbXrLatency {
+    uint32_t valid;                  /* release_to_display_periods is measured (>= 8 pairs shown) */
+    float release_to_display_periods; /* ReleaseEyes -> the pair's display, smoothed */
+    int64_t display_period_ns;       /* the runtime's predicted display period (0 unknown) */
+    int64_t now_xr;                  /* the XrTime of this call (0: the runtime cannot convert) */
+    uint64_t pairs;                  /* pairs released so far */
+    uint64_t half_pairs;             /* releases with only one eye (the other acquire failed) */
+} BbXrLatency;
+
 /// level: 0 info, 1 warning, 2 error.
 typedef void (*BbXrLogFn)(int level, const char* message);
 /// The host's queue lock (the runtime may submit on the shared queue): lock != 0 locks.
@@ -455,7 +478,7 @@ typedef struct BbXrApi {
     /// As AcquireFlat, for eye 0 (left) or 1 (right): that eye's swapchain image to copy a
     /// finished frame into (COLOR_ATTACHMENT_OPTIMAL in and out). Returns 1 with the image, 0
     /// when the headset is not showing or the image is not free yet (skip ReleaseEye; the eye
-    /// keeps its image), -1 when the bridge shows no eye images (not BB_XR_MODE=alt, or the
+    /// keeps its image), -1 when the bridge shows no eye images (not BB_XR_MODE=alt or stereo, or the
     /// runtime refused the layer): send every image through AcquireFlat from then on.
     int (*AcquireEye)(uint32_t eye, uint32_t width, uint32_t height, VkFormat src_format,
                       VkImage* image, VkFormat* format);
@@ -483,6 +506,20 @@ typedef struct BbXrApi {
     /* ABI 9: the VR UI for the desktop window. Any thread. Returns 1 with `out` filled when a
      * fresh mirror image exists, 0 otherwise (off, no menu drawn, no flat view). */
     int (*GetMirrorUi)(BbXrMirrorUi* out);
+    /* ABI 10: true stereo (BbXrLatency above). */
+    /// After the commands writing BOTH acquired eye images were submitted: releases both under one
+    /// lock and shows them together. view[i] is eye i's pose and frustum (pose.valid 0: that eye
+    /// uses the views current now). An eye whose acquire failed is not released (its chain is not
+    /// writing): the other eye is released alone, counted as a half pair, and the layer keeps its
+    /// previous pair's poses for the eye that got nothing new. view null: both use the current views.
+    void (*ReleaseEyes)(const BbXrEyeView view[2]);
+    /// As GetViews for another display time: xrLocateViews and the head at `display_time` (an
+    /// XrTime, as BbXrViews.display_time). The screen and pointer come from the latest GetViews.
+    /// Returns 1 while the head orientation is valid; on failure (or display_time <= 0) fills the
+    /// latest GetViews snapshot and returns what GetViews would.
+    int (*GetViewsAt)(int64_t display_time, BbXrViews* out);
+    /// The measured release -> display latency and the XrTime now. Any thread. Returns out->valid.
+    int (*GetLatency)(BbXrLatency* out);
 } BbXrApi;
 
 typedef const BbXrApi* (*BbXrGetApiFn)(void);

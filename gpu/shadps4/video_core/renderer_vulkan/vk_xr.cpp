@@ -31,7 +31,29 @@
 
 namespace Vulkan {
 
+namespace {
+// BbXrGameState {u32 size; u32 flags; ...}: the flag the HUD centre gate reads (xr_hud_center.h).
+constexpr u32 kGameMenuOpen = 0x80u; // BBXR_GAME_MENU_OPEN
+std::atomic<bool> g_menu_open{false};
+std::atomic<s64> g_state_ns{0}; // steady clock, 0: never
+s64 SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+Xr::MenuState Xr::GameMenuState() {
+    const s64 at = g_state_ns.load(std::memory_order_relaxed);
+    MenuState m;
+    m.known = at != 0 && SteadyNs() - at < 1'000'000'000;
+    m.open = m.known && g_menu_open.load(std::memory_order_relaxed);
+    return m;
+}
+
 #ifdef _WIN32
+
+static_assert(kGameMenuOpen == BBXR_GAME_MENU_OPEN);
 
 namespace {
 constexpr wchar_t BridgeName[] = L"bbport_xr.dll";
@@ -94,6 +116,8 @@ struct Xr::Impl {
     u64 render_count{};
     u32 paired{}, unpaired{}, lag_sum{};
     std::chrono::steady_clock::time_point next_log{};
+    // True stereo: the host's part of the latency, camera set up (H1) -> pair released, smoothed.
+    double camera_to_release_ms{-1.0};
     // Alternate-eye stereo: the bridge said it shows no eye images (AcquireEye returned -1).
     bool eyes_refused{};
     // HUD layer: the bridge said it shows no HUD (AcquireHud returned -1).
@@ -255,8 +279,38 @@ void Xr::ReleaseFlat(const float* camera_view) {
 
 void Xr::SetRenderView(const RenderView& view) {
     std::scoped_lock lock{impl->views_mutex};
-    impl->render_views[impl->render_count % impl->render_views.size()] = view;
+    RenderView& slot = impl->render_views[impl->render_count % impl->render_views.size()];
+    slot = view;
+    slot.set_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
     ++impl->render_count;
+}
+
+std::optional<Xr::RenderView> Xr::MatchRenderView(const float* camera_view) {
+    if (!camera_view) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{impl->views_mutex};
+    const u64 size = impl->render_views.size();
+    const u64 count = std::min<u64>(impl->render_count, size);
+    float best = 1e9f;
+    u64 best_back = 0;
+    for (u64 back = 0; back < count; ++back) {
+        const float error =
+            RowsError(camera_view, impl->render_views[(impl->render_count - 1 - back) % size].rows);
+        if (error < best) {
+            best = error;
+            best_back = back;
+        }
+    }
+    if (!count || best >= 2e-3f) {
+        ++impl->unpaired;
+        return std::nullopt;
+    }
+    ++impl->paired;
+    impl->lag_sum += u32(best_back);
+    return impl->render_views[(impl->render_count - 1 - best_back) % size];
 }
 
 bool Xr::HasEyes() const {
@@ -300,6 +354,47 @@ void Xr::ReleaseEye(int eye, const xrstereo::EyeView& view) {
     out.fov = {view.fov[0], view.fov[1], view.fov[2], view.fov[3]};
     out.seq = view.seq;
     impl->api->ReleaseEye(uint32_t(eye), view.has_pose ? &out : nullptr);
+}
+
+bool Xr::HasPair() const {
+    return HasEyes() && impl->api->abi >= 10 && impl->api->ReleaseEyes;
+}
+
+void Xr::ReleaseEyes(const xrstereo::PairView& view, s64 camera_set_ns) {
+    if (!HasPair()) {
+        return;
+    }
+    float position[2][3], orientation[4];
+    const bool poses = xrstereo::PairEyePoses(view, position, orientation);
+    BbXrEyeView out[2]{};
+    for (int eye = 0; eye < 2; ++eye) {
+        out[eye].display_time = view.display_time;
+        out[eye].fov = {view.fov[0], view.fov[1], view.fov[2], view.fov[3]};
+        out[eye].seq = view.seq;
+        if (poses) {
+            for (int i = 0; i < 3; ++i) {
+                out[eye].pose.position[i] = position[eye][i];
+            }
+            for (int i = 0; i < 4; ++i) {
+                out[eye].pose.orientation[i] = orientation[i];
+            }
+            out[eye].pose.valid = 1u;
+        }
+    }
+    impl->api->ReleaseEyes(out);
+    if (camera_set_ns > 0) {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        const double ms = double(now - camera_set_ns) * 1e-6;
+        std::scoped_lock lock{impl->views_mutex};
+        if (ms >= 0.0 && ms < 1000.0) {
+            impl->camera_to_release_ms = impl->camera_to_release_ms < 0.0
+                                             ? ms
+                                             : impl->camera_to_release_ms +
+                                                   0.1 * (ms - impl->camera_to_release_ms);
+        }
+    }
 }
 
 bool Xr::HasHud() const {
@@ -401,6 +496,12 @@ void Xr::Rumble(u8 large, u8 small) {
 }
 
 void Xr::SetGameState(const void* state, u32 size) {
+    if (state && size >= 2 * sizeof(u32)) {
+        u32 flags = 0;
+        std::memcpy(&flags, static_cast<const u8*>(state) + sizeof(u32), sizeof(flags));
+        g_menu_open.store((flags & kGameMenuOpen) != 0, std::memory_order_relaxed);
+        g_state_ns.store(SteadyNs(), std::memory_order_relaxed);
+    }
     if (!impl->session || impl->api->abi < 8 || !impl->api->SetGameState ||
         size < sizeof(uint32_t)) {
         return;
@@ -439,23 +540,79 @@ std::optional<Xr::MirrorUi> Xr::LatestMirrorUi() {
     return MirrorUi{vk::Image(in.image), vk::Format(in.view_format), in.uv_w, in.uv_h};
 }
 
-std::optional<Xr::Views> Xr::LatestViews() {
-    BbXrViews in{};
-    if (!impl->session || !impl->api->GetViews(&in)) {
-        return std::nullopt;
-    }
+static Xr::Views ConvertViews(const BbXrViews& in) {
     const auto pose = [](const BbXrPose& p) {
-        return Pose{{p.position[0], p.position[1], p.position[2]},
-                    {p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]}};
+        return Xr::Pose{{p.position[0], p.position[1], p.position[2]},
+                        {p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]}};
     };
-    Views views{in.display_time, in.flags, pose(in.head), {}, pose(in.screen.pose),
-                (in.screen.pose.valid ? 1u : 0u) | (in.screen.head_locked ? 2u : 0u)};
+    Xr::Views views{in.display_time, in.flags, pose(in.head), {}, pose(in.screen.pose),
+                    (in.screen.pose.valid ? 1u : 0u) | (in.screen.head_locked ? 2u : 0u)};
     for (int i = 0; i < 2; ++i) {
         const BbXrEye& eye = in.eye[i];
         views.eyes[i] = {pose(eye.pose), eye.fov.left, eye.fov.right, eye.fov.up,
                          eye.fov.down,   eye.width,    eye.height};
     }
     return views;
+}
+
+std::optional<Xr::Views> Xr::LatestViews() {
+    BbXrViews in{};
+    if (!impl->session || !impl->api->GetViews(&in)) {
+        return std::nullopt;
+    }
+    return ConvertViews(in);
+}
+
+std::optional<Xr::Views> Xr::ViewsAt(s64 display_time_ns) {
+    if (!impl->session) {
+        return std::nullopt;
+    }
+    if (impl->api->abi < 10 || !impl->api->GetViewsAt || display_time_ns <= 0) {
+        return LatestViews();
+    }
+    BbXrViews in{};
+    if (!impl->api->GetViewsAt(display_time_ns, &in)) {
+        return std::nullopt;
+    }
+    return ConvertViews(in);
+}
+
+double Xr::DisplayHz() {
+    if (!impl->session || impl->api->abi < 10 || !impl->api->GetLatency) {
+        return 0.0;
+    }
+    BbXrLatency latency{};
+    impl->api->GetLatency(&latency);
+    return latency.display_period_ns > 0 ? 1e9 / double(latency.display_period_ns) : 0.0;
+}
+
+std::optional<Xr::DisplayAhead> Xr::LatestDisplayAhead() {
+    if (!impl->session || impl->api->abi < 10 || !impl->api->GetLatency) {
+        return std::nullopt;
+    }
+    BbXrLatency latency{};
+    impl->api->GetLatency(&latency);
+    double camera_ms;
+    {
+        std::scoped_lock lock{impl->views_mutex};
+        camera_ms = impl->camera_to_release_ms;
+    }
+    if (!latency.valid || camera_ms < 0.0) {
+        return std::nullopt;
+    }
+    const s64 display_time = xrstereo::PredictDisplayTime(
+        latency.now_xr, s64(camera_ms * 1e6), double(latency.release_to_display_periods),
+        latency.display_period_ns);
+    if (!display_time) {
+        return std::nullopt;
+    }
+    return DisplayAhead{display_time,
+                        display_time - latency.now_xr,
+                        latency.display_period_ns,
+                        latency.release_to_display_periods,
+                        float(camera_ms),
+                        latency.pairs,
+                        latency.half_pairs};
 }
 
 #else
@@ -515,6 +672,22 @@ std::optional<Xr::Hands> Xr::LatestHands() {
 void Xr::Rumble(u8, u8) {}
 std::optional<Xr::Views> Xr::LatestViews() {
     return std::nullopt;
+}
+bool Xr::HasPair() const {
+    return false;
+}
+void Xr::ReleaseEyes(const xrstereo::PairView&, s64) {}
+std::optional<Xr::RenderView> Xr::MatchRenderView(const float*) {
+    return std::nullopt;
+}
+std::optional<Xr::Views> Xr::ViewsAt(s64) {
+    return std::nullopt;
+}
+std::optional<Xr::DisplayAhead> Xr::LatestDisplayAhead() {
+    return std::nullopt;
+}
+double Xr::DisplayHz() {
+    return 0.0;
 }
 
 #endif

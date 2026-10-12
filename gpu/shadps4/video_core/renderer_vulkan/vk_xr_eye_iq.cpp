@@ -3,6 +3,7 @@
 
 #include "video_core/renderer_vulkan/vk_xr_eye_iq.h"
 #include "video_core/renderer_vulkan/xr_dlss_logic.h"
+#include "video_core/renderer_vulkan/xr_fps_logic.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +21,9 @@ namespace Vulkan::XrEyeIq {
 namespace {
 
 void Apply(Settings& s, const std::string& key, const std::string& value) {
+    if (XrDlssNrLogic::Apply(s.nr, key, value)) {
+        return;
+    }
     if (key == "aa") {
         s.fxaa = value == "fxaa";
     } else if (key == "upscale") {
@@ -58,6 +62,12 @@ void Apply(Settings& s, const std::string& key, const std::string& value) {
         s.dlss_jitter = XrDlssLogic::ParseJitterOn(value);
     } else if (key == "dlss_mask_m") {
         s.dlss_mask_m = XrDlssLogic::ParseMaskMeters(value, s.dlss_mask_m);
+    } else if (key == "fps") {
+        s.fps = XrFpsLogic::ParseOn(value.c_str());
+    } else if (key == "fps_pos") {
+        s.fps_corner = XrFpsLogic::ParseCorner(value.c_str(), s.fps_corner);
+    } else if (key == "hud_center") {
+        s.hud_center = XrHudCenter::ParseMode(value, s.hud_center);
     } else if (key == "sharpen") {
         s.sharpen = std::clamp(float(std::atof(value.c_str())), 0.0f, 1.0f);
     } else if (key == "res") {
@@ -90,6 +100,12 @@ Settings FromEnv() {
     env("BB_XR_DLSS_MASK", "dlss_mask");
     env("BB_XR_DLSS_MASK_M", "dlss_mask_m");
     env("BB_XR_DLSS_JITTER", "dlss_jitter");
+    env("BB_XR_FPS", "fps");
+    env("BB_XR_FPS_POS", "fps_pos");
+    env("BB_XR_HUD_CENTER", "hud_center");
+    for (const auto& [name, key] : XrDlssNrLogic::EnvKeys) {
+        env(name, key);
+    }
     return s;
 }
 
@@ -121,6 +137,28 @@ void Describe(const Settings& s, const char* where) {
         std::printf("VR IQ (%s): aa %s, upscale %s (frame %s, sharpen %.2f)\n", where,
                     s.fxaa ? "fxaa" : "off", s.fsr1 ? "fsr1" : "off", res, s.sharpen);
     }
+    if (s.fps) {
+        static const char* const corners[] = {"top left", "top right", "bottom left",
+                                              "bottom right"};
+        std::printf("VR IQ (%s): fps counter on (corner %s)\n", where,
+                    corners[std::clamp(s.fps_corner, 0, 3)]);
+    }
+    if (s.hud_center != XrHudCenter::kDefaultMode) {
+        std::printf("VR IQ (%s): hud_center %s (the HUD quad in the middle of the view)\n", where,
+                    XrHudCenter::ModeName(s.hud_center));
+    }
+    if (s.nr.on) {
+        const int passes = XrDlssNrLogic::Passes(s.nr);
+        std::printf("VR IQ (%s): DLSS-NR on: %d pass%s (the first on %.0f %% of the eye, later ones "
+                    "on %.0f %%), style %d, intensity %.2f, tone %.2f, structure %.2f, skin %.2f, "
+                    "place %s\n",
+                    where, passes, passes > 1 ? "es" : "", s.nr.fovea * 100.0f,
+                    std::min(s.nr.inner, s.nr.fovea) * 100.0f, s.nr.style, s.nr.intensity,
+                    s.nr.tone, s.nr.structure, s.nr.skin,
+                    s.nr.place == XrDlssNrLogic::Place::Pre
+                        ? "pre (render size, before the upscaler)"
+                        : "post (the eye image)");
+    }
     std::fflush(stdout);
 }
 
@@ -137,7 +175,8 @@ Settings Current() {
     if (!initialized) {
         initialized = true;
         settings = FromEnv();
-        if (settings.fxaa || settings.fsr1 || settings.dlss || control) {
+        if (settings.fxaa || settings.fsr1 || settings.dlss || settings.fps || settings.nr.on ||
+            settings.hud_center != XrHudCenter::kDefaultMode || control) {
             Describe(settings, "environment");
         }
     }

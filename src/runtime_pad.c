@@ -10,6 +10,7 @@
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #include "vr_visceral.h"
+#include "hooks.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -316,7 +317,7 @@ static void sample(PadData *d) {
     /* VR UI (BB_VR_UI=1): the headset menus' choices as the game's own presses (d-pad, square). */
     d->buttons|=runtime_vr_ui_pad(d->buttons);
     /* VR visceral (findings/41 7): R1 for a thrust / closeness after a parry-candidate shot. */
-    d->buttons|=vr_visceral_pad();
+    { const uint64_t t0=bb_vrprof_t0(); d->buttons|=vr_visceral_pad(); bb_vrprof_end(BB_PROF_VISCERAL_PAD,t0); }
     if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
     record_sample(d);
     read_inject();

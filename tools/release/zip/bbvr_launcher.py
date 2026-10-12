@@ -4,7 +4,10 @@
 
     BloodborneVR.exe                 check everything, then start the game in VR
     BloodborneVR.exe --check         only run the checks
-    BloodborneVR.exe --mono          VR with a flat screen in the headset (no stereo)
+    BloodborneVR.exe --mono          VR render mode Mono: one flat screen in the headset (the default is Stereo, true 3D)
+    BloodborneVR.exe --mode vr|coop|flat   this start's mode: VR solo, Co-op (online, needs a room) or Flat (monitor, no headset)
+    BloodborneVR.exe --flat          play on the monitor (with --mode coop: co-op played flat)
+    BloodborneVR.exe --quality Low|Medium|High|Super High   this start's VR quality preset
     BloodborneVR.exe --game-dir DIR  use (and remember) another game folder
     BloodborneVR.exe --reset         forget the saved game folder and the extracted VR data
     BloodborneVR.exe --menu          show the settings menu (default until you tick "don't show next time")
@@ -18,8 +21,9 @@ What it does, in order:
      else every byte the VR hooks expect is compared with the game's code (unknown builds stop here);
   3. checks that an OpenXR runtime is set up;
   4. builds the VR menu / hit-shape data from YOUR dump into out/vr_assets (stays on this PC);
-  5. writes default fp.txt / stereo.txt if missing, shows the settings menu (bbvr_menu.py, a local web page)
-     and starts run.py with the chosen settings (bbvr_settings.py).
+  5. writes default fp.txt / stereo.txt if missing, shows the settings menu (bbvr_menu.py, a local web page; the
+     native dashboard of BloodborneVR.exe is the same window) and starts run.py with the chosen settings
+     (bbvr_settings.py): the saved mode (VR / Co-op / Flat), VR quality preset and edits.
 No game file is ever copied into this folder except those derived data, and nothing is uploaded.
 """
 import argparse
@@ -50,8 +54,8 @@ DATA = settings_mod.data_root(PORT)
 OUT = DATA / 'out'
 CONFIG = (OUT / 'bbvr_config.json') if DEV else (DATA / 'bbvr_config.json')
 LOGS = DATA / 'logs'
-TITLE_ID = 'CUSA03173'
-APP_VERSION = '01.09'
+TITLE_ID = settings_mod.GAME_TITLE_ID
+APP_VERSION = settings_mod.GAME_APP_VERSION
 # SHA-256 of eboot.bin of the 01.09 dump the patches were written against (a hash, not game content).
 KNOWN_EBOOT_SHA256 = {
     '22ccba99c1182247124b9cfa4c95472d2f2eea442eb61586b5ddec5b4e7cbe02': 'CUSA03173 1.09',
@@ -141,18 +145,8 @@ def find_game_dir(config, requested):
 
 
 def read_sfo(path):
-    """Minimal param.sfo reader: {key: value} of the string / integer entries."""
-    data = Path(path).read_bytes()
-    magic, _, key_table, data_table, count = struct.unpack_from('<4sIIII', data, 0)
-    if magic != b'\0PSF':
-        raise ValueError('not a param.sfo')
-    result = {}
-    for i in range(count):
-        key_off, fmt, length, _, data_off = struct.unpack_from('<HHIII', data, 20 + i * 16)
-        key = data[key_table + key_off:data.index(b'\0', key_table + key_off)].decode('ascii', 'replace')
-        raw = data[data_table + data_off:data_table + data_off + length]
-        result[key] = int.from_bytes(raw[:4], 'little') if fmt == 0x0404 else raw.split(b'\0')[0].decode('utf-8', 'replace')
-    return result
+    """Minimal param.sfo reader: {key: value} of the string / integer entries (bbvr_settings.read_sfo)."""
+    return settings_mod.read_sfo(path)
 
 
 def sha256(path):
@@ -325,6 +319,7 @@ def launch(env_extra, menu=None):
     say(ALPHA_NOTICE)
     if menu:
         menu.game_running = True
+        menu.log_path = log
     heartbeat = None
     if env.get('BB_ONLINE_ROOM_FILE'):  # in a room: keep the room file (members, sign, summoned) fresh while the game runs
         try:
@@ -337,6 +332,8 @@ def launch(env_extra, menu=None):
         handle.write(ALPHA_NOTICE + '\n')
         child = subprocess.Popen([sys.executable, str(PORT / 'run.py')], cwd=PORT, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if menu:
+            menu.child = child  # the menu's Stop button ends it
         while True:
             chunk = child.stdout.read1(65536)  # returns what is there, so a prompt without a newline shows
             if not chunk:
@@ -363,6 +360,22 @@ def settings_path():
     return DATA / 'user' / 'bbvr_settings.json'
 
 
+def online_bridge(argv):
+    """The room commands of bbvr_cli (host / join / leave / view / server) for the web menu. Imported on use: bbvr_cli
+    itself imports this module."""
+    import bbvr_cli
+    return bbvr_cli.online(list(argv))
+
+
+def wants_flat(args):
+    """True when this start is Flat (--flat, --mode flat, or the saved mode) and shows no menu that could change it."""
+    if args.flat or args.mode == 'flat':
+        return True
+    if args.menu or not (args.no_menu or args.profile):
+        return False  # the menu may still pick VR
+    return settings_mod.play_view(settings_mod.load_settings(settings_path())) == 'flat'
+
+
 def run_with_settings(game, args):
     """The settings step: profile / menu, control files, environment; then the game."""
     caps = settings_mod.detect_all(PORT)
@@ -377,6 +390,10 @@ def run_with_settings(game, args):
     menu = None
     if show:
         menu = bbvr_menu.Menu(spath, paths, caps, saved)
+        menu.version = app_version()
+        menu.log_dir = LOGS
+        if settings_mod.ONLINE_PLAY:
+            menu.online = online_bridge  # the Online co-op page: host / join / leave a room
         url = menu.start()
         opened = '' if (args.console or args.no_browser) else bbvr_menu.open_page(url)
         if opened:
@@ -413,19 +430,35 @@ def run_with_settings(game, args):
             say(f'Unknown profile "{args.profile}". Profiles: ' + ', '.join(settings_mod.PROFILE_ORDER))
             return 5
         saved = dict(saved, profile=wanted)
+    if getattr(args, 'mode', None):
+        saved = dict(saved, mode=args.mode)
+    if getattr(args, 'quality', None):
+        wanted = next((q for q in settings_mod.QUALITY_ORDER if q.lower() == args.quality.lower()), None)
+        if not wanted:
+            say(f'Unknown quality "{args.quality}". Presets: ' + ', '.join(settings_mod.QUALITY_ORDER))
+            return 5
+        saved = settings_mod.set_quality(saved, wanted)
+    if getattr(args, 'flat', False):
+        saved = dict(saved, mode='flat' if saved.get('mode') != 'coop' else 'coop', coop_view='flat')
+    view = settings_mod.play_view(saved)
     values = settings_mod.effective_values(saved, caps)
     if args.mono:
         values['mode'] = 'mono'
-    plan = settings_mod.build_launch(values, paths, caps)
+    plan = settings_mod.build_launch(values, paths, caps, view=view)
     for warning in plan['warnings']:
         say('  Note: ' + warning)
-    wr = settings_mod.runtime_warning(caps['runtimes'], values.get('runtime') or '')
-    if wr:
-        say('  Warning: ' + wr)
+    if view == 'vr':
+        wr = settings_mod.runtime_warning(caps['runtimes'], values.get('runtime') or '')
+        if wr:
+            say('  Warning: ' + wr)
     OUT.mkdir(parents=True, exist_ok=True)
-    online = settings_mod.online_env(values, load_config(), DATA / 'user', solo=getattr(args, 'solo', False), port=PORT)
-    if getattr(args, 'solo', False):
+    # Only the Co-op mode (or --online-room flows of older callers: none) plays online; VR and Flat are solo.
+    solo = getattr(args, 'solo', False) or saved.get('mode', 'vr') != 'coop'
+    online = settings_mod.online_env(values, load_config(), DATA / 'user', solo=solo, port=PORT)
+    if solo:
         say('  Play solo: online is off.')
+    elif not online:
+        say('  Co-op: no room to play in (host a room or join one first); starting solo.')
     if online:
         plan['env'].update(online)
         lobby = settings_mod.lobby_address(values, load_config(), DATA / 'user', PORT)
@@ -438,7 +471,12 @@ def run_with_settings(game, args):
     changed = settings_mod.apply_files(plan, paths)
     if changed:
         say('  Updated: ' + ', '.join(Path(c).name for c in changed))
-    say(f'  Profile {saved["profile"]}: upscaler {plan["upscale"]}, executable {plan["exe"] or "default"}')
+    if view == 'flat':
+        say(f'  Flat screen ({settings_mod.MODE_LABELS.get(saved.get("mode", "vr"))}): no headset, executable {plan["exe"] or "default"}')
+    else:
+        say(f'  {settings_mod.MODE_LABELS.get(saved.get("mode", "vr"))}, quality {saved.get("quality", settings_mod.QUALITY_DEFAULT)}, '
+            f'profile {saved["profile"]}: upscaler {plan["upscale"]}, render mode {values.get("mode")}, '
+            f'executable {plan["exe"] or "default"}')
     if args.dry_run:
         for k, v in sorted(plan['env'].items()):
             say(f'{k}={v}')
@@ -456,7 +494,10 @@ def main():
     ap = argparse.ArgumentParser(description='Bloodborne VR alpha launcher')
     ap.add_argument('--check', action='store_true', help='run the checks only')
     ap.add_argument('--solo', action='store_true', help='play solo: online off even when a room is saved (the dashboard Play solo button)')
-    ap.add_argument('--mono', action='store_true', help='flat screen in the headset (no stereo)')
+    ap.add_argument('--mono', action='store_true', help='VR render mode Mono: one flat screen in the headset (no stereo)')
+    ap.add_argument('--mode', choices=settings_mod.MODES, help='play mode for this start: vr, coop (online) or flat (monitor, no headset)')
+    ap.add_argument('--flat', action='store_true', help='play on the monitor, no headset (Co-op stays Co-op, played flat)')
+    ap.add_argument('--quality', help='VR quality preset for this start: ' + ', '.join(settings_mod.QUALITY_ORDER))
     ap.add_argument('--game-dir', help='game folder (remembered)')
     ap.add_argument('--reset', action='store_true', help='forget the game folder and the extracted VR data')
     ap.add_argument('--menu', action='store_true', help='show the settings menu even if it was switched off')
@@ -505,12 +546,15 @@ def main():
         return 2
     if not ok_vulkan:
         return 3
-    if not ok_xr and not yes('Continue without an OpenXR runtime (the game will not show in a headset)?'):
+    if not ok_xr and not wants_flat(args) and not yes('Continue without an OpenXR runtime (the game will not show in a headset)?'):
         return 4
     if args.check:
         say('\nAll checks done.')
         return 0
-    extract_assets(game, config)
+    if wants_flat(args):
+        say('Flat mode: the VR menu and hit-shape data are not needed (they are built when you start in VR).')
+    else:
+        extract_assets(game, config)
     save_config(config)
     ensure_defaults()
     return run_with_settings(game, args)

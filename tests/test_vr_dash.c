@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "vr_dash_detect.h"
+#include "vr_evade_scale.h"
+#include "vr_backstep.h"
 #include "vr_fp_math.h"
 
 static int failures, checks;
@@ -247,6 +249,222 @@ static void test_strafe_step(void) {
     CHECK(ox == 0.0f && oz == 0.0f);
 }
 
+/* The evade distance scale (src/vr_evade_scale.h): a share of each real step, only in evade clips. */
+static void test_evade_scale(void) {
+    CHECK(vr_evade_clamp(2.0f) == 2.0f && vr_evade_clamp(1.0f) == 0.0f && vr_evade_clamp(0.0f) == 0.0f);
+    CHECK(vr_evade_clamp(9.0f) == VR_EVADE_SCALE_MAX && vr_evade_clamp(NAN) == 0.0f && vr_evade_clamp(-3.0f) == 0.0f);
+    float v = 0.0f;
+    CHECK(vr_evade_parse("atk_speed=2 evade_scale=2.5\n", &v) && v == 2.5f);
+    CHECK(!vr_evade_parse("xevade_scale=2", &v) && !vr_evade_parse("", &v));
+    CHECK(!vr_evade_online(NULL, NULL) && !vr_evade_online("0", "") && vr_evade_online("1", NULL) && vr_evade_online(NULL, "host"));
+    CHECK(vr_evade_move(7200) && vr_evade_move(7100) && vr_evade_move(7000) && !vr_evade_move(7800) && !vr_evade_move(30000));
+    /* a 4 m forward roll at 30 fps with a bell-shaped step: scaled x2 it adds about as much again, never more */
+    VrEvade e;
+    vr_evade_reset(&e);
+    const float f[3] = {0, 0, 0};
+    float x = 0.0f, z = 0.0f, real = 0.0f, extra_sum = 0.0f;
+    const int frames = 28;
+    for (int i = 0; i <= frames; ++i) {
+        float dx, dz;
+        if (vr_evade_step(&e, 7200, f, x, z, 1.0f / 30.0f, 2.0f, 2.0f, &dx, &dz)) { x += dx; z += dz; extra_sum += dz; }
+        const float u = (float)i / frames;
+        const float step = 4.0f * 6.0f * u * (1.0f - u) / frames;
+        z += step;
+        real += step;
+    }
+    CHECK(fabsf(real - 4.0f) < 0.1f);
+    CHECK(extra_sum > 3.4f && extra_sum <= 4.0f + 1e-3f);
+    CHECK(x == 0.0f);
+    /* off (k = 0), a walk, a jump: nothing */
+    vr_evade_reset(&e);
+    float dx, dz;
+    for (int i = 0; i < 5; ++i) {
+        CHECK(!vr_evade_step(&e, 7200, f, 0.0f, 0.1f * (float)i, 0.033f, 0.0f, 0.0f, &dx, &dz));
+        CHECK(!vr_evade_step(&e, 20000, f, 0.0f, 0.1f * (float)i, 0.033f, 2.0f, 2.0f, &dx, &dz));
+        CHECK(!vr_evade_step(&e, 7800, f, 0.0f, 0.1f * (float)i, 0.033f, 2.0f, 2.0f, &dx, &dz));
+    }
+    /* a wall: the step collapses, the extra stops for the rest of the clip */
+    vr_evade_reset(&e);
+    float zz = 0.0f;
+    int given = 0;
+    for (int i = 0; i < 12; ++i) {
+        zz += i < 4 ? 0.2f : 0.0f;
+        if (vr_evade_step(&e, 7100, f, 0.0f, zz, 0.033f, 2.0f, 2.0f, &dx, &dz)) { zz += dz; ++given; }
+    }
+    CHECK(given == 3); /* the first call has no step before it */
+    CHECK(!vr_evade_step(&e, 7100, f, 0.0f, zz + 0.2f, 0.033f, 2.0f, 2.0f, &dx, &dz));
+    /* a teleport stops it; a restarted clip (the clip time drops) starts afresh */
+    vr_evade_reset(&e);
+    vr_evade_step(&e, 7100, f, 0, 0, 0.033f, 2.0f, 2.0f, &dx, &dz);
+    CHECK(!vr_evade_step(&e, 7100, f, 0, 5.0f, 0.033f, 2.0f, 2.0f, &dx, &dz) && e.stopped);
+    const float g1[3] = {0.5f, 0, 0}, g2[3] = {0.0f, 0, 0};
+    vr_evade_step(&e, 7100, g1, 0, 5.0f, 0.033f, 2.0f, 2.0f, &dx, &dz);
+    CHECK(e.stopped);
+    CHECK(!vr_evade_step(&e, 7100, g2, 0, 5.0f, 0.033f, 2.0f, 2.0f, &dx, &dz) && !e.stopped);
+    /* past the clip's root motion nothing is added, and the total stays under (k - 1) * distance */
+    vr_evade_reset(&e);
+    float yy = 0.0f;
+    for (int i = 0; i < 80; ++i) {
+        yy += 0.05f;
+        vr_evade_step(&e, 7000, f, 0.0f, yy, 0.033f, 2.0f, 2.0f, &dx, &dz); /* the backstep: 2.48 m, motion 0.83 s */
+        if (e.elapsed > 0.9) CHECK(e.stopped);
+    }
+    CHECK(e.given <= 2.48f + 1e-3f);
+}
+
+/* The control-file parse of evade_scale=: last token, LF / CRLF endings, default 1.5. */
+static void test_evade_control(void) {
+    float v = 0.0f;
+    CHECK(VR_EVADE_SCALE_DEFAULT == 1.5f);
+    CHECK(vr_evade_parse("fp=1 face_dodge=strafe evade_scale=1.5\n", &v) && v == 1.5f);
+    v = 0.0f;
+    CHECK(vr_evade_parse("fp=1 evade_scale=1.5", &v) && v == 1.5f);
+    v = 0.0f;
+    CHECK(vr_evade_parse("fp=1\r\nevade_scale=1.75\r\n", &v) && v == 1.75f);
+    CHECK(vr_evade_parse("hit_scale=1.5 evade_scale=2\n", &v) && v == 2.0f);
+    CHECK(!vr_evade_parse("hit_scale=1.5\n", &v));
+}
+
+/* Backward evade = backstep (src/vr_backstep.h). */
+static void test_backstep(void) {
+    const float D = 3.14159265f / 180.0f;
+    /* classification: facing 0, move heading 0: stick down (sy = -1) is behind, up is ahead, sideways is not */
+    CHECK(vr_backstep_is_back(0.0f, 0.0f, 0.0f, -1.0f, 120.0f));
+    CHECK(!vr_backstep_is_back(0.0f, 0.0f, 0.0f, 1.0f, 120.0f));
+    CHECK(!vr_backstep_is_back(0.0f, 0.0f, 1.0f, 0.0f, 120.0f));
+    CHECK(vr_backstep_is_back(0.0f, 0.0f, 0.5f, -0.9f, 120.0f));   /* 151 deg off */
+    CHECK(!vr_backstep_is_back(0.0f, 0.0f, 0.9f, -0.4f, 120.0f));  /* 114 deg off */
+    CHECK(vr_backstep_is_back(0.0f, 0.0f, 0.9f, -0.4f, 100.0f));   /* ... with a 100 deg threshold */
+    CHECK(!vr_backstep_is_back(0.0f, 0.0f, 0.1f, -0.1f, 120.0f));  /* inside the deadzone */
+    /* head-relative: the move heading turned by 90 deg, the body still facing 0: stick up now points sideways, stick down too */
+    CHECK(!vr_backstep_is_back(0.0f, 90.0f * D, 0.0f, 1.0f, 120.0f));
+    CHECK(vr_backstep_is_back(0.0f, 180.0f * D, 0.0f, 1.0f, 120.0f));   /* looking back, stick forward = behind the body */
+    CHECK(vr_backstep_is_back(170.0f * D, 0.0f, 0.0f, 1.0f, 120.0f));   /* wrap-around */
+    /* the reference is the VIEW: move=head, view 90 deg, the character already turned to its walk direction (not an input):
+     * stick pulled back is behind, forward and sideways are not */
+    CHECK(vr_backstep_is_back(90.0f * D, 90.0f * D, 0.0f, -1.0f, 120.0f));
+    CHECK(!vr_backstep_is_back(90.0f * D, 90.0f * D, 0.0f, 1.0f, 120.0f));
+    CHECK(!vr_backstep_is_back(90.0f * D, 90.0f * D, -1.0f, 0.0f, 120.0f));
+    CHECK(vr_backstep_is_back(NAN, 0.0f, 0.0f, -1.0f, 120.0f) && !vr_backstep_is_back(NAN, 0.0f, 0.0f, 1.0f, 120.0f)); /* no view: the raw stick */
+    CHECK(!vr_backstep_is_back(0.0f, NAN, 0.0f, -1.0f, 120.0f));
+    CHECK(vr_backstep_clamp_angle(NAN) == 120.0f && vr_backstep_clamp_angle(5.0f) == 30.0f && vr_backstep_clamp_angle(400.0f) == 180.0f);
+    { /* raw pad bytes: y = 255 is the stick pulled back, y = 0 forward (src/runtime_pad.c: S = 255, W = 0) */
+        float sx, sy;
+        vr_backstep_stick(128, 255, &sx, &sy);
+        CHECK(vr_backstep_is_back(0.0f, 0.0f, sx, sy, 120.0f));
+        vr_backstep_stick(128, 0, &sx, &sy);
+        CHECK(!vr_backstep_is_back(0.0f, 0.0f, sx, sy, 120.0f));
+        vr_backstep_stick(255, 128, &sx, &sy);
+        CHECK(!vr_backstep_is_back(0.0f, 0.0f, sx, sy, 120.0f));
+        vr_backstep_stick(200, 230, &sx, &sy); /* back and to the right, 150 deg */
+        CHECK(vr_backstep_is_back(0.0f, 0.0f, sx, sy, 120.0f));
+        vr_backstep_stick(128, 128, &sx, &sy);
+        CHECK(!vr_backstep_is_back(0.0f, 0.0f, sx, sy, 120.0f));
+    }
+    float v = 0.0f;
+    CHECK(vr_backstep_parse_key("fp=1 backstep=0\n", "backstep", &v) && v == 0.0f);
+    CHECK(vr_backstep_parse_key("backstep_angle=100 backstep=1", "backstep", &v) && v == 1.0f);
+    CHECK(vr_backstep_parse_key("backstep_angle=100\n", "backstep_angle", &v) && v == 100.0f);
+    CHECK(!vr_backstep_parse_key("backstep_angle=100\n", "backstep", &v));
+
+    /* the hold window */
+    VrBackstepCfg c;
+    vr_backstep_cfg_default(&c);
+    VrBackstep s;
+    memset(&s, 0, sizeof(s));
+    int st = 0;
+    const uint32_t CI = VR_BACKSTEP_BTN_CIRCLE;
+    CHECK(!vr_backstep_update(&s, &c, 1.00, 0, 1, 0, &st) && !st);           /* walking back: untouched */
+    CHECK(vr_backstep_update(&s, &c, 1.02, CI, 1, 0, &st) && st);            /* press: neutral stick */
+    CHECK(vr_backstep_update(&s, &c, 1.10, CI, 1, 0, &st) && !st);           /* held */
+    CHECK(vr_backstep_update(&s, &c, 1.15, 0, 1, 0, &st));                   /* released: tail */
+    CHECK(vr_backstep_update(&s, &c, 1.24, 0, 1, 0, &st));
+    CHECK(!vr_backstep_update(&s, &c, 1.30, 0, 1, 0, &st));                  /* over: the stick is given back */
+    /* a sprint: circle held past the tap window */
+    CHECK(vr_backstep_update(&s, &c, 2.00, CI, 1, 0, &st));
+    CHECK(vr_backstep_update(&s, &c, 2.25, CI, 1, 0, &st));
+    CHECK(!vr_backstep_update(&s, &c, 2.40, CI, 1, 0, &st));
+    CHECK(!vr_backstep_update(&s, &c, 2.50, CI, 1, 0, &st));
+    CHECK(!vr_backstep_update(&s, &c, 2.60, 0, 1, 0, &st));
+    /* forward dodge: nothing */
+    CHECK(!vr_backstep_update(&s, &c, 3.00, CI, 0, 0, &st) && !vr_backstep_update(&s, &c, 3.05, 0, 0, 0, &st));
+    /* the stick arrives a frame after the button: still armed within the grace window, not after it */
+    CHECK(!vr_backstep_update(&s, &c, 4.00, CI, 0, 0, &st));
+    CHECK(vr_backstep_update(&s, &c, 4.04, CI, 1, 0, &st) && st);
+    memset(&s, 0, sizeof(s));
+    CHECK(!vr_backstep_update(&s, &c, 5.00, CI, 0, 0, &st));
+    CHECK(!vr_backstep_update(&s, &c, 5.20, CI, 1, 0, &st) && !st);
+    /* off switch */
+    memset(&s, 0, sizeof(s));
+    c.on = 0;
+    CHECK(!vr_backstep_update(&s, &c, 6.00, CI, 1, 0, &st) && !st);
+    CHECK(!vr_backstep_update(&s, &c, 6.05, 0, 1, 0, &st));
+    /* lock-on: applied by default, skipped with in_lock = 0 */
+    c.on = 1;
+    memset(&s, 0, sizeof(s));
+    CHECK(vr_backstep_update(&s, &c, 7.00, CI, 1, 1, &st) && st);
+    c.in_lock = 0;
+    memset(&s, 0, sizeof(s));
+    CHECK(!vr_backstep_update(&s, &c, 8.00, CI, 1, 1, &st) && !st);
+    vr_backstep_update(&s, &c, 8.50, 0, 1, 1, &st);
+    CHECK(vr_backstep_update(&s, &c, 9.00, CI, 1, 0, &st) && st);
+}
+
+/* Backstep scale: its own key, and a stop guard that waits for the clip's root motion (a decaying speed is not a wall). */
+static void test_backstep_scale(void) {
+    float v = 0.0f;
+    CHECK(VR_BACKSTEP_SCALE_DEFAULT == 2.0f);
+    CHECK(vr_evade_parse_backstep("evade_scale=1.5 backstep_scale=2.5\n", &v) && v == 2.5f);
+    CHECK(vr_evade_parse_backstep("fp=1 backstep_scale=1.8", &v) && v == 1.8f);
+    CHECK(!vr_evade_parse_backstep("fp=1 evade_scale=1.5\n", &v) && !vr_evade_parse_backstep("xbackstep_scale=2\n", &v));
+    CHECK(vr_evade_parse("backstep_scale=3 evade_scale=1.25\n", &v) && v == 1.25f);
+    CHECK(!vr_evade_parse("backstep_scale=3\n", &v));
+    float dx, dz;
+    const float f[3] = {0.0f, 0.0f, 0.0f};
+    /* the backstep's own scale is used for 7000, the roll scale for 7200 */
+    VrEvade e;
+    vr_evade_reset(&e);
+    float z = 0.0f, given = 0.0f;
+    vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz);
+    z += 0.05f;
+    CHECK(vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz) && fabsf(dz - 0.05f) < 1e-4f); /* (2 - 1) * step */
+    vr_evade_reset(&e);
+    vr_evade_step(&e, 7200, f, 0.0f, 0.0f, 0.033f, 1.5f, 2.0f, &dx, &dz);
+    CHECK(vr_evade_step(&e, 7200, f, 0.0f, 0.1f, 0.033f, 1.5f, 2.0f, &dx, &dz) && fabsf(dz - 0.05f) < 1e-4f); /* (1.5 - 1) * step */
+    vr_evade_reset(&e);
+    CHECK(!vr_evade_step(&e, 7000, f, 0.0f, 0.0f, 0.033f, 1.5f, 0.0f, &dx, &dz));
+    CHECK(!vr_evade_step(&e, 7000, f, 0.0f, 0.1f, 0.033f, 1.5f, 0.0f, &dx, &dz) && !e.active); /* backstep scale off */
+    /* a decaying speed: each step 70% of the last (under the roll's 50% rule it would stop at once) down to the end of the motion */
+    vr_evade_reset(&e);
+    float step = 0.1f;
+    z = 0.0f;
+    vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz);
+    for (int i = 0; i < 12; ++i) {
+        z += step;
+        if (vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz)) { z += dz; given += dz; }
+        step *= 0.45f;
+        if (step < 0.012f) step = 0.012f;
+    }
+    CHECK(!e.stopped && given > 0.1f);
+    /* a wall: the step drops to nothing in one frame, the extra stops */
+    vr_evade_reset(&e);
+    z = 0.0f;
+    vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz);
+    for (int i = 0; i < 3; ++i) { z += 0.06f; if (vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz)) z += dz; }
+    CHECK(!vr_evade_step(&e, 7000, f, 0.0f, z + 0.001f, 0.033f, 1.5f, 2.0f, &dx, &dz) && e.stopped);
+    /* the roll keeps the 50% rule */
+    vr_evade_reset(&e);
+    z = 0.0f;
+    vr_evade_step(&e, 7200, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz);
+    z += 0.1f; if (vr_evade_step(&e, 7200, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz)) z += dz;
+    CHECK(!vr_evade_step(&e, 7200, f, 0.0f, z + 0.04f, 0.033f, 1.5f, 2.0f, &dx, &dz) && e.stopped);
+    /* the total stays under (kb - 1) * 2.48 m */
+    vr_evade_reset(&e);
+    z = 0.0f;
+    for (int i = 0; i < 80; ++i) { z += 0.04f; if (vr_evade_step(&e, 7000, f, 0.0f, z, 0.033f, 1.5f, 2.0f, &dx, &dz)) z += dz; }
+    CHECK(e.given <= 2.48f + 1e-3f);
+}
+
 int main(void) {
     test_filter_in_c();
     test_table();
@@ -258,6 +476,10 @@ int main(void) {
     test_settings();
     test_follow();
     test_strafe_step();
+    test_evade_scale();
+    test_evade_control();
+    test_backstep();
+    test_backstep_scale();
     if (failures) {
         printf("%d of %d checks failed\n", failures, checks);
         return 1;

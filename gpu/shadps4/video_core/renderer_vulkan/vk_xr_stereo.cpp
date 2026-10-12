@@ -51,8 +51,15 @@ XrStereo& XrStereo::Get() {
 }
 
 XrStereo::XrStereo() {
-    const char* mode = std::getenv("BB_XR_MODE");
-    enabled = mode && std::strcmp(mode, "alt") == 0;
+    const xrstereo::XrMode mode = xrstereo::ParseMode(std::getenv("BB_XR_MODE"));
+    enabled = mode == xrstereo::XrMode::Alt;
+    pair_enabled = mode == xrstereo::XrMode::Stereo;
+    if (pair_enabled) {
+        std::printf("VR stereo: true stereo (BB_XR_MODE=stereo): every finished frame goes to the "
+                    "headset as one pair of eye images with its render view; frames without a "
+                    "camera match are held, then shown on the flat screen\n");
+        return;
+    }
     if (!enabled) {
         return;
     }
@@ -81,12 +88,54 @@ XrStereo::Status XrStereo::GetStatus() {
 
 void XrStereo::SetCinema(bool on) {
     std::scoped_lock lock{mutex};
+    if (pair_enabled) {
+        if (pair_cinema != on) {
+            pair_cinema = on;
+            std::printf("VR stereo: %s\n", on ? "cutscene: frames go to the cinema screen"
+                                              : "cutscene over: pairs again once frames match");
+        }
+        return;
+    }
     if (pairing.Cinema() == on) {
         return;
     }
     pairing.SetCinema(on);
     std::printf("VR stereo: %s\n", on ? "cutscene: frames go to the cinema screen"
                                       : "cutscene over: eye frames again once the eyes match");
+}
+
+xrstereo::Kind XrStereo::OnPairFrame(bool matched) {
+    std::scoped_lock lock{mutex};
+    const bool was_mono = decider.Mono();
+    const xrstereo::Kind kind = decider.OnFrame(pair_cinema, matched);
+    if (decider.Mono() != was_mono) {
+        std::printf(decider.Mono() ? "VR stereo: no paired frames for a while (or a cutscene): "
+                                     "frames go to the flat screen\n"
+                                   : "VR stereo: paired frames again\n");
+    }
+    const double now = Seconds();
+    if (now >= pair_next_log) {
+        if (pair_next_log > 0.0) {
+            const u64 renderer = eye_r_renderer.load(), copy = eye_r_copy.load();
+            std::printf("VR stereo: %llu frames: %llu pairs, %llu held, %llu cutscene; eye R from "
+                        "the stereo renderer %llu, eye L's image again %llu\n",
+                        static_cast<unsigned long long>(decider.frames() - pair_logged.frames()),
+                        static_cast<unsigned long long>(decider.pairs() - pair_logged.pairs()),
+                        static_cast<unsigned long long>(decider.held() - pair_logged.held()),
+                        static_cast<unsigned long long>(decider.cinema() - pair_logged.cinema()),
+                        static_cast<unsigned long long>(renderer - eye_r_renderer_logged),
+                        static_cast<unsigned long long>(copy - eye_r_copy_logged));
+            eye_r_renderer_logged = renderer;
+            eye_r_copy_logged = copy;
+        }
+        pair_logged = decider;
+        pair_next_log = now + 10.0;
+    }
+    return kind;
+}
+
+void XrStereo::NoteEyeR(bool from_renderer) {
+    (from_renderer ? eye_r_renderer : eye_r_copy).fetch_add(1, std::memory_order_relaxed);
 }
 
 xrstereo::Decision XrStereo::OnFrame(const float* const* camera_views, const float* proj_x,

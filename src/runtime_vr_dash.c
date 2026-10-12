@@ -37,6 +37,7 @@
  *                             headset while the game runs; dash=0 switches it off live)
  */
 #define _GNU_SOURCE
+#include "vr_mem_cache.h"
 #include "vr_dash_game.h"
 #include "vr_dash_detect.h"
 #include <stdatomic.h>
@@ -180,17 +181,9 @@ static void vd_poll_control(double now) {
 static int vd_readable(uintptr_t a, size_t n) {
     if (a < 0x10000 || a + n < a) return 0;
 #ifdef _WIN32
-    uintptr_t at = a;
-    while (at < a + n) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((const void *)at, &mbi, sizeof(mbi))) return 0;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-            return 0;
-        at = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-    return 1;
+    /* page-probed reads with a per-thread cache (vr_mem_cache.h); this guard had no cache at all: a VirtualQuery per read */
+    static _Thread_local VmCache cache;
+    return vm_readable(&cache, a, n);
 #else
     static int fds[2] = {-1, -1};
     if (fds[0] < 0 && pipe(fds) != 0) return 0;

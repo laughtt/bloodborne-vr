@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stereo.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
@@ -168,6 +169,17 @@ public:
     u32 GetGpuCommandProcessorThreadId();
 #endif
 
+    /// VR hybrid stereo, at the flip of `display_buffer` (Presenter::PrepareFrame): eye R's final
+    /// image warped from the display buffer (texture-cache image `color_id`, or `raw_color` in
+    /// eGeneral) with the frame's depth and eye R's depth twin, for the presenter to sample with
+    /// `view_format` (eye L's view of the display buffer). None when the frame has no warp.
+    /// Both given (pre-SR DLSS-NR): the warp reads `raw_color` (the display buffer's processed
+    /// copy, eGeneral, the same bytes and size); `color_id` still names the display buffer.
+    std::optional<Stereo::EyeRImage> StereoWarpAtFlip(VAddr display_buffer,
+                                                      VideoCore::ImageId color_id,
+                                                      vk::Image raw_color, u32 width, u32 height,
+                                                      vk::Format view_format);
+
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
@@ -312,7 +324,7 @@ private:
     void ResetBindings(bool is_compute);
 
     /// bbport: VR Phase 4 prototype (vk_stereo.cpp); no-ops unless BB_XR_MODE=stereo.
-    void StereoBeginDraw(const GraphicsPipeline* pipeline);
+    void StereoBeginDraw(const GraphicsPipeline* pipeline, bool indirect = false);
     void StereoAfterDraw(const GraphicsPipeline* pipeline, const RenderState& state,
                          bool is_indexed, u32 num_indices, u32 num_instances, u32 first_vertex,
                          u32 first_instance);
@@ -321,6 +333,28 @@ private:
     void StereoAfterDispatch(const Shader::Info& cs);
     /// VR Phase 4 (P4.3): before a draw's commands; a doubled pass starts its capture here.
     void StereoBeforeEmit(const GraphicsPipeline* pipeline, const RenderState& state);
+    /// VR Phase 4 (P4.4 slice 3): after a dispatch's resources are bound, before its commands:
+    /// a dispatch reading twins is captured here (the write policy decides) and executed again
+    /// for eye R in StereoAfterDispatch.
+    void StereoBeginDispatch(const ComputePipeline* pipeline);
+    /// The (guest -> twin) descriptor pairs of the draw or dispatch just bound; returns false
+    /// when the bound resources include no twin of this frame.
+    bool StereoCollectSubstitutes(bool graphics);
+    /// VR full stereo (findings/31 section 10): the region doubled to the display pass is over
+    /// (eye R's display pass recorded, its final image handed to the flip).
+    void FinishFullRegion();
+    /// Full stereo: eye R's version of a guest image copy (between the twins); false when the
+    /// copy is not redone (the target's twins are then stale: eye R reads eye L's copy).
+    bool StereoRedoCopy(VideoCore::ImageId src_id, VideoCore::ImageId dst_id);
+    /// After a compute image copy (IsComputeImageCopy) and a compute image clear.
+    void StereoAfterImageCopy(VideoCore::ImageId src_id, VideoCore::ImageId dst_id);
+    void StereoAfterImageClear(VideoCore::ImageId id);
+    /// After an indirect draw of a doubled pass: the write guard (its shaders must not write
+    /// memory, or the pass gets no eye R), as StereoAfterDraw for direct draws.
+    void StereoAfterIndirectDraw(const GraphicsPipeline* pipeline);
+    /// Diagnostics at a flip (BB_STEREO_PROBE_SECONDS, default 10): eye L's display buffer and
+    /// eye R's image mean colour, the game's exposure image, the VRAM budget.
+    void StereoProbe(VideoCore::ImageId color_id, u32 width, u32 height);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -495,6 +529,9 @@ private:
         u32 size;
         u64 offset; ///< in the ring
         VAddr address;
+        /// Stereo (an 864-byte block, parsed by stage A): Stereo::ParseSceneConstants's values.
+        std::array<float, 3> scene;
+        u32 scene_valid;
     };
     struct PendingWrite {
         VAddr begin;

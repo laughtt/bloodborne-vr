@@ -69,6 +69,16 @@ public:
         bool hdr;
         bool flat_temporal; ///< the flat upscaler jitters the scene
         u32 out_width, out_height; ///< the frame (eye image) size
+        /// True stereo (BB_XR_MODE=stereo): eye L of a pair, `eye_m` metres along the camera's
+        /// x axis (the hybrid warp's eye L offset; 0 without one). Its camera, motion vectors and
+        /// history are eye L's; RunEyeR then evaluates eye R of the same frame.
+        bool pair = false;
+        float eye_m = 0.0f;
+        /// Pre-SR DLSS-NR (vk_xr_dlssnr.h): the colour DLSS reads instead of the display buffer
+        /// (its processed copy: the same size and bytes, eGeneral, mutable format), or null.
+        vk::Image color_override{};
+        /// Start every DLSS history over (DLSS's input changed kind: pre-SR DLSS-NR toggled).
+        bool reset_history = false;
     };
     struct Result {
         vk::ImageView view;     ///< the DLSS output (ShaderReadOnlyOptimal), or null
@@ -78,6 +88,22 @@ public:
     };
     /// Every PrepareFrame while VR DLSS is asked for (or was): records DLSS into `cmdbuf`.
     Result Run(vk::CommandBuffer cmdbuf, const Input& input);
+
+    /// True stereo, eye R of the frame whose eye L Run just evaluated (docs/vr/findings/31
+    /// section 9.8): its own feature (slot 2) and history, colour = the hybrid warp's eye R
+    /// (render size, eGeneral, the display buffer's bytes), depth = eye R's G-buffer depth twin
+    /// (eGeneral), camera = eye L's moved to `eye_m`, the same jitter as eye L. No view in the
+    /// result: eye R keeps FSR 1 this frame (eye L not evaluated, inputs unusable, or eye R's
+    /// feature could not be created: logged once, FSR 1 until DLSS is toggled).
+    struct EyeRInput {
+        vk::Image color;
+        u32 width, height;
+        vk::Image depth;
+        vk::Format depth_format;
+        u32 depth_width, depth_height;
+        float eye_m; ///< eye R's offset along the camera's x axis (metres)
+    };
+    Result RunEyeR(vk::CommandBuffer cmdbuf, const EyeRInput& input);
 
 private:
     struct Impl;

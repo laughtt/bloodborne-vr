@@ -10,7 +10,10 @@
 //   - a frame whose first scene camera is another view (sewers) pairs by its other cameras;
 //   - a cutscene reported by the host sends every frame to the mono path (cinema) at once;
 //   - the bridge shows the eyes only when both have an image newer than the latest mono one;
-//   - the age statistics of the pacing log.
+//   - the age statistics of the pacing log;
+//   - true stereo (BB_XR_MODE=stereo, findings/31): the mode words, both eyes' layer poses from
+//     one snapshot, pair atomicity, the hold/flat decision, the release -> display latency and
+//     the display time the host asks views for (GetViewsAt).
 // Exit code 0 when every check passes.
 
 #include <cmath>
@@ -477,6 +480,217 @@ void TestAges() {
     std::printf("PASS ages at 72 FPS / 72 Hz: each eye 0 or 1 display frame old\n");
 }
 
+// ---- true stereo (BB_XR_MODE=stereo) -----------------------------------------------------------
+
+/// A unit quaternion for a rotation of `angle` radians about the unit axis (x, y, z).
+void AxisAngle(float x, float y, float z, float angle, float q[4]) {
+    const float s = std::sin(0.5f * angle);
+    q[0] = x * s;
+    q[1] = y * s;
+    q[2] = z * s;
+    q[3] = std::cos(0.5f * angle);
+}
+
+float Dist(const float a[3], const float b[3]) {
+    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) +
+                     (a[2] - b[2]) * (a[2] - b[2]));
+}
+
+void TestModeParse() {
+    CHECK(ParseMode(nullptr) == XrMode::Cinema);
+    CHECK(ParseMode("") == XrMode::Cinema);
+    CHECK(ParseMode("mono") == XrMode::Mono);
+    CHECK(ParseMode("alt") == XrMode::Alt);
+    CHECK(ParseMode("stereo") == XrMode::Stereo);
+    CHECK(ParseMode("Stereo") == XrMode::Cinema); // exact words, as the bridge always compared
+    CHECK(ParseMode("stereo2") == XrMode::Cinema);
+    CHECK(ParseMode("cinema") == XrMode::Cinema);
+    std::printf("PASS mode parsing: mono, alt, stereo; anything else the cinema screen\n");
+}
+
+void TestPairPoses() {
+    // One snapshot: the head at (1, 1.6, -2) turned 90 deg to the left (about +Y), the eyes 64 mm
+    // apart in the head's frame, the right eye 2 mm forward (a canted display).
+    PairView v;
+    v.has_eye_offset = true;
+    v.head_position[0] = 1.0f;
+    v.head_position[1] = 1.6f;
+    v.head_position[2] = -2.0f;
+    AxisAngle(0, 1, 0, 1.5707963f, v.head_orientation);
+    v.eye_offset[0][0] = -0.032f;
+    v.eye_offset[1][0] = 0.032f;
+    v.eye_offset[1][2] = -0.002f;
+    float pos[2][3], q[4];
+    CHECK(PairEyePoses(v, pos, q));
+    // Turned 90 deg left, the head's +X (right) points to world -Z: the right eye is 32 mm toward
+    // -Z of the head and 2 mm toward its forward (-Z rotated to -X).
+    CHECK(std::fabs(pos[1][2] - (-2.0f - 0.032f)) < 1e-5f);
+    CHECK(std::fabs(pos[1][0] - (1.0f - 0.002f)) < 1e-5f);
+    CHECK(std::fabs(pos[0][2] - (-2.0f + 0.032f)) < 1e-5f);
+    CHECK(std::fabs(pos[0][1] - 1.6f) < 1e-6f && std::fabs(pos[1][1] - 1.6f) < 1e-6f);
+    // Both eyes carry the head's orientation (the image was rendered along the head's axes).
+    for (int i = 0; i < 4; ++i) {
+        CHECK(q[i] == v.head_orientation[i]);
+    }
+    // The baseline is the snapshot's own, whatever the head does.
+    const float baseline = Dist(pos[0], pos[1]);
+    CHECK(std::fabs(baseline - std::sqrt(0.064f * 0.064f + 0.002f * 0.002f)) < 1e-5f);
+    for (int k = 0; k < 8; ++k) {
+        const float n = std::sqrt(14.0f); // the axis (1, 2, 3), unit
+        AxisAngle(1.0f / n, 2.0f / n, 3.0f / n, 0.7f * float(k), v.head_orientation);
+        float p2[2][3], q2[4];
+        CHECK(PairEyePoses(v, p2, q2));
+        CHECK(std::fabs(Dist(p2[0], p2[1]) - baseline) < 1e-5f);
+        // The midpoint of the eyes is a fixed distance from the head (the 1 mm of z).
+        float mid[3];
+        for (int i = 0; i < 3; ++i) {
+            mid[i] = 0.5f * (p2[0][i] + p2[1][i]);
+        }
+        CHECK(std::fabs(Dist(mid, v.head_position) - 0.001f) < 1e-5f);
+    }
+    // No offsets (flat tests, fake head): no pose; the bridge uses the views current at release.
+    PairView fake;
+    CHECK(!PairEyePoses(fake, pos, q));
+    std::printf("PASS pair poses: head orientation, positions = head + rotated offsets, one "
+                "baseline of %.1f mm\n",
+                baseline * 1000.0f);
+}
+
+void TestPairAtomic() {
+    // The projection layer shows a pair only when both eyes have an image newer than the latest
+    // flat one, and a pair release moves both eyes' counters together: a display frame never sees
+    // one new eye next to an old one (the frame loop reads under the same lock as ReleasePair).
+    AltEyes e;
+    CHECK(!e.Showing(1.0, 1.0));
+    e.ReleasePair(1.0);
+    CHECK(e.valid[0] && e.valid[1] && e.released[0] == 1 && e.released[1] == 1);
+    CHECK(e.released_at[0] == e.released_at[1]);
+    CHECK(e.Showing(1.1, 1.0));
+    AgeStats ages;
+    for (int n = 0; n < 200; ++n) {
+        e.ReleasePair(2.0 + n * 0.014);
+        CHECK(e.released[0] == e.released[1]);
+        ages.Frame(e.released);
+    }
+    CHECK(ages.window.one_fresh == 0 && ages.window.both_stale == 0);
+    CHECK(ages.window.both_fresh == 200);
+    // A flat frame (menu, loading) invalidates the pair until the next pair.
+    e.ReleaseFlat(10.0);
+    CHECK(!e.Showing(10.1, 1.0));
+    e.ReleasePair(10.2);
+    CHECK(e.Showing(10.3, 1.0));
+    // Stale pairs stop showing (the host went away).
+    CHECK(!e.Showing(12.0, 1.0));
+    // A half release (an acquire failed) is a single ReleaseEye: after a flat frame it shows only
+    // once the other eye has an image too.
+    e.ReleaseFlat(20.0);
+    e.ReleaseEye(0, 20.1);
+    CHECK(!e.Showing(20.2, 1.0));
+    e.ReleaseEye(1, 20.3);
+    CHECK(e.Showing(20.4, 1.0));
+    std::printf("PASS pair atomicity: counters move together (200 pairs, 0 one-eye frames), flat "
+                "frames invalidate the pair\n");
+}
+
+void TestPairDecider() {
+    PairDecider d(30);
+    CHECK(d.OnFrame(false, true) == Kind::Eye);
+    // Frames that match no render view are held, 29 of them, then the flat screen.
+    for (int i = 0; i < 29; ++i) {
+        CHECK(d.OnFrame(false, false) == Kind::Hold);
+    }
+    CHECK(d.OnFrame(false, false) == Kind::Mono);
+    CHECK(d.OnFrame(false, false) == Kind::Mono); // stays flat while nothing matches
+    CHECK(d.Mono());
+    CHECK(d.OnFrame(false, true) == Kind::Eye);   // a match brings the pair back at once
+    CHECK(!d.Mono());
+    CHECK(d.OnFrame(false, false) == Kind::Hold); // the hold counter restarted
+    // A cutscene goes flat at once, even for frames that match.
+    CHECK(d.OnFrame(true, true) == Kind::Mono);
+    CHECK(d.OnFrame(true, false) == Kind::Mono);
+    CHECK(d.OnFrame(false, false) == Kind::Mono); // no match after the cutscene: still flat
+    CHECK(d.OnFrame(false, true) == Kind::Eye);
+    CHECK(d.cinema() == 2 && d.pairs() == 3);
+    CHECK(d.frames() == 38 && d.held() == 33);
+    std::printf("PASS pair decider: held 29 frames, then flat; a match or the end of a cutscene "
+                "brings the pair back\n");
+}
+
+void TestLatencyTracker() {
+    constexpr int64_t kPeriod = 13'888'889; // 72 Hz
+    LatencyTracker t;
+    CHECK(!t.Valid() && t.Periods() == 0.0);
+    // The pipeline: a pair released 2.0 periods before the display time of the frame showing it.
+    for (int i = 0; i < 7; ++i) {
+        t.Shown(1'000'000'000 + i * kPeriod, 1'000'000'000 + i * kPeriod + 2 * kPeriod, kPeriod);
+    }
+    CHECK(!t.Valid());
+    t.Shown(2'000'000'000, 2'000'000'000 + 2 * kPeriod, kPeriod);
+    CHECK(t.Valid() && std::fabs(t.Periods() - 2.0) < 1e-9 && t.PeriodNs() == kPeriod);
+    // Smoothed: one 3-period sample moves the mean by a tenth of the difference.
+    t.Shown(3'000'000'000, 3'000'000'000 + 3 * kPeriod, kPeriod);
+    CHECK(std::fabs(t.Periods() - 2.1) < 1e-9);
+    // Converges to a new level.
+    for (int i = 0; i < 100; ++i) {
+        t.Shown(4'000'000'000, 4'000'000'000 + int64_t(1.5 * double(kPeriod)), kPeriod);
+    }
+    CHECK(std::fabs(t.Periods() - 1.5) < 1e-3);
+    // Stalls and bad data are not samples: a display time before the release, more than 8 periods,
+    // no release time, no period.
+    const uint64_t n = t.samples();
+    t.Shown(5'000'000'000, 5'000'000'000 - 1, kPeriod);
+    t.Shown(5'000'000'000, 5'000'000'000 + 9 * kPeriod, kPeriod);
+    t.Shown(0, 5'000'000'000, kPeriod);
+    t.Shown(5'000'000'000, 5'000'000'000 + kPeriod, 0);
+    CHECK(t.samples() == n && t.rejected() == 2);
+    CHECK(std::fabs(t.Periods() - 1.5) < 1e-3);
+    std::printf("PASS latency tracker: %.3f periods after 100 samples, stalls rejected\n",
+                t.Periods());
+}
+
+void TestPredictDisplayTime() {
+    constexpr int64_t kPeriod = 13'888'889;
+    const int64_t now = 5'000'000'000;
+    // now + the host's 8 ms (camera -> release) + 2 display periods (release -> display).
+    CHECK(PredictDisplayTime(now, 8'000'000, 2.0, kPeriod) == now + 8'000'000 + 2 * kPeriod);
+    CHECK(PredictDisplayTime(now, 0, 1.5, kPeriod) == now + int64_t(1.5 * double(kPeriod)));
+    // A host time below zero (a clock hiccup) counts as zero.
+    CHECK(PredictDisplayTime(now, -5, 2.0, kPeriod) == now + 2 * kPeriod);
+    // Never more than 8 periods ahead, never in the past.
+    CHECK(PredictDisplayTime(now, 0, 50.0, kPeriod) == now + 8 * kPeriod);
+    CHECK(PredictDisplayTime(now, 2'000'000'000, 2.0, kPeriod) == now + 8 * kPeriod);
+    CHECK(PredictDisplayTime(now, 0, 0.0, kPeriod) == now);
+    // No XrTime now (the runtime cannot convert), no period or a nonsense latency: 0, the host
+    // keeps the views of GetViews.
+    CHECK(PredictDisplayTime(0, 8'000'000, 2.0, kPeriod) == 0);
+    CHECK(PredictDisplayTime(now, 8'000'000, 2.0, 0) == 0);
+    CHECK(PredictDisplayTime(now, 8'000'000, -1.0, kPeriod) == 0);
+    CHECK(PredictDisplayTime(now, 8'000'000, std::nan(""), kPeriod) == 0);
+    // End to end with a simulated frame loop (72 Hz, the runtime predicts 2 periods ahead of the
+    // wait): the host releases 6 ms after the frame loop's wait returned, the loop shows the pair
+    // in its next frame; the tracker measures it, and a request made at the time a camera is set
+    // up lands where the image of that camera will be displayed.
+    LatencyTracker t;
+    const int64_t lead = 2 * kPeriod;         // display time - XrTime at the wait
+    const int64_t release_offset = 6'000'000; // the host releases this long after the wait
+    for (int frame = 0; frame < 50; ++frame) {
+        const int64_t wait_xr = 1'000'000'000 + frame * kPeriod;
+        t.Shown(wait_xr + release_offset, wait_xr + kPeriod + lead, kPeriod);
+    }
+    CHECK(t.Valid());
+    const double expected = double(kPeriod + lead - release_offset) / double(kPeriod);
+    CHECK(std::fabs(t.Periods() - expected) < 1e-9);
+    // The camera is set up 5 ms before its release, which is 6 ms after a wait: the image is shown
+    // at the next frame's display time, wait + 1 period + lead.
+    const int64_t wait_xr = 1'000'000'000 + 20 * kPeriod;
+    const int64_t camera_xr = wait_xr + release_offset - 5'000'000;
+    const int64_t asked = PredictDisplayTime(camera_xr, 5'000'000, t.Periods(), kPeriod);
+    CHECK(std::llabs(asked - (wait_xr + kPeriod + lead)) < 1000);
+    std::printf("PASS display-time prediction: %.3f periods release to display, asks %.2f ms "
+                "ahead of the camera\n",
+                t.Periods(), double(asked - camera_xr) * 1e-6);
+}
+
 } // namespace
 
 int main() {
@@ -492,6 +706,12 @@ int main() {
     TestCinema();
     TestAltEyes();
     TestAges();
+    TestModeParse();
+    TestPairPoses();
+    TestPairAtomic();
+    TestPairDecider();
+    TestLatencyTracker();
+    TestPredictDisplayTime();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

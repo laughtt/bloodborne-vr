@@ -34,6 +34,7 @@
 
 #include "bbport_xr_bridge.h"
 #include "sandbox3d/combat_hud.h"
+#include "sandbox3d/hud_bars.h"
 #include "sandbox3d/ui.h"
 #include "vr_ui_filter.h"
 #include "vr_game_hitbox.h"
@@ -113,6 +114,7 @@ public:
     /// quad, which would cover the item at the grip).
     int HeldHandForMarker() const { return held_marker_hand.load(std::memory_order_relaxed); }
     const sb::SwingReadout& Readout() const { return readout; }
+    const sb::bars::Colors& BarColors() const { return bar_colors; }
     sb::UiSystem& Menus() { return menus; }
     bool Active() const { return active; }
     bool HudVisible() const { return hud_visible; }
@@ -174,6 +176,9 @@ private:
     bool hud_gpu_ready = false;
     sb::UiCanvas hud_canvas{nullptr, &hud_font};
     sb::SwingReadout readout;
+    sb::bars::Colors bar_colors; // the wrist bars' colours (layout, env, control file)
+    double bar_colors_at = -1e9;
+    void RefreshBarColors(std::string& log);
     bool hud_visible = false;
     double last_activity = -1e9;
 

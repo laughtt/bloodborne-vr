@@ -158,7 +158,7 @@ const char* const kDefaultLayout = R"JSON({
     "debug_gun_ray": false, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
     "debug_hitboxes": {"weapon": false, "attack": false, "enemies": false, "self": false, "hits": false,
                        "line_mrad": 1.5, "idle_alpha": 0.6},
-    "hud": {"on": true, "head": false, "wrist": true, "bar": "always", "distance": 0.9,
+    "hud": {"on": true, "head": false, "wrist": true, "bar": "always", "hp_color": "green", "stamina_color": "green", "distance": 0.9,
             "down_deg": 24, "scale": 1.0, "wrist_scale": 0.7, "wrist_offset": [0.0, 0.08, 0.0],
             "label_s": 1.6},
     "haptics": {"tick_light": [0.2, 0.025], "tick_heavy": [0.4, 0.035], "hit_light": [0.6, 0.06],
@@ -555,6 +555,8 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
         Read(h["head"], game.hud_head);
         Read(h["wrist"], game.hud_wrist);
         Read(h["bar"], game.bar);
+        Read(h["hp_color"], game.hp_color);
+        Read(h["stamina_color"], game.stamina_color);
         Read(h["distance"], game.hud_distance);
         Read(h["down_deg"], game.hud_down_deg);
         Read(h["scale"], game.hud_scale);

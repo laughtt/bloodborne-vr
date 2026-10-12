@@ -20,6 +20,7 @@ extern "C" {
 // ABI 3: BbDlssEvaluate gets a bias_mask image at the end (NGX "bias current colour mask": 1 = trust the
 // current frame, e.g. first-person arms that move with the hands while the motion vectors are
 // camera-only). A null view leaves it out, as in ABI 2 and for the flat game.
+// DLSS-NR is a separate export (BbDlssGetNrApi, below) and leaves this ABI as it is.
 #define BBPORT_DLSS_BRIDGE_ABI 3
 #define BBPORT_DLSS_BRIDGE_SLOTS 4
 
@@ -85,6 +86,46 @@ typedef struct BbDlssApi {
 } BbDlssApi;
 
 typedef const BbDlssApi* (*BbDlssGetApiFn)(void);
+
+// DLSS-NR (neural rendering, docs/vr/findings/42-dlss-nr.md): NVIDIA's experimental
+// nvngx_dlssnr.dll, which the player puts next to bb-probe.exe (never shipped). Its own export
+// (BbDlssGetNrApi) rather than an ABI 4: exes that know ABI 1-3 keep loading this bridge, and an
+// exe without DLSS-NR support simply never asks for it. Calls after BbDlssApi::Initialize.
+#define BBPORT_DLSS_NR_ABI 1
+#define BBPORT_DLSS_NR_SLOTS 6
+
+typedef struct BbDlssRect {
+    uint32_t x, y, width, height;
+} BbDlssRect;
+
+typedef struct BbDlssNrEvaluate {
+    BbDlssImage color;  // sampled, display-referred (tonemapped) colour
+    BbDlssImage output; // storage, general layout
+    BbDlssRect color_rect;
+    BbDlssRect output_rect;
+    int32_t reset;
+    int32_t style; // 0..2
+    float intensity;
+    float local_tone;
+    float local_structure;
+    float skin_structure;
+} BbDlssNrEvaluate;
+
+typedef struct BbDlssNrApi {
+    uint32_t abi;
+    // Loads nvngx_dlssnr.dll from the Configure directory and initialises it on the device given to
+    // Initialize. 1 = ready. Tried once; later calls return the first result.
+    int32_t (*Initialize)(void);
+    // A feature per slot (0 .. BBPORT_DLSS_NR_SLOTS - 1), each with its own history, for regions
+    // up to width x height.
+    int32_t (*CreateFeature)(uint32_t slot, VkCommandBuffer command, uint32_t width,
+                             uint32_t height);
+    int32_t (*Evaluate)(uint32_t slot, VkCommandBuffer command, const BbDlssNrEvaluate* evaluate);
+    // The caller must have waited for the GPU work that used the feature.
+    void (*ReleaseFeature)(uint32_t slot);
+} BbDlssNrApi;
+
+typedef const BbDlssNrApi* (*BbDlssGetNrApiFn)(void);
 
 #ifdef __cplusplus
 }

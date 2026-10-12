@@ -10,12 +10,16 @@
 // its log, the trace and the frame-dump tags are what the flat test (tools/vr_stereo_test.py)
 // checks.
 //
+// True stereo (BB_XR_MODE=stereo, findings/31 "P4.6a hand-off"): no eye schedule. The frame is paired
+// with its one render view (Xr::MatchRenderView), PairDecider holds or flats the frames that match
+// none, and the present thread hands both eye images to the bridge as one pair (Xr::ReleaseEyes).
 // Environment: BB_XR_MODE=alt turns it on; BB_VR_STEREO_LOG=1 a 10 s summary (always on with alt
 // while a headset is used); BB_VR_STEREO_TRACE=<csv> one line per finished frame.
 
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 
@@ -32,6 +36,17 @@ public:
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
     }
+    /// BB_XR_MODE=stereo: both eyes of every frame as one pair.
+    [[nodiscard]] bool PairEnabled() const noexcept {
+        return pair_enabled;
+    }
+
+    /// True stereo: a finished frame at its flip (GPU thread). `matched`: its scene camera matched
+    /// a render view. Pair = both eyes, Hold = both keep their images, Mono = the flat screen.
+    xrstereo::Kind OnPairFrame(bool matched);
+    /// True stereo, at present: eye R's image came from the stereo renderer (true) or is eye L's
+    /// image again (false). Counted for the 10 s line.
+    void NoteEyeR(bool from_renderer);
 
     /// The camera hook set up a frame for an eye (game thread).
     void Add(const xrstereo::EyeView& view);
@@ -60,9 +75,16 @@ private:
     void LogWindow();
 
     bool enabled = false;
+    bool pair_enabled = false;
     bool log = false;
     std::mutex mutex;
     xrstereo::Pairing pairing;
+    xrstereo::PairDecider decider;
+    bool pair_cinema = false;
+    double pair_next_log = 0.0;
+    xrstereo::PairDecider pair_logged{};
+    std::atomic<u64> eye_r_renderer{0}, eye_r_copy{0};
+    u64 eye_r_renderer_logged = 0, eye_r_copy_logged = 0;
     std::FILE* trace = nullptr;
     // The 10 s summary (GPU thread only, under mutex).
     double next_log = 0.0;

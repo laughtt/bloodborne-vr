@@ -54,6 +54,10 @@ struct ImageView {
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+    // bbport (VR stereo P4.4 slice 3): what the view was created with, to match a twin's view.
+    vk::Format vk_format{};
+    vk::ImageAspectFlags vk_aspect{};
+    vk::ImageViewType vk_type{};
 };
 
 } // namespace VideoCore

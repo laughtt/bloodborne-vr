@@ -138,6 +138,7 @@ public:
         vk::Format format; ///< the game target's (RGBA8 UNORM, sRGB-encoded values)
         u32 width, height;
         bool fullscreen;   ///< the UI covers the screen (loading screens, full-screen menus)
+        u32 activity;      ///< lit probes outside the always-on HUD zones (xr_hud_center.h)
     };
     /// The UI of the frame the latest display pass copied, when it was separated.
     bool LatestHud(Hud& hud);
@@ -156,6 +157,7 @@ private:
     vk::Format hud_format = vk::Format::eUndefined;
     UiComposition::FullScreenLatch hud_latch; ///< under hud_mutex
     bool hud_fullscreen = false;              ///< under hud_mutex
+    u32 hud_activity = 0;                     ///< under hud_mutex
     std::atomic<u32> hud_probes_pending{0};
 
     /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers

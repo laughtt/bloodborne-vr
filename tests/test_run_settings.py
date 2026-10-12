@@ -95,6 +95,8 @@ class RestartResolutionTests(unittest.TestCase):
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=auto\n', caps=0)[0]['BB_RENDER_RES'],
                          '854x480')
 
+    @unittest.skipIf(os.name == 'nt', 'emulates the Linux AppImage PATH with symlinked coreutils (MSYS ones do not run '
+                                      'through a Windows symlink)')
     def test_live_resolution_without_sed_or_grep(self):
         # A missing sed ended run.sh (exit 127) before the game in the AppImage on NixOS.
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=0\n', caps=1,

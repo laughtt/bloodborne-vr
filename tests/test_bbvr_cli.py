@@ -67,7 +67,7 @@ class CliTests(unittest.TestCase):
         for name in ('Default', 'Comfort', 'Performance', 'Quality (DLSS)'):
             self.assertIn(name, st['profiles'])  # the Play tab shows one card per profile, with its note
             self.assertTrue(st['profile_notes'][name])
-        self.assertEqual(st['values']['mode'], 'alt')  # the View toggle: 3D (alt) by default
+        self.assertEqual(st['values']['mode'], 'stereo')  # the render mode: Stereo by default
         self.assertIn('rtx', st['caps']['gpus'][0] if st['caps']['gpus'] else {'rtx': False})
         # Performance: a plain profile pick
         st = bbvr_cli.run(['save'], json.dumps({'profile': 'Performance'}))
@@ -84,8 +84,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(S.build_launch(S.effective_values(S.load_settings(self.port / 'user' / 'bbvr_settings.json')),
                                         bbvr_cli.make_menu()[0].paths, {})['env']['BB_XR_MODE'], 'mono')
         # back to 3D
-        vals['mode'] = 'alt'
-        self.assertEqual(bbvr_cli.run(['save'], json.dumps({'values': vals}))['values']['mode'], 'alt')
+        vals['mode'] = 'stereo'
+        self.assertEqual(bbvr_cli.run(['save'], json.dumps({'values': vals}))['values']['mode'], 'stereo')
+
+    def test_play_tab_display_size(self):
+        # Auto reads the last session's log in the data dir (no game start); the choice keeps the profile
+        logs = self.port / 'logs'
+        logs.mkdir()
+        (logs / 'bbvr-20261011-101704.log').write_text(
+            'VR: runtime Oculus 1.110.0\nVR: headset Meta Quest 3, max swapchain 8192x8192\n'
+            'VR: eye images: recommended 2064x2208 and 2064x2208, max 8192x8192\n', encoding='utf-8')
+        caps = S.detect_all(self.port, data=self.port)
+        caps['runtimes'] = {'active': None, 'runtimes': [], 'warnings': []}
+        caps['headset'] = S.detect_headset(caps['runtimes'], logs)
+        with mock.patch.object(S, 'detect_all', return_value=caps):
+            st = bbvr_cli.run(['state'])
+            self.assertEqual(st['values']['display_size'], 'auto')
+            self.assertEqual(st['display']['detected']['name'], 'Meta Quest 3')
+            self.assertEqual(st['display']['detected']['source'], 'log')
+            self.assertTrue(st['display']['sizes']['eye'])
+            vals = dict(st['values'], display_size='quest2')
+            st = bbvr_cli.run(['save'], json.dumps({'values': vals}))
+            self.assertEqual(st['profile'], 'Default')
+            self.assertEqual(st['values']['display_size'], 'quest2')
+            env = bbvr_cli.profile_env('Performance', caps)['env']
+            self.assertIn('BB_RENDER_RES', env)  # Quest 2 at 70%: a smaller render size, the headset choice kept
+            self.assertEqual(S.load_settings(self.port / 'user' / 'bbvr_settings.json')['hw'], {'display_size': 'quest2'})
 
     def test_game_dir_needs_eboot_and_accept_is_remembered(self):
         game = self.port / 'dump'

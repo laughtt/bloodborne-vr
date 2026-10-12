@@ -716,10 +716,22 @@ public:
         return data;
     }
 
-    void Execute(vk::CommandBuffer cmdbuf) const {
+    /// `eye_r` (P4.4 slice 3): commands that carry eye R's descriptors (Pipeline::BindResources
+    /// in a capture) use them while ExecutingEyeR() is true.
+    void Execute(vk::CommandBuffer cmdbuf, bool eye_r = false) const {
+        const BbStats::PerfScope perf{eye_r ? BbStats::PerfArenaEyeR : BbStats::PerfArenaEyeL};
+        const bool saved = executing_eye_r;
+        executing_eye_r = eye_r;
         for (const auto& chunk : chunks) {
             chunk->ExecuteKeep(cmdbuf);
         }
+        executing_eye_r = saved;
+    }
+
+    /// True while an arena is being executed for eye R on this thread (only commands recorded
+    /// into an arena ever ask).
+    [[nodiscard]] static bool ExecutingEyeR() noexcept {
+        return executing_eye_r;
     }
 
     [[nodiscard]] size_t Commands() const noexcept {
@@ -729,6 +741,7 @@ public:
 private:
     std::vector<std::unique_ptr<RecordChunk>> chunks;
     size_t commands = 0;
+    static inline thread_local bool executing_eye_r = false;
 };
 
 class Scheduler {
@@ -964,6 +977,12 @@ public:
     using CaptureEnd = std::function<void(std::shared_ptr<RecordArena>, bool complete)>;
     bool BeginCapture(std::shared_ptr<RecordArena> arena, CaptureEnd on_end);
 
+    /// bbport (P4.4 slice 3): the same around a dispatch's commands, outside render passes.
+    /// EndCapture() finishes it (`on_end(arena, true)`); a direct CommandBuffer() call or a
+    /// BeginRendering() while it is open finishes it incomplete.
+    bool BeginComputeCapture(std::shared_ptr<RecordArena> arena, CaptureEnd on_end);
+    void EndCapture();
+
     [[nodiscard]] bool IsCapturing() const noexcept {
         return capture != nullptr;
     }
@@ -1037,6 +1056,7 @@ private:
     bool recording_threaded{false};
     // bbport: VR Phase 4 stereo capture (BeginCapture)
     RecordArena* capture{};
+    bool capture_pass = false; ///< the capture ends with its render pass (else: EndCapture)
     std::shared_ptr<RecordArena> capture_arena;
     CaptureEnd capture_end;
     std::jthread recorder_thread;

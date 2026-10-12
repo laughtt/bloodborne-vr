@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <xxhash.h>
+
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -12,10 +17,39 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
-static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
+// bbport 8: binaries keyed with the version and stored only with their meta (stereo
+// permutations with their own Info had overwritten other permutations' binaries).
+static constexpr u32 ShaderBinaryVersion = 8u;
+static constexpr u32 ShaderMetaVersion = 8u;
+// bbport 6: each stage's meta fingerprint follows the key (a pipeline is loaded only with the
+// permutations it was built from).
+static constexpr u32 PipelineKeyVersion = 6u;
 } // namespace Serialization
+
+namespace {
+// bbport: permutation hashes are positional (program hash, permutation index), so the meta stored
+// under one can describe another permutation than when a pipeline referencing it was saved (an
+// index taken by another permutation in a later session). Each pipeline therefore stores the
+// fingerprint of its stages' metas, checked at load.
+std::mutex fingerprint_mutex;
+std::unordered_map<u64, u64> meta_fingerprints; ///< permutation hash -> XXH3 of its meta bytes
+
+u64 Fingerprint(const std::vector<u8>& bytes) {
+    const u64 h = XXH3_64bits(bytes.data(), bytes.size());
+    return h ? h : 1; // 0 means unknown
+}
+
+void NoteFingerprint(u64 perm_hash, u64 fingerprint) {
+    std::scoped_lock lock{fingerprint_mutex};
+    meta_fingerprints[perm_hash] = fingerprint;
+}
+
+u64 KnownFingerprint(u64 perm_hash) {
+    std::scoped_lock lock{fingerprint_mutex};
+    const auto it = meta_fingerprints.find(perm_hash);
+    return it == meta_fingerprints.end() ? 0 : it->second;
+}
+} // namespace
 
 namespace Vulkan {
 
@@ -33,6 +67,7 @@ void RegisterPipelineData(const ComputePipelineKey& key,
 
     key.Serialize(ar);
     sdata.Serialize(ar);
+    pldata.Write(KnownFingerprint(key.value));
 
     Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                        fmt::format("c_{:#018x}", key.value), ar.TakeOff());
@@ -52,6 +87,9 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
     key.Serialize(ar);
     sdata.Serialize(ar);
+    for (const u64 stage_hash : key.stage_hashes) {
+        pldata.Write(stage_hash ? KnownFingerprint(stage_hash) : u64{0});
+    }
 
     Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
@@ -77,8 +115,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     spec.Serialize(ar);
     info.Serialize(ar);
 
+    auto bytes = ar.TakeOff();
+    NoteFingerprint(perm_hash, Fingerprint(bytes));
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
-                                       fmt::format("{:#018x}", perm_hash), ar.TakeOff());
+                                       fmt::format("{:#018x}", perm_hash), std::move(bytes));
 }
 
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
@@ -86,8 +126,10 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
         return;
     }
 
+    // (Keyed with the version: a build of another version sharing the store cannot overwrite it.)
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       fmt::format("{:#018x}_{}_b{}", pgm_hash, perm_idx,
+                                                   Serialization::ShaderBinaryVersion),
                                        std::move(spv));
 }
 
@@ -151,6 +193,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
+    u64 expected{};
+    Serialization::Reader{ar}.Read(expected);
 
     std::vector<u8> meta_blob;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
@@ -158,6 +202,11 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     if (meta_blob.empty()) {
         return false;
     }
+    const u64 fingerprint = Fingerprint(meta_blob);
+    if (fingerprint != expected) {
+        return false; // the permutation hash describes another permutation now
+    }
+    NoteFingerprint(compute_key.value, fingerprint);
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
@@ -219,6 +268,10 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
+    std::array<u64, MaxShaderStages> expected{};
+    for (auto& fingerprint : expected) {
+        Serialization::Reader{ar}.Read(fingerprint);
+    }
 
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = sel.graphics_key.stage_hashes[stage_idx];
@@ -232,6 +285,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         if (meta_blob.empty()) {
             return false;
         }
+        const u64 fingerprint = Fingerprint(meta_blob);
+        if (fingerprint != expected[stage_idx]) {
+            return false; // the permutation hash describes another permutation now
+        }
+        NoteFingerprint(hash, fingerprint);
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
@@ -265,7 +323,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
+                                       fmt::format("{:#018x}_{}_b{}", program->info.pgm_hash,
+                                                   perm_idx, Serialization::ShaderBinaryVersion),
                                        spv);
     if (spv.empty()) {
         return false;
@@ -281,6 +340,19 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
+        // bbport: every permutation of a program is bound with the program's Info (that of the
+        // meta loaded first). A meta saved in another session can carry another Info (another
+        // first permutation then): its module would be bound with the wrong resource layout.
+        // Such a permutation is not preloaded; it compiles at runtime.
+        if (std::memcmp(static_cast<const Shader::InfoPersistent*>(&program->info),
+                        static_cast<const Shader::InfoPersistent*>(&it_pgm.value()->info),
+                        sizeof(Shader::InfoPersistent)) != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Cached permutation {} of {}_{:x} was saved with another program layout, "
+                        "skipping preload",
+                        perm_idx, program->info.hw_stage, program->info.pgm_hash);
+            return false;
+        }
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means

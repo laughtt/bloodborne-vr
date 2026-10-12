@@ -26,11 +26,16 @@
  *   BB_VR_HEAD_POS=<s>   head position offset, scale s (0 = off, the default; 1 = 1:1 meters),
  *                        clamped to +-0.25 m horizontally and +-0.15 m vertically
  *   BB_VR_HEAD_FOV=game|hmd|<deg>  camera FOV: "hmd" = the symmetric frustum around both eyes'
- *                        (the default with BB_XR_MODE=mono or alt), "game" (the default
+ *                        (the default with BB_XR_MODE=mono, alt or stereo), "game" (the default
  *                        otherwise), or a vertical FOV in degrees; BB_VR_HEAD_ASPECT=<w/h> with
  *                        a fixed FOV
  *   BB_VR_FAKE_HEAD=...  headset-free head: "yaw,pitch[,roll[,x,y,z]]", "sweep[:yaw,pitch,s]",
  *                        or "@file" (vr_head_math.h; re-read when it changes)
+ * BB_XR_MODE=stereo (true stereo, findings/31): the camera is the head's, with the union frustum
+ * and overscan as in alt, and no eye offset here (the stereo renderer shifts per eye). The views come
+ * from bbgpu_vr_views_at at the moment the frame's image will be on the display (the bridge's
+ * measured release -> display latency plus H1 -> release, bbgpu_vr_display_ahead), and the render
+ * view carries both eyes' offsets from the head out of that one snapshot.
  * Reference ("forward"): the yaw of the bridge's cinema screen, which it places in front of the
  * user and places again on a recenter (left stick click held); the head's own yaw at the first
  * tracked frame when the screen is head-locked or not placed. The fake head has no reference. */
@@ -40,6 +45,7 @@
 #include "vr_head_math.h"
 #include "vr_fp.h"
 #include "vr_stereo.h"
+#include "vr_stereo_math.h"
 #include "vr_arms.h"
 #include "vr_gun.h"
 #include "vr_visceral.h"
@@ -71,10 +77,13 @@ typedef struct {
     int lod;            /* the LOD fix may adjust contexts built from this camera */
     int64_t display_time; /* of the headset views the head came from (0: fake) */
     VrVec3 head_pos;    /* OpenXR, the views' world space */
+    int has_eye_offset; /* stereo: eye_offset is from this sample's snapshot */
+    VrVec3 eye_offset[2]; /* the eyes' offsets from the head, in the head's frame (OpenXR axes) */
 } VhSample;
 
 static struct {
-    int ready, enabled, log, level, fov_mode, mono, overscan_logged;
+    int ready, enabled, log, level, fov_mode, mono, stereo, overscan_logged, ahead_logged;
+    uint64_t next_ahead_log;
     float pos_scale, fov_fixed, aspect_fixed, overscan_x, overscan_y;
     VrFakeHead fake;
     VrFakeFile file;
@@ -154,8 +163,10 @@ static void vh_init(void) {
     vh.log = env_on("BB_VR_HEAD_LOG");
     vh.level = env_on("BB_VR_HEAD_LEVEL");
     const char *mode = getenv("BB_XR_MODE");
-    /* mono and alt (alternate-eye stereo): the frustum that contains both eyes by default */
-    vh.mono = mode && (!strcmp(mode, "mono") || !strcmp(mode, "alt"));
+    /* mono, alt (alternate-eye stereo) and stereo (true stereo): the frustum that contains both
+     * eyes by default */
+    vh.stereo = mode && !strcmp(mode, "stereo");
+    vh.mono = mode && (!strcmp(mode, "mono") || !strcmp(mode, "alt") || vh.stereo);
     const char *pos = getenv("BB_VR_HEAD_POS");
     vh.pos_scale = pos ? strtof(pos, NULL) : 0.0f;
     if (!isfinite(vh.pos_scale) || vh.pos_scale < 0.0f || vh.pos_scale > 4.0f) vh.pos_scale = 0.0f;
@@ -237,6 +248,26 @@ static int same_pose(const BbVrPose *a, const BbVrPose *b) {
     return 1;
 }
 
+/* The views this frame's camera is composed from. Alt and mono: the bridge's latest snapshot.
+ * True stereo: the views predicted for when the image will be on the display (this camera's
+ * H1 -> release time plus the bridge's measured release -> display time), else the latest. */
+static int vh_views(BbVrViews *v, uint64_t now) {
+    if (vh.stereo) {
+        BbVrDisplayAhead a;
+        if (bbgpu_vr_display_ahead(&a) && bbgpu_vr_views_at(a.display_time_ns, v)) {
+            if (!vh.ahead_logged || (vh.log && now >= vh.next_ahead_log)) {
+                vh.ahead_logged = 1;
+                vh.next_ahead_log = now + 1000000;
+                fprintf(stderr, "VR head: stereo: views for %.1f ms ahead (camera -> release %.1f ms + release -> display %.2f periods of %.2f ms); %llu pairs, %llu half\n",
+                        (double)a.ahead_ns * 1e-6, a.camera_to_release_ms, a.release_to_display_periods,
+                        (double)a.period_ns * 1e-6, (unsigned long long)a.pairs, (unsigned long long)a.half_pairs);
+            }
+            return 1;
+        }
+    }
+    return bbgpu_vr_views(v);
+}
+
 static void vh_sample(VhSample *s, uint64_t now) {
     memset(s, 0, sizeof(*s));
     s->apply = 3;
@@ -269,7 +300,7 @@ static void vh_sample(VhSample *s, uint64_t now) {
                                         VH_MAX_OFFSET_H, VH_MAX_OFFSET_V);
     } else {
         BbVrViews v;
-        if (!bbgpu_vr_views(&v)) return;
+        if (!vh_views(&v, now)) return;
         const VrQuat e0 = pose_q(&v.eye[0].pose), e1 = pose_q(&v.eye[1].pose);
         const int eyes = vr_qvalid(e0) && vr_qvalid(e1);
         VrQuat q = pose_q(&v.head);
@@ -280,6 +311,12 @@ static void vh_sample(VhSample *s, uint64_t now) {
             pos = vr_scale(vr_add(pose_v(&v.eye[0].pose), pose_v(&v.eye[1].pose)), 0.5f);
         }
         q = vr_qnormalize(q);
+        if (vh.stereo && eyes) { /* both eyes' offsets from this snapshot's head */
+            VrVec3 off[2];
+            s->has_eye_offset = vrs_pair_offsets(q, pos, pose_v(&v.eye[0].pose), pose_v(&v.eye[1].pose), VRS_DEFAULT_IPD, off);
+            s->eye_offset[0] = off[0];
+            s->eye_offset[1] = off[1];
+        }
         /* Reference: the cinema screen's yaw while it is placed in the world. */
         const VrQuat screen = pose_q(&v.screen);
         if ((v.screen_flags & 1) && !(v.screen_flags & 2) && vr_qvalid(screen)) {
@@ -380,7 +417,7 @@ static void log_sample(const VhSample *s) {
             s->level ? "level" : "camera frame", s->set_fov ? "set" : "game", s->fov_y, s->aspect);
 }
 
-/* The view the camera was just turned to, for BB_XR_MODE=mono (bridge ABI 5): the head pose
+/* The view the camera was just turned to, for BB_XR_MODE=mono and stereo (bridge ABI 5, 10): the head pose
  * used, the camera's final symmetric frustum (fov_y, aspect as tangents) and its rotation rows,
  * which the presenter matches against the presented frame's scene camera. */
 static void vh_publish_render_view(const float m[4][4], float fov_y, float aspect) {
@@ -404,6 +441,14 @@ static void vh_publish_render_view(const float m[4][4], float fov_y, float aspec
     view.fov_down = -atanf(ty);
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) view.rows[i][j] = m[i][j];
+    if (s->has_eye_offset) {
+        view.has_eye_offset = 1;
+        for (int e = 0; e < 2; ++e) {
+            view.eye_offset[e][0] = s->eye_offset[e].x;
+            view.eye_offset[e][1] = s->eye_offset[e].y;
+            view.eye_offset[e][2] = s->eye_offset[e].z;
+        }
+    }
     bbgpu_vr_set_render_view(&view);
 }
 
@@ -419,7 +464,9 @@ static void vh_stereo(float *cam) {
     head.head_pos = s->head_pos;
     head.display_time = s->display_time;
     head.frame = vh.seq;
+    const uint64_t prof_t0 = bb_vrprof_t0();
     vr_stereo_h1(cam, &head);
+    bb_vrprof_end(BB_PROF_H1_STEREO, prof_t0);
 }
 
 /* First person (BB_VR_FP=1, src/runtime_vr_fp.c, findings/16): the camera at the hunter's eyes,
@@ -430,7 +477,10 @@ static int vh_first_person(const BbHookContext *ctx, float *cam, int logging) {
     const int head_ok = vh.frame.valid && (vh.frame.apply & 1);
     VrFpView fpv;
     /* ref_yaw: the reference's heading (OpenXR yaw is left positive); it moves on a recenter */
-    if (!vr_fp_frame(ctx, (const float (*)[4])vh.h1_game, head_ok, vh.frame.rel, -vh.frame.ref_yaw, &fpv)) return 0;
+    const uint64_t prof_fp = bb_vrprof_t0();
+    const int fp_ok = vr_fp_frame(ctx, (const float (*)[4])vh.h1_game, head_ok, vh.frame.rel, -vh.frame.ref_yaw, &fpv);
+    bb_vrprof_end(BB_PROF_H1_FP, prof_fp);
+    if (!fp_ok) return 0;
     float out[4][4];
     if (fpv.keep_game_rotation) { /* flat: the game's own rotation, only the position moves */
         memcpy(out, vh.h1_game, sizeof(out));
@@ -482,7 +532,11 @@ static ABI void vh_hook_h1(BbHookContext *ctx) {
     if (!vh.enabled && !fp_on) return;
     const uint64_t now = vh_now_us();
     ++vh.seq;
-    if (vh.enabled) vh_sample(&vh.frame, now);
+    if (vh.enabled) {
+        const uint64_t prof_t0 = bb_vrprof_t0();
+        vh_sample(&vh.frame, now);
+        bb_vrprof_end(BB_PROF_H1_VIEWS, prof_t0);
+    }
     else memset(&vh.frame, 0, sizeof(vh.frame));
     float *cam = (float *)(uintptr_t)(ctx->rbx + 0x10); /* +0x10 matrix, then fov aspect near far */
     float (*m)[4] = (float (*)[4])cam;
@@ -515,7 +569,7 @@ static ABI void vh_hook_h1(BbHookContext *ctx) {
     /* A real-time cutscene (Remo, boss intro) or the debug camera with alternate eyes: the game's own
      * camera (no head pose, FOV or eye offset: a moving cutscene camera with head tracking is not
      * comfortable), no eye view published, and the presenter shows the frames on the cinema screen. */
-    vh_set_cinema(fp_on && vr_stereo_enabled() && vr_fp_cutscene());
+    vh_set_cinema(fp_on && (vr_stereo_enabled() || vh.stereo) && vr_fp_cutscene());
     if (vh.cinema) {
         if (logging) fprintf(stderr, "VR head:   cutscene: the game's camera, frames on the cinema screen\n");
         return;

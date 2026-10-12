@@ -107,3 +107,78 @@ It needs first person (`BB_VR_FP=1`, H1). Without first person the shots are lef
 `src/runtime_vr_head.c` (calls `vr_gun_view` / `vr_gun_register`), `gpu/bbgpu.h`, `gpu/shim/bbgpu.cpp`,
 `gpu/shadps4/video_core/renderer_vulkan/vk_xr.{h,cpp}` (aim poses), `patches/Bloodborne.xml`,
 `tests/test_vr_gun.c` (`vr-gun-test`, 115 checks), `tests/test_hooks.c` (the real window).
+
+## 8. Gun-shot animation speed (2026-10-12)
+
+Headset feedback: "the gun feels a little bit delayed, can we make the gun animation faster? double". The
+delay is the shot clip's wind-up before the TAE bullet event plus its recovery after it, not the aim hook.
+
+- **Which clips.** TimeAct ring sub-id (anim % 1000000) **51000-52999**. Evidence: 13 section 7.4 (from the TAE data)
+  lists "gun groups 51000-52999, shots: bullet event at 0.33 s (51000), 0.37 s (52150), 0.17 s (52550)";
+  13 section 5.4 uses the same range for the left-hand gun blend. The play logs (`out/vr_all_*.log`, `VR FP:
+  face=attack` lines) show real shots as **a102_051000 (83 times) and a102_051003 (51 times)**; no other
+  50000-52999 id appears in any log. Not confirmed from evidence: 52xxx ids in actual play (only the TAE table
+  names them) and any separate quickshot / charged-shot ids (none seen; the left-hand shot is the same
+  51000 family). If a 52xxx id turns out not to be a shot, narrow `VR_GUN_ANIM_TO` in `src/vr_gun_speed.h`.
+- **Mechanism.** The same hook as the attack speed ("VR Attack Speed (chr dt)", ChrIns+0xE0). While the newest
+  ring clip is a shot the dt is multiplied by `gun_speed`, with the attack guards: dt 0 (hit stop) and dt > 0.2
+  (hitch) are left alone. The ring keeps the shot id through the recovery, so it is sped up too.
+- **Bullet.** The bullet comes from the game's TAE event (a window the clip time crosses), so it is spawned once,
+  just earlier in wall time. The gun aim hook fires at the bullet launch and is not touched.
+- **Settings.** `BB_VR_GUN_SPEED=<k>` (default 2.0, 1 = off, max 4) or `gun_speed=<k>` in `out/fp.txt` (polled
+  4 Hz; a missing key falls back to the env value / 2.0). Logged at start and on each change; with
+  `BB_VR_FP_LOG=1` the measured clip rate (~k) twice a second during a shot.
+- **Online.** Stays ON in co-op (user decision, 2026-10-12); `BB_VR_GUN_SPEED_ONLINE=0` opts out. At startup, when
+  `BB_ONLINE=1` or `BB_ONLINE_ROLE` is set, one `VR online: gun_speed x.. and hurt_speed x.. are active` line
+  is logged. What a peer sees: section 10.
+- **Files.** `src/vr_gun_speed.h` (decision logic), `src/runtime_vr_atkspeed.c` (hook), `tests/test_vr_gun_speed.c`
+  (`vr-gun-speed-test`, 24 checks). Not run in the game yet.
+
+## 9. Hit-reaction animation speed (2026-10-12)
+
+Request: "reduce stagger time to half from all hits too". The player's damage-reaction clips play `hurt_speed`
+times faster (set `BB_VR_HURT_SPEED=2` and the stagger lasts half as long; **OFF by default (1.0) until the anim range is confirmed**, the feature is postponed), through the same dt hook as sections 8 and the
+attack speed, with the same guards (dt 0 = hit stop and dt > 0.2 hitches are untouched, so the freeze after a hit
+keeps its length).
+
+- **Which clips: NOT confirmed from Bloodborne data.** No hit-reaction id appears in any log or doc as such, and
+  the game's animation files are not on disk here. Default range: sub-id **9000-12999**. Evidence and its limits:
+  13 section 7.4 lists 9000-12999 as "likely damage" ([L], a guess from the TAE layout); 11 section 1 quotes the
+  DS3 head-tracking rules (light hurt anims 10000-15000; its 5000-5500 is a plain loop in Bloodborne, so that part is
+  not used; 13000+ is left out because deaths probably live there); the play logs show `a003_011100` and
+  `a003_012000` as the clip that followed a dodge and `a003_008000` once (consistent, not proof). If the range
+  is wrong the failure is harmless: a wrong id is simply not sped up, or a non-reaction clip in the range is.
+- **Finding the real ids.** `BB_VR_FP_LOG=1` prints `VR hurt speed: new clip <id> (sub-id N) is not an attack...`
+  for every clip with sub-id 8000 up that is not an attack, a shot or in the range (once per change). Get hit
+  (flinch, big stagger, knockdown, get-up), read the ids, then set `BB_VR_HURT_RANGE=<from>-<to>` (inclusive, no
+  rebuild) or change `VR_HURT_ANIM_FROM/TO` in `src/vr_hurt_speed.h`.
+- **Excluded.** 100000-104999 (events, gestures, and where the victim half of grabs and visceral hits probably
+  is: those clips are timing-locked to the enemy's clip and could desync when scaled), 13000+ (deaths),
+  attacks 30000-49999, gun shots 51000-52999, dodges 7000s. Anything in 9000-12999 that is a synced grab
+  victim would be scaled; none is known to be.
+- **Settings.** `BB_VR_HURT_SPEED=<k>` (default 1.0 = off until the range is confirmed, max 4), `hurt_speed=<k>` in `out/fp.txt`
+  (polled 4 Hz; a missing key falls back to the env value / 1.0 = off), `BB_VR_HURT_RANGE`. Logged at start and on
+  every change; with `BB_VR_FP_LOG=1` also the measured clip rate during a reaction.
+- **Online.** Stays ON in co-op; `BB_VR_HURT_SPEED_ONLINE=0` opts out (section 10).
+- **Files.** `src/vr_hurt_speed.h`, `src/runtime_vr_atkspeed.c`, `tests/test_vr_hurt_speed.c`
+  (`vr-hurt-speed-test`, 25 checks). Not run in the game yet.
+
+## 10. What a co-op peer sees when our clips run at 2x (read from the repo; mostly UNVERIFIED)
+
+No packet capture of the game's own character sync exists (19 section 10: the game's P2P socket carried no
+traffic in the traced runs; `src/runtime_vr_netstate.c` only watches connection flags; `docs/vr/coop-net-trace.md`
+traces NP/HTTP calls, not the character state). So most answers are the Souls-series model, not measurements.
+
+| Question | Answer | Evidence |
+|---|---|---|
+| What is sent (anim id, clip time, position)? | **Unverified.** The design (19 section 10, from the game): each client simulates its own hunter and sends position and animation state; the port's pose channel (34) states that "the root's own world position and heading come from the game's character sync" and that the base game syncs the partner's character animation. Which fields exactly (id, time, position) was never read from the wire. | 34 header and section 1; 19 section 10 |
+| Does the peer replay at 1x or follow our clip time? | **Unverified.** Likely it plays the announced animation on its copy of our character with its own timing, or follows the sent state; in both cases it ends up short of or ahead of our 2x clip. Expect a visual mismatch (a quick shot or flinch), not a crash. The attack-speed header already assumes "co-op peers see the faster animation through the net state but their copy of the moveset times are unchanged". | `runtime_vr_atkspeed.c` header, 19 section 10 |
+| Who decides damage and hits? | **Unverified.** The Souls-series model (19 section 10): the attacker's client decides hits on remote players, the host decides for enemies. Our gun bullet is spawned by the game's TAE event on our machine and is redirected by our gun aim hook; it is the game's own bullet sync (27 section 6, unchecked) that tells the peer. The shot is fired at the same TAE event, only earlier in wall time. A hit on us is decided by whichever machine the game uses; our stagger length is local to our machine. | 19 section 10, 27 section 6 |
+| Does anything we change run on or write to the peer's game? | **No, from the code.** The hook only touches the character whose ChrIns is `[[WorldChrMan]+0x60]` with the PlayerIns vtable (`as_hook`: `player != chr` returns at once), i.e. the local player, and it only multiplies that character's dt (ChrIns+0xE0) in our process. We send no packets and write nothing to a remote character; the peer's PC runs its own unmodified game. | `src/runtime_vr_atkspeed.c` `as_hook` |
+
+What this means in practice (reasoning, not tested): a shot at 2x means the peer sees our hunter finish the gun
+animation earlier, or a mismatch between the animation they play and the position/state we send; a half-length
+stagger means we recover earlier than the game's timings on the other machine expect (a hit that lands on the peer's
+view of us during our get-up could look odd, or the peer could consider us still staggered). Both are a gameplay
+advantage in co-op. To check: two instances with `BB_VR_FP_LOG=1` and the peer's view recorded (needs the P2P sync
+working end to end, which it was not).

@@ -163,6 +163,71 @@ static DWORD WINAPI test_thread(LPVOID mode) {
     return 0;
 }
 
+/* Exit trace (docs/vr/findings/43-pm4-race.md): every process exit but TerminateProcess goes
+ * through ntdll!RtlExitUserProcess (exit, _exit, ExitProcess, from any module). Some launches
+ * ended with code 1 and no line in the log, a few seconds after the VR session started: a
+ * library exiting on its own. The trap names the caller (module+offset backtrace, guest rbp
+ * chain), writes a report bundle, then exits as asked. Code 0 passes through silently. */
+typedef VOID (NTAPI *RtlExitUserProcess_t)(LONG);
+static RtlExitUserProcess_t exit_original;
+static unsigned char exit_saved[12];
+static volatile LONG exit_traced;
+
+static void exit_restore(void) {
+    DWORD old;
+    if (VirtualProtect((void *)exit_original, sizeof(exit_saved), PAGE_EXECUTE_READWRITE, &old)) {
+        memcpy((void *)exit_original, exit_saved, sizeof(exit_saved));
+        VirtualProtect((void *)exit_original, sizeof(exit_saved), old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)exit_original, sizeof(exit_saved));
+    }
+}
+
+static VOID NTAPI exit_trap(LONG status) {
+    const unsigned code = (unsigned)status;
+    if (code != 0 && !InterlockedExchange(&exit_traced, 1)) {
+        fflush(NULL);
+        fprintf(stderr, "Exit: the process is exiting with code %u (0x%x) on thread %lu, called from:\n",
+                code, code, GetCurrentThreadId());
+        void *frames[32];
+        const USHORT n = RtlCaptureStackBackTrace(1, 32, frames, NULL);
+        char module[MAX_PATH];
+        uintptr_t offset;
+        for (USHORT i = 0; i < n; ++i) {
+            locate((uintptr_t)frames[i], module, sizeof(module), &offset);
+            fprintf(stderr, "  #%u %s+0x%" PRIxPTR "\n", i, module, offset);
+        }
+        CONTEXT context;
+        RtlCaptureContext(&context);
+        EXCEPTION_RECORD record = {0};
+        record.ExceptionCode = 0xE0000001u; /* not an exception: the exit, for the report */
+        record.ExceptionAddress = (void *)(uintptr_t)context.Rip;
+        EXCEPTION_POINTERS info = {&record, &context};
+        char kind[32];
+        snprintf(kind, sizeof(kind), "exit%u", code);
+        bb_crash_write(&info, kind);
+        fflush(NULL);
+    }
+    exit_restore();
+    exit_original(status);
+}
+
+static void exit_trace_init(void) {
+    const char *env = getenv("BB_EXIT_TRACE");
+    if (env && !strcmp(env, "0")) return;
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    exit_original = ntdll ? (RtlExitUserProcess_t)(void *)GetProcAddress(ntdll, "RtlExitUserProcess") : NULL;
+    if (!exit_original) return;
+    unsigned char jump[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0}; /* mov rax, imm64; jmp rax */
+    const uint64_t target = (uint64_t)(uintptr_t)exit_trap;
+    memcpy(jump + 2, &target, sizeof(target));
+    DWORD old;
+    if (!VirtualProtect((void *)exit_original, sizeof(jump), PAGE_EXECUTE_READWRITE, &old)) return;
+    memcpy(exit_saved, (void *)exit_original, sizeof(exit_saved));
+    memcpy((void *)exit_original, jump, sizeof(jump));
+    VirtualProtect((void *)exit_original, sizeof(jump), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)exit_original, sizeof(jump));
+}
+
 void bb_crash_init(const char *user_dir, unsigned char *const *guest_image) {
     const char *enabled = getenv("BB_CRASH_CAPTURE");
     guest_image_ref = guest_image;
@@ -171,6 +236,7 @@ void bb_crash_init(const char *user_dir, unsigned char *const *guest_image) {
     for (char *p = crash_root; *p; ++p) if (*p == '/') *p = '\\';
     printf("BB_BUILD_ID=%s\n", BB_BUILD_ID);
     if (!capture_enabled) return;
+    exit_trace_init();
     const char *hang = getenv("BB_HANG_SECONDS");
     unsigned long seconds = hang ? strtoul(hang, NULL, 10) : 0;
     if (seconds) { HANDLE h = CreateThread(NULL, 0, hang_thread, (LPVOID)(uintptr_t)seconds, 0, NULL); if (h) CloseHandle(h); }
