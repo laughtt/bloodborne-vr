@@ -239,5 +239,94 @@ class HelpPageTests(unittest.TestCase):
         self.assertNotIn('for name in NEVER_SHIP', text)  # it clobbered the release name (the zip was called nvngx_dlssnr.dll.zip)
 
 
+RTX = [{'name': 'NVIDIA GeForce RTX 4090', 'rtx': True}]
+
+
+class InstalledLayoutTests(unittest.TestCase):
+    """Setup.exe layout: program folder (installed.flag, bin/) apart from the data folder (%LOCALAPPDATA%/BloodborneVR).
+    The model file goes next to the game exe in bin/, which is where the bridge loads it from; the choice is saved in the data folder."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.port = make_port(root / 'Programs' / 'BloodborneVR')
+        (self.port / S.INSTALLED_FLAG).write_text('', encoding='utf-8')
+        self.data = S.data_root(self.port, {'LOCALAPPDATA': str(root / 'Local')})
+        self.assertNotEqual(self.data, self.port)
+        self.src = root / 'Downloads' / 'nvngx_dlssnr.dll'
+        self.src.parent.mkdir()
+        self.src.write_bytes(GOOD_DLL)
+        self.settings_file = self.data / 'user' / 'bbvr_settings.json'
+        patcher = mock.patch.object(S, 'detect_gpus', return_value=RTX)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_copy_then_select_save_reload_and_launch(self):
+        caps = S.detect_all(self.port, data=self.data)
+        self.assertFalse(caps['dlssnr']['ok'])
+        self.assertFalse(caps['dlssnr']['dll'])
+        menu = bbvr_menu.Menu(self.settings_file, S.make_paths(self.port, self.port / 'game', self.data), caps)
+        menu.update({'quality': 'Super High'})  # greyed out: a stale click does nothing
+        self.assertEqual(menu.settings['quality'], 'High')
+        result = menu.install_nr_dll(str(self.src))
+        self.assertTrue(result['ok'] and result['available'], result)
+        self.assertTrue((self.port / 'bin' / 'nvngx_dlssnr.dll').is_file())  # next to bb-probe.exe, not in the data folder
+        self.assertFalse((self.data / 'nvngx_dlssnr.dll').exists())
+        self.assertTrue(menu.state()['caps']['dlssnr']['ok'])  # refreshed at once, no restart
+        menu.update({'quality': 'Super High'})
+        self.assertEqual(menu.settings['quality'], 'Super High')
+        self.assertEqual(json.loads(self.settings_file.read_text(encoding='utf-8'))['quality'], 'Super High')
+        # reopened: a new Menu loads the file and checks again
+        again = bbvr_menu.Menu(self.settings_file, S.make_paths(self.port, self.port / 'game', self.data), S.detect_all(self.port, data=self.data))
+        st = again.state()
+        self.assertEqual((st['quality'], st['quality_notice']), ('Super High', ''))
+        values = S.effective_values(again.settings, again.caps)
+        plan = S.build_launch(values, S.make_paths(self.port, self.port / 'game', self.data), again.caps, public=False)
+        self.assertEqual((plan['env']['BB_XR_DLSSNR'], plan['env']['BB_XR_DLSSNR_PLACE']), ('1', 'pre'))
+        self.assertEqual(plan['warnings'], [])
+
+    def test_a_missing_file_later_gives_a_notice_not_a_silent_switch(self):
+        S.install_nr_dll(self.src, self.port)
+        S.save_settings(self.settings_file, S.set_quality(S.default_settings(), 'Super High'))
+        (self.port / 'bin' / 'nvngx_dlssnr.dll').unlink()
+        caps = S.detect_all(self.port, data=self.data)
+        settings = S.load_settings(self.settings_file)
+        self.assertEqual(settings['quality'], 'Super High')  # kept
+        notice = S.page_state(settings, caps, public=False)['quality_notice']
+        self.assertIn('Super High is selected', notice)
+        self.assertIn('nvngx_dlssnr.dll', notice)
+        plan = S.build_launch(S.effective_values(settings, caps), S.make_paths(self.port, self.port / 'game', self.data), caps, public=False)
+        self.assertEqual(plan['env']['BB_XR_DLSSNR'], '0')  # NR settings only with the file
+        self.assertNotIn('BB_XR_DLSSNR_PLACE', plan['env'])
+        self.assertTrue(any('DLSS-NR' in w for w in plan['warnings']))
+
+    def test_a_bridge_from_before_dlss_nr_is_reported_not_blamed_on_the_file(self):
+        (self.port / 'bin' / 'bbport_dlss.dll').write_bytes(b'MZ old bridge' + bytes(16))  # what alpha11 shipped
+        r = S.install_nr_dll(self.src, self.port)
+        self.assertTrue(r['ok'])
+        self.assertFalse(r['available'])
+        self.assertIn('too old for DLSS-NR', r['message'])
+        nr = S.detect_dlssnr(self.port)
+        self.assertFalse(nr['ok'])
+        self.assertTrue(nr['dll'])
+        self.assertNotIn('Find file', nr['reason'])
+
+    def test_a_failed_copy_says_why(self):
+        with mock.patch.object(S.shutil, 'copyfile', side_effect=PermissionError(13, 'Access is denied')):
+            r = S.install_nr_dll(self.src, self.port)
+        self.assertFalse(r['ok'])
+        self.assertIn('No permission to write', r['message'])
+        self.assertFalse(list((self.port / 'bin').glob('nvngx_dlssnr*')))
+
+    def test_make_release_refuses_a_stale_bridge(self):
+        text = (ROOT / 'tools' / 'release' / 'make_release.py').read_text(encoding='utf-8')
+        self.assertIn("b'BbDlssGetNrApi' not in", text)
+
+    def test_the_web_menu_and_dashboard_show_the_notice(self):
+        self.assertIn('S.quality_notice', bbvr_menu.PAGE)
+        self.assertIn('quality_notice', (ROOT / 'tools' / 'release' / 'dashboard' / 'main.cpp').read_text(encoding='utf-8'))
+
+
 if __name__ == '__main__':
     unittest.main()

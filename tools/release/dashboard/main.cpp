@@ -1197,7 +1197,9 @@ static void nr_controls(float w)
     ImGui::SameLine();
     if (Button("What is this?", ImVec2(S(130), S(30)), false, true)) cli_async({"nr-help"});
     const json r = A.st.value("nr_dll", json::object());
-    if (r.contains("message")) Colored(jstr(r, "message"), r.value("ok", false) ? GREEN : AMBER, 12.5f);
+    if (r.contains("message")) Colored(jstr(r, "message"), r.value("ok", false) && r.value("available", true) ? GREEN : AMBER, 12.5f);
+    std::string notice = jstr(A.st, "quality_notice");
+    if (!notice.empty() && !r.contains("message")) Colored(notice, AMBER, 12.5f);
 }
 
 static void preset_cards(float w)

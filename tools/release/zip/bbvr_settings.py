@@ -907,17 +907,20 @@ def detect_dlssnr(port, exe_override=None, gpus=None, dlss=None):
     nvngx_dlssnr.dll (never shipped), and the executable and bbport_dlss.dll both know DLSS-NR."""
     if dlss is None:
         dlss = detect_dlss(port, exe_override, gpus)
-    result = {'ok': False, 'reason': '', 'dir': None}
+    result = {'ok': False, 'reason': '', 'dir': None, 'dll': False}
     if not dlss['ok']:
         result['reason'] = 'DLSS-NR needs DLSS: ' + dlss['reason']
         return result
     folder = Path(dlss['dir'])
     result['dir'] = folder
+    result['dll'] = (folder / NR_DLL).is_file()
     if not exe_supports_dlssnr(dlss['exe']):
         result['reason'] = 'This build has no DLSS-NR support.'
     elif not _file_has(folder / 'bbport_dlss.dll', b'BbDlssGetNrApi'):
-        result['reason'] = 'bbport_dlss.dll is too old for DLSS-NR (use the one from this build).'
-    elif not (folder / 'nvngx_dlssnr.dll').is_file():
+        # a file cannot fix this one: Find file... only supplies nvngx_dlssnr.dll
+        result['reason'] = ('bbport_dlss.dll in ' + str(folder) + ' is too old for DLSS-NR, so Super High cannot run here even with '
+                            'nvngx_dlssnr.dll in place. Install a newer version of the mod (this one shipped an old bridge).')
+    elif not result['dll']:
         result['reason'] = f"nvngx_dlssnr.dll is not included with the mod: use your own copy (press 'Find file...' to copy it next to bb-probe.exe in {folder})."
     else:
         result['ok'] = True
@@ -965,7 +968,10 @@ def install_nr_dll(src, port, exe_override=None, gpus=None):
     if path.name.lower() != NR_DLL:
         return {'ok': False, 'message': f'Pick the file named {NR_DLL} (this one is {path.name}).', 'dest': ''}
     try:
-        head = path.open('rb').read(2) if path.is_file() else b''
+        head = b''
+        if path.is_file():
+            with path.open('rb') as f:
+                head = f.read(2)
         size = path.stat().st_size if path.is_file() else 0
     except OSError as e:
         return {'ok': False, 'message': f'Cannot read that file: {e.strerror or e}.', 'dest': ''}
@@ -983,9 +989,19 @@ def install_nr_dll(src, port, exe_override=None, gpus=None):
         tmp = folder / (NR_DLL + '.tmp')
         shutil.copyfile(path, tmp)
         os.replace(tmp, dest)
+    except PermissionError:
+        return {'ok': False, 'dest': '', 'message': (f'No permission to write to {folder}. Install the mod for the current user '
+                                                      '(Setup.exe /CURRENTUSER) or copy the file there yourself as administrator.')}
     except OSError as e:
         return {'ok': False, 'message': f'Could not copy it to {folder}: {e.strerror or e} (close the game first).', 'dest': ''}
-    return {'ok': True, 'message': f'Copied {NR_DLL} to {folder}. It stays on this PC; it is not part of the mod.', 'dest': str(dest)}
+    if not dest.is_file():
+        return {'ok': False, 'message': f'The copy to {folder} did not show up there.', 'dest': ''}
+    # the check is redone right here, so the message says whether Super High can be used now
+    nr = detect_dlssnr(port, exe_override, gpus)
+    text = f'Copied {NR_DLL} to {folder}. It stays on this PC; it is not part of the mod.'
+    if nr['ok']:
+        return {'ok': True, 'available': True, 'message': text + ' Super High is available now.', 'dest': str(dest)}
+    return {'ok': True, 'available': False, 'message': text + ' Super High is still not available: ' + nr['reason'], 'dest': str(dest)}
 
 
 def _md_to_html(text):
@@ -1424,7 +1440,17 @@ def parse_extra_env(text):
 
 NR_SUB = ('dlssnr_passes', 'dlssnr_place', 'dlssnr_style', 'dlssnr_intensity', 'dlssnr_tone', 'dlssnr_structure', 'dlssnr_skin',
           'dlssnr_fovea', 'dlssnr_inner')
-NO_NR = {'ok': False, 'reason': 'not checked', 'dir': None}
+NO_NR = {'ok': False, 'reason': 'not checked', 'dir': None, 'dll': False}
+
+
+def quality_notice(settings, caps):
+    """Shown when the saved preset needs DLSS-NR and it is not available: the choice is kept (never switched to another
+    preset), the game runs without the NR pass until the file is back."""
+    q = settings.get('quality')
+    ok, reason = nr_state(caps)
+    if q in NR_PRESETS and not ok:
+        return f'{q} is selected, but it is not available now: {reason} The game runs High until then; your choice is kept.'
+    return ''
 
 
 def _flag(v):
@@ -1868,7 +1894,7 @@ def page_state(settings, caps, public=None):
         'mode': settings.get('mode', 'vr'), 'coop_view': settings.get('coop_view', 'vr'), 'view': play_view(settings),
         'modes': [{'id': m, 'label': MODE_LABELS[m], 'note': MODE_NOTES[m]} for m in MODES],
         'quality': settings.get('quality', QUALITY_DEFAULT), 'quality_modified': modified_preset_keys(settings),
-        'quality_table': preset_table(caps), 'overrides': sorted((settings.get('overrides') or {})),
+        'quality_table': preset_table(caps), 'quality_notice': quality_notice(settings, caps), 'overrides': sorted((settings.get('overrides') or {})),
         'pages': pages,
         'caps': {'gpus': caps['gpus'],
                  'dlss': {k: (str(v) if isinstance(v, Path) else v) for k, v in caps['dlss'].items()},

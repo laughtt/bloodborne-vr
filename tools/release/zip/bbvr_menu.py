@@ -533,7 +533,7 @@ function presetCards(){const g=el('div','segs q5');const modified=S.quality_modi
 function nrBox(){const b=el('div','nrbox');
  b.appendChild(el('div','note','Super High needs the model file nvngx_dlssnr.dll. It is NVIDIA\'s, it is NOT included with this mod, and there is no download here: if you already have a copy on this PC, press Find file... and it is copied next to the game. Without it the game runs High.'));
  const r=el('div');r.style.marginTop='6px';
- const f=el('button','out','Find file...');f.onclick=async()=>{try{const x=await api('/api/nr-dll',{});nrMsg=x.result.message||'';nrBad=!x.result.ok;if(x.state)S=x.state}catch(e){nrMsg='That did not work.';nrBad=true}render()};r.appendChild(f);r.appendChild(document.createTextNode(' '));
+ const f=el('button','out','Find file...');f.onclick=async()=>{try{const x=await api('/api/nr-dll',{});nrMsg=x.result.message||'';nrBad=!x.result.ok||x.result.available===false;if(x.state)S=x.state}catch(e){nrMsg='That did not work.';nrBad=true}render()};r.appendChild(f);r.appendChild(document.createTextNode(' '));
  const h=el('button','out','What is this?');h.onclick=async()=>{try{const x=await api('/api/nr-help',{});if(!x.ok)window.open(x.url,'_blank','noopener')}catch(e){}};r.appendChild(h);b.appendChild(r);
  if(nrMsg){const m=el('div','note',nrMsg);m.style.color=nrBad?'var(--bad)':'var(--ok)';b.appendChild(m)}
  return b}
@@ -543,6 +543,7 @@ function displayLine(){const d=(S.display||{}).sizes;if(S.values.display_size===
 function qualityCard(){const c=el('div','card');c.appendChild(el('h2','cap','VR quality'));c.appendChild(presetCards());
  const cur=S.quality_table.presets.find(p=>p.name===S.quality);if(cur)c.appendChild(el('div','note',cur.note));
  S.quality_table.presets.filter(p=>!p.available).forEach(p=>{const n=el('div','note',p.name+' is greyed out: '+p.reason);n.style.color='var(--warn)';c.appendChild(n)});
+ if(S.quality_notice){const n=el('div','note',S.quality_notice);n.style.color='var(--warn)';c.appendChild(n)}
  c.appendChild(nrBox());const more=el('button','out','What each preset sets');more.style.marginTop='10px';more.onclick=()=>go('graphics');c.appendChild(more);
  c.appendChild(el('div','sub','VR render mode'));c.appendChild(renderModeControl());return c}
 function memberColor(st){return st==='in world'?'var(--ok)':st==='sign up'?'var(--warn)':st==='host'?'var(--gold)':'var(--dim)'}

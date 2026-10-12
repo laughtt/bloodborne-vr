@@ -342,6 +342,10 @@ def main():
     for path in (args.exe, args.bridge, args.openxr, args.export / 'run.py') + (() if args.no_dlss else tuple(dlss_dlls)):
         if not path.is_file():
             sys.exit(f'missing input: {path}' + (' (run tools/release/export_public.py first)' if 'export' in str(path) else ''))
+    if not args.no_dlss and b'BbDlssGetNrApi' not in args.dlss_dir.joinpath('bbport_dlss.dll').read_bytes():
+        # alpha11 shipped a bridge from before DLSS-NR: Super High stayed greyed out whatever file the player picked
+        sys.exit(f'{args.dlss_dir / "bbport_dlss.dll"} has no DLSS-NR export (BbDlssGetNrApi): it is a stale build. '
+                 'Rebuild it (packaging/windows/build_dlss.sh) before packaging.')
     name = f'BloodborneVR-{args.version}'
     stage = args.out / name
     if stage.exists():
