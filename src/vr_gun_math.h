@@ -285,6 +285,112 @@ static inline VrVec3 vg_assist_dir(VrVec3 ray, VrVec3 muzzle, const VrVec3 *targ
     return vam_norm(vam_lerp(ray, best_dir, vr_clampf(best_w, 0.0f, 1.0f)), ray);
 }
 
+/* ---- the barrel source and the live trims (findings/27 section 11) ----
+ * The visible gun hangs off the L_Weapon bone, which the arms IK places at grip * offset * trim
+ * (runtime_vr_arms.c arms_target: arm_offset, arm_rot_l). The controller's aim ray ignores that
+ * offset and trim, so with arm_rot_l=30,25 the bullets left about 30 deg left / 25 deg below the
+ * barrel the player sees. The barrel source takes the direction from the weapon bone after the IK:
+ * its rotation relative to the H1 camera (vg_weapon_in_cam, published by the arms module) and an
+ * axis of the bone (-Z: the weapon models' barrel, the pistol's muzzle dummy at z -0.44, findings/13
+ * 7.3; the sandbox's guns aim the model's -Z), through the same camera rows as the aim ray. */
+enum { VG_SRC_BARREL = 0, VG_SRC_AIM = 1, VG_SRC_GRIP = 2 };
+static inline const char *vg_src_name(int s) { return s == VG_SRC_AIM ? "aim" : s == VG_SRC_GRIP ? "grip" : "barrel"; }
+/* "barrel" | "aim" | "grip" (case sensitive); -1 for anything else. */
+static inline int vg_src_parse(const char *s) {
+    if (!s) return -1;
+    return !strcmp(s, "barrel") ? VG_SRC_BARREL : !strcmp(s, "aim") ? VG_SRC_AIM : !strcmp(s, "grip") ? VG_SRC_GRIP : -1;
+}
+/* A bone axis "+x" "-x" "x" "+y" "-y" "y" "+z" "-z" "z" (no sign = +); 1 when it parsed. */
+static inline int vg_axis_parse(const char *s, VrVec3 *out) {
+    if (!s) return 0;
+    if (!strcmp(s, "auto")) { *out = vr_v3(0, 0, 0); return 1; } /* gun_axis=auto: picked per lock (vg_best_axis) */
+    float sign = 1.0f;
+    if (*s == '-' || *s == '+') sign = *s++ == '-' ? -1.0f : 1.0f;
+    if (!s[0] || s[1]) return 0;
+    switch (s[0]) {
+    case 'x': case 'X': *out = vr_v3(sign, 0, 0); return 1;
+    case 'y': case 'Y': *out = vr_v3(0, sign, 0); return 1;
+    case 'z': case 'Z': *out = vr_v3(0, 0, sign); return 1;
+    default: return 0;
+    }
+}
+/* A direction in the game camera's frame (+x right, +y up, +z forward; vr_xr_to_game_vec of an XR
+ * vector) in the world, through the camera rows (right, up, forward). */
+static inline VrVec3 vg_cam_dir_to_world(VrVec3 d, const float rows[3][4]) {
+    const VrVec3 r = vr_v3(rows[0][0], rows[0][1], rows[0][2]);
+    const VrVec3 u = vr_v3(rows[1][0], rows[1][1], rows[1][2]);
+    const VrVec3 f = vr_v3(rows[2][0], rows[2][1], rows[2][2]);
+    return vr_add(vr_add(vr_scale(r, d.x), vr_scale(u, d.y)), vr_scale(f, d.z));
+}
+/* A bone's model rotation relative to the camera: cam_rot is the camera in model space
+ * (vam_camera_in_model: camera frame -> model), so this is camera frame <- bone frame. */
+static inline VrQuat vg_weapon_in_cam(VrQuat cam_rot, VrQuat bone_model) {
+    return vr_qnormalize(vr_qmul(vr_qconj(cam_rot), bone_model));
+}
+/* The barrel in the world: the bone's `axis` (bone frame) through its camera-relative rotation and
+ * the camera rows. Unit; (0,0,0) for a degenerate input. */
+static inline VrVec3 vg_barrel_in_world(VrQuat weapon_cam, VrVec3 axis, const float rows[3][4]) {
+    return vam_norm(vg_cam_dir_to_world(vr_qrotate(vr_qnormalize(weapon_cam), axis), rows), vr_v3(0, 0, 0));
+}
+/* gun_axis=auto: the six bone axes (+x -x +y -y +z -z) through vg_barrel_in_world; returns the index of the one
+ * closest to the controller ray `ray` (unit) and fills angles[6] (deg, -1 for a degenerate axis); -1 if none. */
+static const char *const vg_axis_names[6] = {"+x", "-x", "+y", "-y", "+z", "-z"};
+static inline int vg_best_axis(VrQuat weapon_cam, const float rows[3][4], VrVec3 ray, float angles[6]) {
+    static const float ax[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    int best = -1;
+    for (int i = 0; i < 6; ++i) {
+        const VrVec3 b = vg_barrel_in_world(weapon_cam, vr_v3(ax[i][0], ax[i][1], ax[i][2]), rows);
+        angles[i] = vam_len(b) < 0.5f ? -1.0f : vg_angle_deg(b, ray);
+        if (angles[i] >= 0.0f && (best < 0 || angles[i] < angles[best])) best = i;
+    }
+    return best;
+}
+/* The live trim: the heading turned by yaw_deg (+ = right: vg_yaw_pitch's heading grows toward
+ * world +X, which is the camera's right when it looks along +Z) and the pitch raised by pitch_deg
+ * (clamped to +-89 deg). Zero trims return the direction unchanged. */
+static inline VrVec3 vg_trim(VrVec3 dir, float yaw_deg, float pitch_deg) {
+    if (yaw_deg == 0.0f && pitch_deg == 0.0f) return dir;
+    float h, p;
+    vg_yaw_pitch(dir, &h, &p);
+    h = (h + yaw_deg) * VR_DEG;
+    p = vr_clampf(p + pitch_deg, -89.0f, 89.0f) * VR_DEG;
+    return vr_v3(cosf(p) * sinf(h), sinf(p), cosf(p) * cosf(h));
+}
+/* The arms IK's per-hand trim (arm_rot_l / arm_rot_r) as a rotation in the controller frame
+ * (OpenXR: yaw right = about -Y, pitch up = about +X), the same product arms_target applies. */
+static inline VrQuat vg_hand_trim(float yaw_deg, float pitch_deg) {
+    return vr_qnormalize(vr_qmul(vr_qaxis(vr_v3(0, 1, 0), -yaw_deg * VR_DEG), vr_qaxis(vr_v3(1, 0, 0), pitch_deg * VR_DEG)));
+}
+/* `key=<float>` as a whole token anywhere in a one-line control text (fp.txt: space separated
+ * key=value tokens); 1 and the value when present and finite. */
+static inline int vg_key_float(const char *text, const char *key, float *out) {
+    const size_t n = strlen(key);
+    for (const char *p = text; p && (p = strstr(p, key)) != NULL; p += n) {
+        if ((p != text && p[-1] != ' ' && p[-1] != '\t' && p[-1] != '\n' && p[-1] != '\r') || p[n] != '=') continue;
+        const char c = p[n + 1];
+        if (!c || c == ' ' || c == '\t' || c == '\r' || c == '\n') continue; /* "key=" with no value */
+        char *end;
+        const float x = strtof(p + n + 1, &end);
+        if (end != p + n + 1 && isfinite(x)) { *out = x; return 1; }
+    }
+    return 0;
+}
+/* `key=<word>` likewise; the word (up to the next blank, at most cap - 1 chars) into out. */
+static inline int vg_key_word(const char *text, const char *key, char *out, size_t cap) {
+    const size_t n = strlen(key);
+    for (const char *p = text; p && (p = strstr(p, key)) != NULL; p += n) {
+        if ((p != text && p[-1] != ' ' && p[-1] != '\t' && p[-1] != '\n' && p[-1] != '\r') || p[n] != '=') continue;
+        const char *v = p + n + 1;
+        size_t k = 0;
+        while (v[k] && v[k] != ' ' && v[k] != '\t' && v[k] != '\r' && v[k] != '\n') ++k;
+        if (!k || k >= cap) return 0;
+        memcpy(out, v, k);
+        out[k] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* Bullet id filter: "all", or comma separated ids and ranges ("500-999,1100"). Returns 1 when `id`
  * is in the list; an empty or unparsable list matches nothing. */
 static inline int vg_id_in_list(const char *list, int id) {

@@ -204,11 +204,31 @@ uint32_t ItemId(const std::string& key) {
     return BBXR_ITEM_NONE;
 }
 
+m3::Vec3 GunRayTrim(m3::Vec3 dir, float yaw_deg, float pitch_deg) {
+    if (yaw_deg == 0.0f && pitch_deg == 0.0f) {
+        return dir;
+    }
+    constexpr float kRad = 3.14159265358979f / 180.0f;
+    const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (len < 1e-6f) {
+        return dir;
+    }
+    // Heading grows toward +X (right) looking along -Z, like vg_yaw_pitch's toward +X looking +Z.
+    float h = std::atan2(dir.x, -dir.z) / kRad;
+    float p = std::asin(std::clamp(dir.y / len, -1.0f, 1.0f)) / kRad;
+    h = (h + yaw_deg) * kRad;
+    p = std::clamp(p + pitch_deg, -89.0f, 89.0f) * kRad;
+    return {std::cos(p) * std::sin(h), std::sin(p), -std::cos(p) * std::cos(h)};
+}
+
 GunRayLook GunRayFor(const sb::UiGameLayout& game, bool in_world, bool aim_valid,
-                     double since_pull_s) {
+                     double since_pull_s, bool aiming) {
     GunRayLook look;
-    look.visible = game.debug_gun_ray && in_world && aim_valid;
-    look.flash = look.visible && since_pull_s >= 0.0 && since_pull_s < kGunRayFlashS;
+    const bool shot = since_pull_s >= 0.0 && since_pull_s < kGunRayFlashS;
+    const bool mode = game.debug_gun_ray || game.gun_laser == "always" ||
+                      (game.gun_laser == "hold" && (aiming || shot));
+    look.visible = mode && in_world && aim_valid;
+    look.flash = look.visible && shot;
     look.width_m = look.flash ? 0.012f : 0.004f;
     look.alpha = look.visible ? (look.flash ? 1.0f : 0.55f) : 0.0f;
     return look;
@@ -252,6 +272,17 @@ bool GameUi::Load(const std::filesystem::path& assets_dir, const sb::Renderer::D
         log += "game UI: no font in " + (assets / "ui").string() +
                " (scripts/vr_assets/ui_extract.py): the stamina bar shows, no labels\n";
     }
+    // The HUD pipeline's own icon atlas (the icons plus the item texture sheet appended below them):
+    // the held and thrown item meshes are drawn into hud_canvas in the icon mode, at uvs of that atlas
+    // (sb::ItemSheet::Uv). Without it the HUD renderer samples its 1x1 white default texture and every
+    // held mesh shows untextured (only the menus' renderer had the atlas).
+    sb::UiAtlas hud_atlas;
+    std::string atlas_log;
+    hud_atlas_w = hud_atlas_h = 0;
+    if (hud_atlas.Load(assets / "ui", atlas_log)) {
+        hud_atlas_w = hud_atlas.width;
+        hud_atlas_h = hud_atlas.height;
+    }
     if (device && gpu_ok) {
         std::string error;
         if (hud_gpu.Create(*device, error)) {
@@ -260,6 +291,15 @@ bool GameUi::Load(const std::filesystem::path& assets_dir, const sb::Renderer::D
             if (hud_font.Ready() &&
                 !hud_gpu.UploadFont(hud_font.width, hud_font.height, hud_font.pixels)) {
                 log += "game UI: HUD font upload failed: " + hud_gpu.LastError() + "\n";
+            }
+            if (hud_atlas.Ready()) {
+                if (hud_gpu.UploadIcons(hud_atlas.width, hud_atlas.height, hud_atlas.pixels)) {
+                    log += Fmt("game UI: HUD icon atlas %ux%u uploaded (the held items' textures)\n",
+                               hud_atlas.width, hud_atlas.height);
+                } else {
+                    log += "game UI: HUD icon atlas upload failed: " + hud_gpu.LastError() + "\n";
+                    hud_atlas_w = hud_atlas_h = 0;
+                }
             }
         } else {
             log += "game UI: HUD: " + error + "\n";
@@ -523,6 +563,30 @@ void GameUi::Events(std::vector<Haptic>& haptics, std::string& log) {
             }
             break;
         }
+        case BBXR_EV_INSTANT_THROW: {
+            // The host used the thrown item with no animation: our item flies from the release (the same
+            // BulletParam flight as the aim arc, at the host's launch speed) until the host says it landed.
+            InstantFlight& f = instant_flight;
+            if (f.released && f.info.goods == e.a && now - f.release_t < 3.0 && e.b > 0) {
+                held::ItemInfo p = f.info;
+                p.speed = float(e.b) * 0.01f;
+                f.arc = held::ComputeArc(f.origin, f.dir, p, f.origin.y - 30.0f, 4.0f);
+                f.active = true;
+                f.t0 = now;
+                f.end_t = now + 4.0;
+                log += Fmt("game UI: instant throw: goods %d flies at %.1f m/s (%zu arc points)\n", e.a, double(p.speed),
+                           f.arc.points.size());
+            }
+            f.released = false;
+            break;
+        }
+        case BBXR_EV_INSTANT_LAND: {
+            if (instant_flight.active && instant_flight.info.goods == e.a) {
+                instant_flight.end_t = std::min(instant_flight.end_t, now);
+                log += Fmt("game UI: instant throw: goods %d landed after %d ms (how %d)\n", e.a, e.b, e.c);
+            }
+            break;
+        }
         case BBXR_EV_ACTION_DONE: {
             const std::string what = pending.empty() ? std::string("the action") : pending;
             pending.clear();
@@ -651,7 +715,7 @@ void GameUi::Act(const sb::UiAction& a, std::string& log) {
                        a.item + " ignored\n";
                 return;
             }
-            out.b = 0;
+            out.c = 0; // assigned only (c = "then use"); b stays the item id the host checks the inventory entry against
             start_held_slot = slot;
         }
     } else if (a.action == "assign_slot") {
@@ -734,7 +798,7 @@ void GameUi::Act(const sb::UiAction& a, std::string& log) {
         // Could not be held after all (none left): the old behaviour, used at once.
         std::scoped_lock lock{mutex};
         if (!actions.empty() && actions.back().kind == BBXR_UI_ASSIGN_QUICK) {
-            actions.back().b = 1;
+            actions.back().c = 1; // then use it
         }
     }
 }
@@ -881,6 +945,13 @@ void GameUi::FireHeld(const held::Result& r, const FrameInput& in, std::string& 
         return;
     }
     held_fired_at = in.time;
+    if (r.thrown) { // instant items: where the item flies from if the host takes the throw with no animation
+        instant_flight.released = true;
+        instant_flight.release_t = now;
+        instant_flight.origin = r.throw_origin;
+        instant_flight.dir = r.throw_dir;
+        instant_flight.info = r.item;
+    }
     std::scoped_lock lock{mutex};
     SyncHeldSignalLocked(); // the item left the hand: the weapon is back before the use goes out
     const bool aimed_throw = r.thrown && r.has_marker;
@@ -1100,6 +1171,16 @@ void GameUi::Update(const FrameInput& in, std::vector<Haptic>& haptics, std::str
 
     // The debug gun ray: remember the pull, log the aim once per pull (rate limited).
     ray_in_world = true;
+    gun_aiming = (in.pad.reserved[1] & BBXR_RAW_GUN_AIM) != 0 && !(filter.HoldMask() & BBXR_BTN_L2);
+    if (!laser_trim_logged) {
+        laser_trim_logged = true;
+        const sb::UiGameLayout& lg = menus.Layout().game;
+        char tb[160];
+        std::snprintf(tb, sizeof(tb), "gun laser: %s, trim yaw %.1f pitch %.1f deg (+ = right / up)\n",
+                      lg.debug_gun_ray ? "always" : lg.gun_laser.c_str(), lg.gun_laser_yaw_deg,
+                      lg.gun_laser_pitch_deg);
+        log += tb;
+    }
     if ((in.pad.buttons & BBXR_BTN_L2) && !(prev_buttons & BBXR_BTN_L2)) {
         last_pull = now;
         if (in.aim[0].valid && now - last_pull_log > 0.25) {
@@ -1175,11 +1256,11 @@ void GameUi::RefreshBarColors(std::string& log) {
 }
 
 void GameUi::DrawGunRay(const sb::UiGameLayout& g) {
-    const GunRayLook look = GunRayFor(g, ray_in_world, left_aim.valid, now - last_pull);
+    const GunRayLook look = GunRayFor(g, ray_in_world, left_aim.valid, now - last_pull, gun_aiming);
     if (!look.visible) {
         return;
     }
-    const Vec3 dir = Rotate(left_aim.rotation, {0, 0, -1});
+    const Vec3 dir = GunRayTrim(Rotate(left_aim.rotation, {0, 0, -1}), g.gun_laser_yaw_deg, g.gun_laser_pitch_deg);
     const float length = g.debug_gun_ray_length_m;
     const Vec3 from = left_aim.position, to = from + dir * length;
     const Vec3 mid = from + dir * (length * 0.5f);
@@ -1226,6 +1307,10 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
         } else {
             hitbox_log += Fmt("game UI: held item: goods %d mesh file found: %s\n", info.goods,
                               mesh->tried_path.c_str());
+            if (mesh->spec.game_model) {
+                hitbox_log += Fmt("game UI: held item: goods %d is %s; %.3f m long, scale %.3f\n", info.goods,
+                                  mesh->spec.why.c_str(), double(mesh->longest), double(mesh->spec.scale));
+            }
         }
     }
     if (mesh && hands_in.grip[h].valid) {
@@ -1243,17 +1328,20 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
         const held::HandPlacement at_hand = held::PlaceInHand(bone_ok ? dbg.weapon[h] : nullptr,
                                                                hands_in.grip[h].position, hands_in.grip[h].rotation);
         const Mat4 world = held::SocketMeshWorld(mesh->spec, mesh->from_table, info.kind, held_item.Id(), h,
-                                                  at_hand.pos, at_hand.rot);
+                                                  at_hand.pos, at_hand.rot, at_hand.from_bone);
         size_t drawn = 0;
+        // The game's own models carry their texture as is (the blood vials keep some red: their texture
+        // is the glass); the sandbox's / items.json meshes keep the old drink tint.
+        const float tex_tint = mesh->spec.game_model ? mesh->spec.tex_tint
+                                                     : (info.kind == held::Kind::Mouth ? 0.85f : 0.0f);
         if (hands) {
             std::vector<Vec3> pos, nrm;
             held::TransformModel(mesh->model, world, pos, nrm);
-            drawn = held::AddModel(*hands, mesh->model, pos, nrm, tint, held_meshes.Sheet(assets),
-                                    info.kind == held::Kind::Mouth ? 0.85f : 0.0f);
+            drawn = held::AddModel(*hands, mesh->model, pos, nrm, tint, held_meshes.Sheet(assets), tex_tint,
+                                    mesh->spec.tex_gain);
         } else {
             drawn = held::AppendMesh(hud_canvas.top, mesh->model, world, tint, head_pose.position,
-                                      held_meshes.Sheet(assets),
-                                      info.kind == held::Kind::Mouth ? 0.85f : 0.0f);
+                                      held_meshes.Sheet(assets), tex_tint, mesh->spec.tex_gain);
         }
         if (grip && held_logged.insert(-info.goods - 1000000).second) { // once: it was really drawn
             const Vec3 c = {world.m[12], world.m[13], world.m[14]};
@@ -1279,7 +1367,7 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
                               !mesh ? "no mesh or stand-in" : "the hand's grip pose is not valid");
         }
     }
-    if (held_item.Progress() > 0.0f || held_item.InContact()) {
+    if (g.held.hand_ring && (held_item.Progress() > 0.0f || held_item.InContact())) {
         hud_canvas.Sector(panel, 0, 0, 1.5708f, 3.1416f * std::max(held_item.Progress(), 0.05f), ring_in,
                           ring_in + 0.006f, {1.0f, 1.0f, 1.0f, 1.0f});
     }
@@ -1289,7 +1377,7 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
         hud_canvas.Text(panel, 0.0f, ring_in + 0.039f, 0.013f, held_item.CancelHint(), {0.8f, 0.8f, 0.8f, 1},
                         sb::UiAlign::Center);
     }
-    if (grip && info.kind == held::Kind::Mouth && head_pose.valid) {
+    if (g.held.hand_ring && grip && info.kind == held::Kind::Mouth && head_pose.valid) {
         // The mouth, as a faint ring.
         const Vec3 mouth = head_pose.position + Rotate(head_pose.rotation, g.held.mouth);
         const sb::UiPanel ring = sb::UiPanel::Facing(mouth, head_pose.position, {0, 1, 0});
@@ -1299,6 +1387,42 @@ void GameUi::DrawHeldItem(const sb::UiGameLayout& g, held::TriBatch* hands) {
     }
     hud_canvas.on_top = false;
     hud_canvas.alpha = 1.0f;
+}
+
+void GameUi::DrawInstantFlight() {
+    InstantFlight& f = instant_flight;
+    if (!f.active) {
+        return;
+    }
+    if (now > f.end_t || f.arc.points.empty()) {
+        f.active = false;
+        return;
+    }
+    // ComputeArc's points are 1/60 s apart (the first is the release).
+    const double t = std::max(0.0, now - f.t0) * 60.0;
+    const size_t i = std::min(size_t(t), f.arc.points.size() - 1);
+    const size_t j = std::min(i + 1, f.arc.points.size() - 1);
+    const float k = float(std::clamp(t - double(i), 0.0, 1.0));
+    const Vec3 at = f.arc.points[i] + (f.arc.points[j] - f.arc.points[i]) * k;
+    if (i + 1 >= f.arc.points.size() && f.arc.hit_floor) {
+        f.end_t = std::min(f.end_t, now + 0.1); // our arc ended (its floor): wait briefly for the host's landing
+    }
+    hud_canvas.on_top = true;
+    hud_canvas.alpha = 1.0f;
+    const held::MeshCache::Entry* mesh = held_meshes.Resolve(assets, f.info.goods);
+    if (mesh) {
+        // The game's own model flies centred on the arc at its real size; the others as before.
+        const Mat4 world = mesh->spec.game_model
+                               ? held::FlightMeshWorld(mesh->spec, at)
+                               : held::SocketMeshWorld(mesh->spec, mesh->from_table, f.info.kind,
+                                                       BBXR_ITEM_GOODS | uint32_t(f.info.goods), 1, at, Quat{});
+        held::AppendMesh(hud_canvas.top, mesh->model, world, mesh->spec.color, head_pose.position, held_meshes.Sheet(assets),
+                         mesh->spec.game_model ? mesh->spec.tex_tint : 0.0f, mesh->spec.tex_gain);
+    } else {
+        const sb::UiPanel panel = sb::UiPanel::Facing(at, head_pose.position, {0, 1, 0});
+        hud_canvas.Disc(panel, 0, 0, 0.03f, {0.3f, 0.7f, 1.0f, 1.0f});
+    }
+    hud_canvas.on_top = false;
 }
 
 bool GameUi::CustomHandsOn() const {
@@ -1477,6 +1601,7 @@ bool GameUi::Build() {
     }
     hud_canvas.on_top = false;
     hud_canvas.alpha = 1.0f;
+    DrawInstantFlight();
     if (const held::ThrowArc* arc = held_item.Aim()) {
         DrawThrowAim(hud_canvas, *arc, head_pose.position);
     }

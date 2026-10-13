@@ -71,8 +71,14 @@ struct GunRayLook {
     float width_m = 0.0f, alpha = 0.0f;
 };
 constexpr double kGunRayFlashS = 0.3;
+/// Visible when game.gun_laser is "always" (or debug_gun_ray), or "hold" while `aiming` (left
+/// trigger held in the gun role) or within the flash after the shot. "off" hides it.
 GunRayLook GunRayFor(const sb::UiGameLayout& game, bool in_world, bool aim_valid,
-                     double since_pull_s);
+                     double since_pull_s, bool aiming = false);
+/// The ray direction with the laser trim, the same as the host's vg_trim (src/vr_gun_math.h) in
+/// this space (right = +X, up = +Y, forward = -Z): the heading turned by yaw_deg about the
+/// world vertical (+ = right), the pitch raised by pitch_deg (clamped to +-89).
+m3::Vec3 GunRayTrim(m3::Vec3 dir, float yaw_deg, float pitch_deg);
 /// A world direction as yaw (radians, 0 = -Z, left positive) and pitch (up positive), relative
 /// to the head's own yaw/pitch when `head` is given.
 void AimAngles(m3::Vec3 dir, const m3::Quat* head, float* yaw, float* pitch);
@@ -121,6 +127,10 @@ public:
     size_t HudVertices() const { return hud_canvas.world.size() + hud_canvas.top.size(); }
     /// The HUD's front-layer triangles of the last Build (the held item, the hands: tests and the offline render).
     const std::vector<sb::UiVertex>& HudTop() const { return hud_canvas.top; }
+    /// The icon atlas (icons + the item texture sheet) the HUD pipeline samples: the held meshes'
+    /// textured triangles carry uvs in it (sb::ItemSheet::Uv). 0 x 0 when there is none.
+    uint32_t HudAtlasWidth() const { return hud_atlas_w; }
+    uint32_t HudAtlasHeight() const { return hud_atlas_h; }
     /// The custom hands (vr_hand_model.h): on (the layout's custom_hands.on or BB_XR_CUSTOM_HANDS)
     /// and loaded; the triangles they drew last Build.
     bool CustomHandsOn() const;
@@ -174,6 +184,7 @@ private:
     sb::UiFont hud_font;
     sb::UiRenderer hud_gpu;
     bool hud_gpu_ready = false;
+    uint32_t hud_atlas_w = 0, hud_atlas_h = 0; // the icon atlas given to hud_gpu (with the item sheet)
     sb::UiCanvas hud_canvas{nullptr, &hud_font};
     sb::SwingReadout readout;
     sb::bars::Colors bar_colors; // the wrist bars' colours (layout, env, control file)
@@ -227,11 +238,25 @@ private:
     m3::Quat held_grip_rot;          // the holding hand's grip rotation this frame (StepHeld)
     double last_pull = -1e9;         // the last left-trigger (L2) pull
     double last_pull_log = -1e9;
+    bool gun_aiming = false;         // the left trigger is held in the gun role (reserved[1])
+    bool laser_trim_logged = false;
     bool ray_in_world = false;    void (*recenter)() = nullptr;
     // The item in a hand (physical items).
     held::HeldItem held_item;
     double held_menu_ignore_until = -1.0; // the menu that took the pick is closing
     double held_fired_at = -1e9;
+    // Instant items (docs/vr/findings/44): the last throw's release (headset space) and, once the host says it
+    // took the throw with no animation (BBXR_EV_INSTANT_THROW), the item drawn along its flight until _LAND.
+    struct InstantFlight {
+        bool released = false;
+        double release_t = -1e9;
+        m3::Vec3 origin, dir;
+        held::ItemInfo info;
+        bool active = false;
+        double t0 = 0.0, end_t = 0.0;
+        held::ThrowArc arc;
+    } instant_flight;
+    void DrawInstantFlight();
     std::atomic<int> held_marker_hand{-1};
     int32_t held_sig_id = 0;              // the item the host was told is in a hand (0: none)
     int held_sig_hand = 1;

@@ -84,7 +84,7 @@ class DisplaySizeWithPresetsTests(unittest.TestCase):
         v = S.effective_values(S.apply_changes(s, {'display_scale': '125'}, {}), {})
         self.assertEqual(v['display_scale'], '125')  # the player's % over the preset's 70
         self.assertEqual(S.effective_values(S.set_quality(S.apply_changes(S.default_settings(), {'display_size': 'quest3'}, {}), 'Low'), {})['display_size'], 'quest3')
-        self.assertEqual(S.apply_changes(s, {'display_size': 'auto'}, {})['hw'], {})
+        self.assertEqual(S.apply_changes(s, {'display_size': 'game'}, {})['hw'], {})  # back to the default
 
     def test_the_table_and_the_page_list_it(self):
         rows = {p['name']: dict(p['rows']) for p in S.preset_table({})['presets']}

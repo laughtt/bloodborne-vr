@@ -403,6 +403,51 @@ void TestGunRay() {
     const vrui::GunRayLook shot = GunRayFor(layout.game, true, true, 0.1);
     CHECK(shot.flash && shot.width_m > idle.width_m && shot.alpha > idle.alpha);
     CHECK(!GunRayFor(layout.game, true, true, 0.31).flash);
+    // gun_laser modes: hold (default) shows only while aiming or in the flash.
+    sb::UiLayout hold;
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2}}", hold, error));
+    CHECK(hold.game.gun_laser == "hold" && hold.game.gun_laser_yaw_deg == 10.0f && // the default: 10 deg right, with gun_yaw=10 in the packaged fp.txt
+          hold.game.gun_laser_pitch_deg == 0.0f);
+    CHECK(!GunRayFor(hold.game, true, true, 5.0, false).visible);
+    CHECK(GunRayFor(hold.game, true, true, 5.0, true).visible);
+    CHECK(!GunRayFor(hold.game, true, true, 5.0, true).flash);
+    CHECK(GunRayFor(hold.game, true, true, 0.1, false).visible && GunRayFor(hold.game, true, true, 0.1, false).flash);
+    CHECK(!GunRayFor(hold.game, false, true, 5.0, true).visible);
+    CHECK(!GunRayFor(hold.game, true, false, 5.0, true).visible);
+    hold.game.debug_gun_ray = true; // the old flag means always
+    CHECK(GunRayFor(hold.game, true, true, 5.0, false).visible);
+    sb::UiLayout off, always, trim;
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"gun_laser\": \"off\"}}", off, error));
+    CHECK(!GunRayFor(off.game, true, true, 0.1, true).visible);
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"gun_laser\": \"always\"}}", always, error));
+    CHECK(GunRayFor(always.game, true, true, 5.0, false).visible);
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"gun_laser\": \"bogus\", \"gun_laser_yaw_deg\": 10, "
+                          "\"gun_laser_pitch_deg\": -5}}", trim, error));
+    CHECK(trim.game.gun_laser == "hold" && trim.game.gun_laser_yaw_deg == 10.0f &&
+          trim.game.gun_laser_pitch_deg == -5.0f);
+    // The trim, matching the host's vg_trim (+ yaw = right, + pitch = up; here forward is -Z,
+    // right +X, up +Y; vg_trim uses +Z forward so only z flips).
+    {
+        const float rad = 3.14159265f / 180.0f;
+        const m3::Vec3 same = vrui::GunRayTrim({0, 0, -1}, 0, 0);
+        CHECK(same.z == -1.0f && same.x == 0.0f);
+        const m3::Vec3 r = vrui::GunRayTrim({0, 0, -1}, 10, 0);
+        CHECK(r.x > 0.0f && std::fabs(r.x - std::sin(10 * rad)) < 1e-5f &&
+              std::fabs(r.z + std::cos(10 * rad)) < 1e-5f && std::fabs(r.y) < 1e-6f);
+        const m3::Vec3 u = vrui::GunRayTrim({0, 0, -1}, 0, 10);
+        CHECK(u.y > 0.0f && std::fabs(u.y - std::sin(10 * rad)) < 1e-5f);
+        const m3::Vec3 l = vrui::GunRayTrim({0, 0, -1}, -10, 0);
+        CHECK(l.x < 0.0f);
+        // Turned about the world vertical: a ray pitched up 30 deg keeps its pitch under yaw.
+        const m3::Vec3 up30{0, std::sin(30 * rad), -std::cos(30 * rad)};
+        const m3::Vec3 yawed = vrui::GunRayTrim(up30, 10, 0);
+        CHECK(std::fabs(yawed.y - up30.y) < 1e-5f && yawed.x > 0.0f);
+        // A ray already facing right (+X): + yaw turns it back toward +Z (clockwise from above).
+        const m3::Vec3 e = vrui::GunRayTrim({1, 0, 0}, 10, 0);
+        CHECK(e.z > 0.0f);
+        const m3::Vec3 steep = vrui::GunRayTrim({0, 0, -1}, 0, 120);
+        CHECK(std::fabs(steep.y - std::sin(89 * rad)) < 1e-5f);
+    }
     // Angles: straight ahead (-Z) is 0/0; head-relative removes the head's yaw.
     float yaw, pitch;
     vrui::AimAngles({0, 0, -1}, nullptr, &yaw, &pitch);
@@ -2775,6 +2820,9 @@ void TestCollisionHaptics(const fs::path& assets) {
     CHECK(l.game.collision_haptics.on && l.game.held_items);
     CHECK(std::fabs(l.game.collision_haptics.wall.amplitude - 0.9f) < 1e-5f);
     CHECK(std::fabs(l.game.held.mouth_radius_m - 0.24f) < 1e-6f && std::fabs(l.game.held.throw_min_speed - 1.5f) < 1e-6f);
+    CHECK(!l.game.held.hand_ring); // no rings around the hand by default
+    sb::UiLayout ringed;
+    CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"held\": {\"hand_ring\": true}}}", ringed, error) && ringed.game.held.hand_ring);
     sb::UiLayout c;
     CHECK(sb::ParseLayout("{\"game\": {\"version\": 2, \"held_items\": false, \"held\": {\"mouth_radius_m\": 0.2, "
                           "\"throw_min_speed\": 100, \"release_squeeze\": 2.0}, \"collision_haptics\": {\"on\": false, "
@@ -3387,7 +3435,7 @@ void TestCustomHandsInGame(const fs::path& assets) {
 fs::path FullAssets(const fs::path& assets, const char* name, const std::string& game_extra) {
     const fs::path dir = HeldAssets(assets, name, game_extra);
     std::error_code ec;
-    for (const char* d : {"hands", "items", "consumables", "throwables"}) {
+    for (const char* d : {"hands", "items", "consumables", "throwables", "held"}) {
         if (fs::exists(assets / d)) {
             fs::copy(assets / d, dir / d, fs::copy_options::recursive, ec);
         }
@@ -3960,7 +4008,7 @@ void TestHeldAtGameHand(const fs::path& assets) {
         const m3::Quat bq = m3::ToQuat(rot);
         const m3::Mat4 world = vrui::held::SocketMeshWorld(
             e->spec, e->from_table, r.ui.HeldItemState().Info().kind, Goods(1000), h,
-            with_bone ? bp : r.in.grip[h].position, with_bone ? bq : r.in.grip[h].rotation);
+            with_bone ? bp : r.in.grip[h].position, with_bone ? bq : r.in.grip[h].rotation, with_bone);
         std::vector<m3::Vec3> pos, nrm;
         vrui::held::TransformModel(e->model, world, pos, nrm);
         CHECK(MatchingVertices(r.ui.HudTop(), pos) >= 6);
@@ -3995,7 +4043,7 @@ void TestHeldPlacementBothModes(const fs::path& assets) {
             continue;
         }
         const bool table = vrui::held::MeshFor(goods) != nullptr;
-        CHECK(e->from_table == table);
+        CHECK(e->from_table == (table && !e->spec.game_model)); // the game's own model is not the sandbox's row
         const m3::Mat4 world = vrui::held::SocketMeshWorld(e->spec, e->from_table, game.ui.HeldItemState().Info().kind,
                                                            BBXR_ITEM_GOODS | uint32_t(goods), h, game.in.grip[h].position,
                                                            game.in.grip[h].rotation);
@@ -4036,6 +4084,12 @@ void TestHeldPlacementBothModes(const fs::path& assets) {
                 hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
             }
             const float longest = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z});
+            if (e->spec.game_model && e->spec.real_size) {
+                // the game's own model (held/): the size the game draws it at (a rigid placement, scale 1)
+                CHECK(e->spec.scale == 1.0f && std::fabs(m3::Length(m3::TransformDir(w, {0, 0, 1})) - 1.0f) < 1e-4f);
+                CHECK(e->longest > 0.02f && e->longest < 1.0f && longest < 1.8f * e->longest);
+                continue;
+            }
             CHECK(std::fabs(longest - t.target) < 0.10f * t.target);
             if (vrui::hand::CategoryFor(Goods(t.goods)) == vrui::hand::HoldCategory::Bottle) {
                 const m3::Vec3 c = (lo + hi) * 0.5f;
@@ -4043,7 +4097,7 @@ void TestHeldPlacementBothModes(const fs::path& assets) {
             }
         }
         const auto* vial = cache.Resolve(assets, 1000);
-        if (vial && !vial->standin) {
+        if (vial && !vial->standin && !vial->spec.game_model) {
             // the neck (mesh +Y) points out of the thumb side (grip -Z)
             const m3::Mat4 w = vrui::held::SocketMeshWorld(vial->spec, vial->from_table, vrui::held::Kind::Mouth,
                                                            Goods(1000), 1, {0, 0, 0}, {0, 0, 0, 1});
@@ -4054,7 +4108,7 @@ void TestHeldPlacementBothModes(const fs::path& assets) {
     {
         vrui::held::MeshCache cache;
         const auto* e = cache.Resolve(assets, 1000);
-        CHECK(e && e->from_table);
+        CHECK(e && (e->from_table || e->spec.game_model)); // the sandbox's row, or the game's own model
         if (e) {
             const m3::Quat rot = m3::FromEulerDeg({10.0f, 20.0f, 30.0f});
             const m3::Mat4 a = vrui::held::SocketMeshWorld(e->spec, true, vrui::held::Kind::Mouth, Goods(1000), 1,
@@ -4070,6 +4124,216 @@ void TestHeldPlacementBothModes(const fs::path& assets) {
             CHECK(std::fabs(m3::Translation(l).x + m3::Translation(rr).x) < 1e-6f);
         }
     }
+}
+
+/// A bbmodel box (one mesh range) of size `size` centred on `centre`: <dir>/<name>.json + .bin.
+void WriteBoxModel(const fs::path& dir, const std::string& name, m3::Vec3 centre, m3::Vec3 size) {
+    std::vector<sb::Vertex> v;
+    std::vector<uint32_t> idx;
+    const m3::Vec3 h = size * 0.5f;
+    for (int i = 0; i < 8; ++i) {
+        sb::Vertex x{};
+        const m3::Vec3 s{(i & 1) ? 1.0f : -1.0f, (i & 2) ? 1.0f : -1.0f, (i & 4) ? 1.0f : -1.0f};
+        x.position[0] = centre.x + s.x * h.x, x.position[1] = centre.y + s.y * h.y, x.position[2] = centre.z + s.z * h.z;
+        const m3::Vec3 n = m3::Normalize(s, {0, 1, 0});
+        x.normal[0] = n.x, x.normal[1] = n.y, x.normal[2] = n.z;
+        x.weights[0] = 1.0f;
+        v.push_back(x);
+    }
+    for (const uint32_t i : {0u, 2u, 1u, 1u, 2u, 3u, 4u, 5u, 6u, 5u, 7u, 6u, 0u, 1u, 4u, 1u, 5u, 4u,
+                             2u, 6u, 3u, 3u, 6u, 7u, 0u, 4u, 2u, 2u, 4u, 6u, 1u, 3u, 5u, 3u, 7u, 5u}) {
+        idx.push_back(i);
+    }
+    fs::create_directories(dir);
+    std::ofstream bin(dir / (name + ".bin"), std::ios::binary);
+    bin.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * sizeof(sb::Vertex)));
+    bin.write(reinterpret_cast<const char*>(idx.data()), std::streamsize(idx.size() * sizeof(uint32_t)));
+    std::ofstream js(dir / (name + ".json"), std::ios::binary);
+    js << "{\"format\": \"bbmodel\", \"version\": 1, \"name\": \"" << name << "\", \"bin\": \"" << name
+       << ".bin\", \"vertex_layout\": {\"stride\": 56}, \"vertex_count\": " << v.size()
+       << ", \"vertices_offset\": 0, \"index_count\": " << idx.size()
+       << ", \"indices_offset\": " << v.size() * sizeof(sb::Vertex)
+       << ", \"bones\": [], \"dummies\": [], \"meshes\": [{\"name\": \"" << name
+       << "/0\", \"first_index\": 0, \"index_count\": " << idx.size() << ", \"first_vertex\": 0, \"vertex_count\": "
+       << v.size() << "}]}";
+}
+
+/// held/held.json (scripts/vr_assets/held_extract.py): the models the game itself draws in the hand.
+/// A synthetic index first (the lookup order, the real size, both sockets, the left-hand mirror, the
+/// centring of a model without a hand dummy, the flight), then the real folder when it was extracted.
+void TestHeldGameModels(const fs::path& assets) {
+    using namespace vrui::held;
+    const fs::path dir = fs::temp_directory_path() / "bbport_held_game_models";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    // 1000: a 18 cm vial whose frame is not its centre, with both sockets; 1411: a vfx model (no hand
+    // dummy); 1100: a guess (no real size).
+    WriteBoxModel(dir / "held", "1000", {0.0f, 0.015f, 0.0f}, {0.04f, 0.18f, 0.04f});
+    WriteBoxModel(dir / "held", "1411", {0.01f, 0.02f, 0.03f}, {0.055f, 0.036f, 0.036f});
+    WriteBoxModel(dir / "held", "1100", {0.0f, 0.0f, 0.0f}, {0.07f, 0.15f, 0.07f});
+    {
+        std::ofstream f(dir / "held" / "held.json", std::ios::binary);
+        f << R"JSON({"format": "bbheld", "version": 1, "items": [
+          {"goods": 1000, "name": "Blood Vial", "mesh": "1000.json", "size_m": [0.04, 0.18, 0.04], "centre": [0.0, 0.015, 0.0],
+           "socket": {"pos": [0.01, -0.02, 0.03], "rot_deg": [-90.0, 0.0, 0.0], "dummy": 1, "hand_bone": "R_Hand"},
+           "grip_socket": {"pos": [-0.03, 0.0, 0.0], "rot_deg": [0.0, 90.0, 0.0], "dummy": 1, "hand_bone": "R_Hand"},
+           "confidence": "game", "sources": ["s10002 x (1, 1, 1)"],
+           "chain": {"step": "use animation", "anim": "a000_100080", "event": "TAE 96 ffx 20156 dummy 1"}},
+          {"goods": 1411, "name": "Monocular", "mesh": "1411.json", "centre": [0.01, 0.02, 0.03], "socket": null,
+           "grip_socket": null, "confidence": "game (vfx, not at the hand)", "sources": [], "chain": {"step": "SpEffect vfx"}},
+          {"goods": 1100, "name": "Antidote", "mesh": "1100.json", "centre": [0, 0, 0], "socket": null,
+           "confidence": "guess", "sources": [], "chain": {"step": "guess"}}]})JSON";
+    }
+    // the lookup: held/ before the sandbox's own row (the vial's consumables/cs_1000) and items.json
+    const MeshSpec* vial = MeshFor(dir, 1000);
+    CHECK(MeshFor(1000) != nullptr); // the sandbox has a row for the vial...
+    CHECK(vial && vial->file == "held/1000.json" && vial->game_model && vial->real_size); // ...held/ wins
+    CHECK(vial && vial->has_socket && vial->has_grip_socket && vial->why.find("a000_100080") != std::string::npos);
+    CHECK(vial && IsBloodVial(1000) && vial->tex_tint > 0.0f && !IsBloodVial(1200) && vial->tex_gain == 1.0f);
+    const MeshSpec* guess = MeshFor(dir, 1100);
+    CHECK(guess && guess->game_model && !guess->real_size && !guess->has_socket);
+    CHECK(MeshFor(dir, 1300) == nullptr); // not in held/, no sandbox row, no items.json here
+    // the cache: real size kept for the game's models, the in-game size for a guess
+    MeshCache cache;
+    const MeshCache::Entry* e = cache.Resolve(dir, 1000);
+    CHECK(e && !e->standin && !e->from_table && e->spec.scale == 1.0f && std::fabs(e->longest - 0.18f) < 1e-4f);
+    const MeshCache::Entry* g = cache.Resolve(dir, 1100);
+    CHECK(g && !g->standin && std::fabs(g->spec.scale * g->longest - InGameTarget(1100, false, vrui::hand::HoldCategory::Bottle)) < 1e-4f);
+    if (e) {
+        const m3::Vec3 gp{0.2f, 1.1f, -0.4f};
+        const m3::Quat gq = m3::FromEulerDeg({15.0f, -30.0f, 5.0f});
+        // the game's hand bone: the mesh frame sits at the bone socket
+        const m3::Mat4 wb = SocketMeshWorld(e->spec, false, Kind::Mouth, Goods(1000), 1, gp, gq, true);
+        CHECK(m3::Length(m3::Translation(wb) - (gp + m3::Rotate(gq, {0.01f, -0.02f, 0.03f}))) < 1e-5f);
+        CHECK(m3::Length(m3::TransformDir(wb, {0, 1, 0}) - m3::Rotate(gq, m3::Rotate(m3::FromEulerDeg({-90, 0, 0}), {0, 1, 0}))) < 1e-5f);
+        // a controller grip: the grip socket (the arms IK's hand at the controller)
+        const m3::Mat4 wc = SocketMeshWorld(e->spec, false, Kind::Mouth, Goods(1000), 1, gp, gq);
+        CHECK(m3::Length(m3::Translation(wc) - (gp + m3::Rotate(gq, {-0.03f, 0.0f, 0.0f}))) < 1e-5f);
+        // the left hand mirrors the socket across the grip's X
+        const m3::Mat4 wl = SocketMeshWorld(e->spec, false, Kind::Mouth, Goods(1000), 0, {0, 0, 0}, {0, 0, 0, 1}, true);
+        CHECK(std::fabs(m3::Translation(wl).x + 0.01f) < 1e-6f && std::fabs(m3::Translation(wl).y + 0.02f) < 1e-6f);
+        // in flight: the mesh centred on the arc point
+        const m3::Mat4 wf = FlightMeshWorld(e->spec, {1.0f, 2.0f, 3.0f});
+        CHECK(m3::Length(m3::TransformPoint(wf, e->spec.centre) - m3::Vec3{1.0f, 2.0f, 3.0f}) < 1e-6f);
+    }
+    // a game model with no hand dummy: its centre goes where the category's socket puts a centred mesh
+    const MeshCache::Entry* mono = cache.Resolve(dir, 1411);
+    CHECK(mono && mono->spec.game_model && !mono->spec.has_socket);
+    if (mono) {
+        const m3::Mat4 w = SocketMeshWorld(mono->spec, false, Kind::Mouth, Goods(1411), 1, {0, 0, 0}, {0, 0, 0, 1});
+        const m3::Mat4 sock = vrui::hand::SocketWorld(vrui::hand::GripFor(Goods(1411)), 1, {0, 0, 0}, {0, 0, 0, 1});
+        CHECK(m3::Length(m3::TransformPoint(w, mono->spec.centre) - m3::Translation(sock)) < 1e-5f);
+    }
+    // through the game UI: holding the vial draws the held/ mesh and logs where it came from
+    if (fs::exists(assets / "ui" / "icons.json")) {
+        const fs::path game_dir = HeldAssets(assets, "bbport_game_ui_held_models", "");
+        fs::copy(dir / "held", game_dir / "held", fs::copy_options::recursive, ec);
+        Rig r;
+        std::string log;
+        CHECK(HoldItem(r, game_dir, 1000, log));
+        CHECK(r.all_log.find("game UI: held item: goods 1000 mesh file found: ") != std::string::npos &&
+              r.all_log.find("1000.json") != std::string::npos);
+        CHECK(r.all_log.find("game UI: held item: goods 1000 is the game's model (game): use animation a000_100080") !=
+              std::string::npos);
+        const int h = r.ui.HeldItemState().Hand();
+        MeshCache c2;
+        const MeshCache::Entry* ge = c2.Resolve(game_dir, 1000);
+        CHECK(ge && h >= 0);
+        if (ge && h >= 0) {
+            const m3::Mat4 world = SocketMeshWorld(ge->spec, ge->from_table, r.ui.HeldItemState().Info().kind, Goods(1000),
+                                                   h, r.in.grip[h].position, r.in.grip[h].rotation);
+            std::vector<m3::Vec3> pos, nrm;
+            TransformModel(ge->model, world, pos, nrm);
+            CHECK(MatchingVertices(r.ui.HudTop(), pos) >= 6);
+        }
+    }
+    fs::remove_all(dir, ec);
+    // the real folder, when extracted: the items the game draws in the hand, at their own size
+    if (!fs::exists(assets / "held" / "held.json")) {
+        std::printf("held game models (real folder): skipped (no held/held.json under %s)\n", assets.string().c_str());
+        return;
+    }
+    const struct {
+        int goods;
+        float lo, hi; // the longest side the game draws it at (m)
+    } kReal[] = {{1000, 0.15f, 0.20f}, {703, 0.15f, 0.20f}, {1101, 0.13f, 0.18f}, {1120, 0.12f, 0.16f},
+                 {2030, 0.10f, 0.14f}, {1200, 0.26f, 0.32f}, {1220, 0.15f, 0.20f}, {1230, 0.10f, 0.14f},
+                 {1240, 0.36f, 0.44f}, {1250, 0.26f, 0.32f}, {1260, 0.22f, 0.27f}, {1270, 0.20f, 0.25f},
+                 {200, 0.15f, 0.19f}, {205, 0.20f, 0.25f}, {225, 0.16f, 0.20f}, {2050, 0.11f, 0.14f}};
+    MeshCache real;
+    for (const auto& k : kReal) {
+        const MeshCache::Entry* x = real.Resolve(assets, k.goods);
+        CHECK(x && !x->standin && x->spec.game_model && x->spec.file == "held/" + std::to_string(k.goods) + ".json");
+        if (!x) {
+            continue;
+        }
+        CHECK(x->spec.scale == 1.0f && x->longest > k.lo && x->longest < k.hi);
+        CHECK(x->spec.has_socket && x->spec.has_grip_socket); // all come from a hand dummy of the use animation
+        CHECK(m3::Length(x->spec.socket_pos) < 0.10f && m3::Length(x->spec.grip_pos) < 0.10f); // in the hand
+        CHECK(x->spec.tex_gain >= 1.0f && x->spec.tex_gain <= 2.5f && (k.goods != 1240 || x->spec.tex_gain > 1.5f));
+        if (x->longest <= k.lo || x->longest >= k.hi) {
+            std::printf("  held game model %d: longest %.3f m\n", k.goods, double(x->longest));
+        }
+    }
+    std::printf("held game models (real folder): %zu goods checked under %s\n", std::size(kReal), assets.string().c_str());
+}
+
+/// The held meshes are textured in the game: every textured submesh of held/ names a texture of the item
+/// sheet, the HUD pipeline (which draws them) has the icon atlas with the sheet appended (it used to keep
+/// its 1x1 white default: untextured in the headset), and holding an item puts icon-mode triangles with
+/// uvs inside that texture's rect into the HUD.
+void TestHeldTexturesInHud(const fs::path& assets) {
+    sb::ItemSheet sheet;
+    if (!fs::exists(assets / "held" / "held.json") || !sheet.Load(assets)) {
+        std::printf("held textures in the HUD: skipped (no held/ or item sheet under %s)\n", assets.string().c_str());
+        return;
+    }
+    // 1. every held/ mesh's textures are in the sheet
+    vrui::held::MeshCache cache;
+    int textured_items = 0;
+    for (const int goods : {1000, 703, 1101, 1120, 2030, 1200, 1220, 1230, 1240, 1250, 1260, 1270, 200, 205, 225, 2050}) {
+        const vrui::held::MeshCache::Entry* e = cache.Resolve(assets, goods);
+        CHECK(e && e->spec.game_model);
+        if (!e) {
+            continue;
+        }
+        bool any = false;
+        for (const sb::MeshRange& r : e->model.meshes) {
+            if (!r.texture.empty()) {
+                any = true;
+                CHECK(sheet.rects.count(r.texture) == 1);
+            }
+        }
+        textured_items += any;
+    }
+    CHECK(textured_items >= 14);
+    // 2. through the game UI: the HUD atlas is the layout the uvs are computed for, and the vial's
+    //    triangles in the HUD sample its texture
+    const fs::path dir = FullAssets(assets, "bbport_game_ui_held_textures", "");
+    Rig r;
+    std::string log;
+    CHECK(HoldItem(r, dir, 1000, log));
+    CHECK(r.ui.HudAtlasWidth() == sheet.Width() && r.ui.HudAtlasHeight() == sheet.Height() && sheet.Height() > sheet.icons_h);
+    const vrui::held::MeshCache::Entry* vial = cache.Resolve(assets, 1000);
+    const auto it = vial && !vial->model.meshes.empty() ? sheet.rects.find(vial->model.meshes[0].texture) : sheet.rects.end();
+    CHECK(it != sheet.rects.end());
+    if (it == sheet.rects.end()) {
+        return;
+    }
+    const auto& rc = it->second;
+    const float u0 = float(rc[0]) / float(sheet.Width()), u1 = float(rc[0] + rc[2]) / float(sheet.Width());
+    const float v0 = float(sheet.icons_h + uint32_t(rc[1])) / float(sheet.Height());
+    const float v1 = float(sheet.icons_h + uint32_t(rc[1] + rc[3])) / float(sheet.Height());
+    size_t icon_mode = 0, inside = 0;
+    for (const sb::UiVertex& v : r.ui.HudTop()) {
+        if (v.shape[0] == 1.0f && v.shape[1] == 1.0f) {
+            ++icon_mode;
+            inside += v.uv[0] >= u0 && v.uv[0] <= u1 && v.uv[1] >= v0 && v.uv[1] <= v1;
+        }
+    }
+    CHECK(icon_mode >= 3 * 100 && inside == icon_mode); // the vial's ~180 visible triangles, all in s10002
+    std::printf("held textures in the HUD: atlas %ux%u, %zu textured vertices of the vial\n", sheet.Width(),
+                sheet.Height(), icon_mode);
 }
 
 // ---- The custom character model override (vr_skin_model.h) ----
@@ -4402,7 +4666,8 @@ int RenderHeld(const fs::path& assets, const fs::path& out_dir, int view = 0) {
     const fs::path dirs[2] = {FullAssets(assets, "bbport_game_ui_render_hands", ", \"custom_hands\": {\"on\": true}"),
                               FullAssets(assets, "bbport_game_ui_render_game", "")};
     const char* names[2] = {"hands", "game"};
-    const int goods_list[] = {205, 1000, 1100, 1120, 1200, 1220, 1230, 1240, 1300, 2030, 200, 4312, 100, 1410};
+    const int goods_list[] = {205, 1000, 703, 1100, 1101, 1120, 1200, 1220, 1230, 1240, 1270, 1300, 2030, 200,
+                              4312, 100, 1410};
     std::vector<Image> tiles;
     sb::UiAtlas atlas;
     std::string atlas_log;
@@ -4671,6 +4936,7 @@ int main(int argc, char** argv) {
     TestHeldMeshTable();
     TestUiDrag();
     TestHeldItemsIndex(assets);
+    TestHeldGameModels(assets);
     TestHeldMeshDraw(assets);
     TestHandPoses();
     TestHandAsset(assets);
@@ -4693,6 +4959,7 @@ int main(int argc, char** argv) {
         TestHeldAtGameHand(assets);
         TestHeldMeshInGame(assets);
         TestHeldMeshRealFolder(assets);
+        TestHeldTexturesInHud(assets);
         TestSkinInGame(assets);
         TestCustomHandsInGame(assets);
         TestCollisionHaptics(assets);

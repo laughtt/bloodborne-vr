@@ -52,6 +52,8 @@ extern "C" {
 #define BBXR_GESTURE_VIAL 0x8u      /* left grip at the mouth -> triangle */
 
 #define BBXR_RAW_Y 0x1u
+/* reserved[1]: the left trigger is held in the gun role (fire on release): aiming, no L2 yet. */
+#define BBXR_RAW_GUN_AIM 0x1u
 
 typedef struct BbXrPose {
     float position[3];    /* meters, LOCAL space unless stated otherwise */
@@ -64,7 +66,7 @@ typedef struct BbXrInput {
     uint32_t buttons;  /* BBXR_BTN_*, gesture presses included */
     uint8_t lx, ly, rx, ry; /* sticks 0..255, 128 centered, y down */
     uint8_t l2, r2;    /* analog triggers 0..255 */
-    uint8_t reserved[2]; /* [0]: BBXR_RAW_Y when the Y button itself is down (not a vial gesture) */
+    uint8_t reserved[2]; /* [0]: BBXR_RAW_Y when the Y button itself is down (not a vial gesture); [1]: BBXR_RAW_GUN_AIM */
     uint32_t gestures; /* BBXR_GESTURE_* fired since the previous GetInput */
     float hand_speed[2]; /* m/s, 0 left 1 right */
     BbXrPose head, grip[2], aim[2];
@@ -325,6 +327,12 @@ typedef struct BbXrGameState {
                                    when known (0 unknown), b contact (0 character, 1 wall, 2 object),
                                    c hand (0 left, 1 right). Haptics only: the stamina readout ignores
                                    it. An older bridge ignores unknown events. */
+/* Instant items (src/runtime_vr_items.c, docs/vr/findings/44-instant-items.md): the host used a thrown item
+ * with no animation; the bridge draws the item flying from where its hand let go (its last throw release,
+ * the BulletParam flight of vr_held_items.h ComputeArc) until _LAND. */
+#define BBXR_EV_INSTANT_THROW 6u /* a goods id, b the launch speed in cm/s, c 1 */
+#define BBXR_EV_INSTANT_LAND 7u  /* a goods id, b the flight time in ms, c how it ended (1 map, 2 character,
+                                    3 floor plane, 4 expired) */
 
 typedef struct BbXrGameEvent {
     uint32_t kind;

@@ -15,7 +15,7 @@ paths, is in [findings/26-game-ui.md](findings/26-game-ui.md#controls-in-the-gam
 | Left stick click | Moving: jump. Standing: open / close the **dashboard**. Held 1 s: recenter |
 | Right stick | Turn / camera |
 | Right stick click | Open the **item wheel** |
-| Left trigger | Hold the gun; a left-hand thrust shoots |
+| Left trigger | Hold: aim the gun (laser); release: shoot. A left-hand thrust also shoots |
 | Right trigger | Nothing in the world (it is the pointer click in the dashboard) |
 | Left grip | Transform (L1) |
 | Right grip | Heavy / charge modifier for swings; a quick tap swaps the right weapon |

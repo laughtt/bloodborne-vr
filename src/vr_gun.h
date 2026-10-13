@@ -24,6 +24,10 @@ int vr_gun_view_latest(float rows[4][4], uint64_t *age_us);
 /* The lock-on candidates' world points (the enemies the game would let the player lock onto); returns
  * how many were read (0 before the first launch hook call). */
 int vr_gun_candidate_points(float (*out)[3], int max);
+/* Instant items (src/runtime_vr_items.c, pad thread): a hand position and a direction in the head's frame
+ * (mm, unit x 10000, as BBXR_UI_THROW_ORIGIN / _DIR) into the world with the latest first-person camera;
+ * 0 when there is no camera of the last second or the direction is degenerate. */
+int vr_gun_rel_to_world(const int32_t mm[3], const int32_t dir_1e4[3], float origin[3], float dir[3]);
 /* Reads the environment and registers the bullet launch hook's handler ("bb_hook_vr_gun_aim"). */
 void vr_gun_register(void);
 

@@ -41,6 +41,7 @@
 #include "vr_gun.h"
 #include "vr_fp.h"
 #include "vr_free_bells.h"
+#include "vr_items.h"
 /* Public builds: only the room features run here (the auto-bell's press, a missing bell given, free bells). The
  * general debug give / use tools stay out; the give plan is one bell at most. */
 #define VRDG_MAX_INSIGHT 99999
@@ -556,6 +557,7 @@ static ABI void vu_hook_menu(BbHookContext *ctx) {
     (void)ctx;
     if ((!vu.on && !vu.dbg) || !vu.image) return;
     __atomic_store_n(&vu_hook_us, (uint64_t)(vu_now() * 1e6) + 1u, __ATOMIC_RELEASE);
+    if (vu.on) vr_items_game_step(vu.image); /* instant items (BB_VR_INSTANT_ITEMS, findings/44): uses, flights, bursts */
     vu_debug_give_step();
     vu_debug_speffect_step();
     vu_free_bells_step();
@@ -1185,16 +1187,46 @@ uint32_t runtime_vr_ui_pad(uint32_t buttons_in) {
         }
         vu.then_use = -1;
     }
+    /* Instant items (findings/44): a use the instant path handed back runs the usual way now. */
+    if (vu.on && !vrui_exec_busy(&vu.exec) && __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) == 0) {
+        uint32_t fk = 0, fi = 0;
+        int32_t fs = 0, fsp = 0;
+        if (vr_items_pad_poll(&fk, &fs, &fi, &fsp)) {
+            if (fk == BBXR_UI_USE_QUICK && fsp > 0) {
+                vr_gun_throw_speed(fsp);
+                vr_atkspeed_throw_begin();
+            }
+            vrui_exec_start(&vu.exec, (int)fk, (int)fs, fi, now);
+            if (fk == BBXR_UI_USE_ITEM) vu.exec.item = (uint32_t)fs;
+            vu.exec_reported = 0;
+            fprintf(stderr, "VR UI: action %u (slot %d, item %#x) from the headset, the game's own path (instant items)\n", fk,
+                    (int)fs, (unsigned)fi);
+            fflush(stderr);
+        }
+    }
     /* The user's choices: one at a time (a new one waits while one runs). */
     if (vu.on && !vrui_exec_busy(&vu.exec) && __atomic_load_n(&vq.state, __ATOMIC_ACQUIRE) == 0) {
         BbXrUiAction a;
+        const int instant = vr_items_on(); /* BB_VR_INSTANT_ITEMS / instant_items= (off: the path below is unchanged) */
         while (bbgpu_vr_ui_actions(&a, 1) == 1) {
             if (a.kind == BBXR_UI_THROW_ORIGIN || a.kind == BBXR_UI_THROW_DIR) {
                 /* a thrown item's release (physical items): arms the launch hook, then the use follows */
                 const int32_t v[3] = {a.a, a.b, a.c};
+                if (instant) { /* our own projectile; a use handed back re-arms the launch hook (vr_items_pad_poll) */
+                    if (a.kind == BBXR_UI_THROW_ORIGIN) vr_items_throw_origin(v);
+                    else vr_items_throw_dir(v);
+                    continue;
+                }
                 if (a.kind == BBXR_UI_THROW_ORIGIN) vr_gun_throw_origin(v);
                 else vr_gun_throw_dir(v);
                 continue;
+            }
+            if (instant && (a.kind == BBXR_UI_USE_QUICK || a.kind == BBXR_UI_USE_ITEM) &&
+                vr_items_take(a.kind, a.a, (uint32_t)a.b, a.c)) {
+                fprintf(stderr, "VR UI: action %u (slot %d, item %#x) from the headset: instant items%s\n", a.kind, (int)a.a,
+                        (unsigned)a.b, a.kind == BBXR_UI_USE_QUICK && a.c > 0 ? " (a thrown item)" : "");
+                fflush(stderr);
+                break;
             }
             if (a.kind == BBXR_UI_HELD) {
                 /* the bridge holds an item in a hand (a = hand or -1, b = item): handled at once, never the executor */

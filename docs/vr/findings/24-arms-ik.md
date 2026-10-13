@@ -146,6 +146,7 @@ A1/A2 (animation; any thread; a busy flag)   rax == player pose + 0x18 ?
 | `arm_fore_roll=<0..1>` | share of the wrist roll the Forearm bone takes before the twist bones (0.35) |
 | `arm_fake_r= / arm_fake_l=<x,y,z[,yaw,pitch,roll]>` | fake grips relative to the head (m, deg; right default 0.18, -0.38, -0.32, pitch -20) |
 | `arm_offset=<x,y,z[,pitch]>` | grip -> wrist offset, right hand |
+| `arm_cut=<0..1>\|auto` | the wrist cut (section 9): auto = 0.8 while first person hides the skin's arms, else 0 |
 
 ## 4. Weapons
 
@@ -368,3 +369,148 @@ changes. Test: `test_roll_lag` (body 9 m/s, camera 4 m/s: 0.05 m+ error without 
 Not done: a prediction of the camera's acceleration (the slide's ease), the physics step's position
 between the IK and the render.
 
+### 8.2 Headset feedback: "the hands still shake, especially during rolls" [built, untested in the headset]
+
+Static analysis and unit tests only (no game run). The candidates, with what the code and the logs show:
+
+| Candidate | In the code? | Size |
+|---|---|---|
+| **The grips are measured against another head than the camera's** | yes, the main one | in all play, worse when the head moves |
+| `rel_vel` noise (8.1's lead) | yes | in evades only: ~30 % of the remaining roll shake |
+| The frame time varies (dt) | yes, and it cannot be fixed one frame ahead | in evades: the floor that stays |
+| The 0.1 s detach blend toggling | no | the logs show none |
+| The dash slide's ease | small | ~1-3 cm, smooth (a lag, not a shake) |
+| The game at 30-60 Hz, the headset at 72-120 Hz | it is there, but it is not this bug | judder (one pose per game frame), not a shake |
+
+1. **The head (normal play and rolls).** The hand is placed as `camera . head^-1 . grip`
+   (`vam_grip_to_model`). The camera is H1's, built from `vh.frame.head`. In true stereo that head is
+   predicted for the image's display, extrapolated from the bridge's last two frames (`GetViewsAt`; run26: "views
+   for 111.1 ms ahead"). The `head` in the product was the pad snapshot's (`bbgpu_vr_hands`, the bridge's latest
+   90 Hz frame, 0-11 ms old, so its age changes from one game frame to the next). The scene is drawn with the
+   camera's head, and the compositor reprojects it from that head, so the scene stays still. The hands carry
+   `head_cam . head_pad^-1`: the head's turn over ~0.1 s, plus the prediction's error, plus a different age on every
+   frame. The test (`test_head_pick`: 60 deg/s with a wobble, 50 fps, the stereo log's 111 ms) has a controller
+   held still in the room swim by 113 mm and jump by up to 22 mm between frames. With the camera's own head the
+   error is 0.0 mm. **Fix:** `arm_head=view` (default): the grips are measured against the head the camera was
+   built from (`ArmView.head_pos/head_rot`, the same `vh.frame` as the camera). This needs both heads in one space.
+   The views use the screen's space (LOCAL unless `BB_XR_STAGE=1`) and the grips use LOCAL. If the two heads are
+   more than 0.5 m or 60 deg apart, the code treats them as different spaces and uses the pad's head (logged
+   once). This is `vr_arm_pick_head`.
+2. **The lead's noise (rolls).** 8.1's `rel_vel` is one raw finite difference: one H1's step divided by that H1's
+   wall-clock gap, then multiplied by the arms' wall-clock interval. H1 and the arms each run at their own point
+   in a frame with a few ms of jitter, and the frame time is 17-33 ms (the dash lines: 47 frames in 0.88 s, 29 in
+   0.87 s). So step / gap swings by 10-20 % from frame to frame, which is 1-3 cm at 10 m/s. If H1 sits at the
+   end of the frame instead of the start (not known), the error grows to a full step, because the step and the
+   gap then belong to different frames. Also, the camera position carries the real head's own motion (and its
+   prediction noise), which the hands already follow through the grips, so the lead added it a second time.
+   **Fix:** the step is taken for the point of the headset space where the head is (`vr_roll_head_point`: the
+   camera minus the head's own step; `vr_roll_rel_step`, in metres). The velocity is the low-passed step over the
+   low-passed gap, updated once per new H1 snapshot (`VrRollLead`, `ArmView.seq`; a gap under 4 ms or over 0.1 s
+   restarts it; a step is cut to 0.2 m). It is led by the arms' own frame interval as before (`vr_roll_lead`, at
+   most 0.2 m, scaled by the detach amount). Constant motion is still led exactly.
+3. **What stays: the frame time.** The IK of frame k+1 uses H1(k), and the true step of frame k+1 depends on
+   that frame's time, which is not known yet. With 20 +-2 ms frames and 5 % hitches of 33 ms, at 5 m/s of
+   relative speed, the hand placement error changes by 25 mm rms between frames even with a perfect velocity.
+   This is the "no lead" floor in the test, and a hitch frame costs 8-12 cm. The real fix is to place the hands in
+   the frame that draws them (the arms after the camera, or the body's live position read at IK time). That is
+   the physics-step item of 8.1, still not done.
+4. **Not causes.** The detach blend: every evade in run19/25/26 logs exactly one detach and one attach line,
+   and `evading` is logged on every change, so the clip id does not flicker. The edit runs once per frame
+   (player-site 49-52/s with 49-52 writes), so no second edit with a near-zero dt. The 72-120 Hz headset: the
+   arms are posed once per game frame (A1/A2 run per game frame, and H1 also runs per game frame), so between
+   game frames the compositor only reprojects. That gives judder at 30-60 Hz, but no frame-to-frame error.
+   Only drawing the hands in the bridge (14 option C) would remove it.
+
+**Settings** (all new; nothing existing changed):
+
+| Variable / key | Effect |
+|---|---|
+| `BB_VR_ARMS_HEAD=view\|xr`, `arm_head=view\|xr` | which head the grips are measured against (view; xr = the old behaviour) |
+| `BB_VR_ARMS_LEAD=0\|1`, `arm_lead=0\|1` | the evade lead of 8.1/8.2 on/off (1) |
+| `BB_VR_ARMS_LEAD_SMOOTH=<a>`, `arm_lead_smooth=<0.05..1>` | weight of the newest H1 in the lead's low-pass (0.5; 1 = raw, close to 8.1) |
+
+The control-file line now also prints `roll_detach`, `lead` (and its smoothing) and `head`.
+
+**Tests** (`tests/test_vr_arms.c`, 1208 checks, C and C++):
+- `test_lead_jitter` models a roll at 9 m/s against a camera at 4 +-3 m/s (the ease), a variable-step game loop,
+  H1/arms timing jitter and a bobbing head. Mean hand offset, then the frame-to-frame change rms / worst:
+  no lead 104 mm, 25 / 117; 8.1 raw 14 mm, 30 / 95; 8.2 filtered 10 mm, 20 / 83.
+- The same test checks that a constant step is led exactly, that one snapshot never steps the filter twice, that a
+  stall restarts it, that junk input moves the lead by less than half of what the raw lead does (and stays under
+  the cap), and that head motion over a still body is no step.
+- `test_head_pick` checks the numbers of item 1 and the four fallbacks (STAGE-like 1.6 m, 70 deg apart, no camera
+  head, `arm_head=xr`).
+
+**Needs the headset:**
+- A/B `arm_head=view` against `xr` with the head moving while the hands are held still. This is the main expected
+  gain, in normal play too.
+- A/B `arm_lead_smooth=0.5` against `1` and `arm_lead=0` in rolls.
+- With `BB_XR_STAGE=1`, check for the fallback line.
+- Whether the remaining roll shake is the frame-time floor of item 3: it should follow frame-time hitches (the
+  VR profiler's frame times) and not happen at a steady frame rate.
+
+
+## 9. The wrist cut (`arm_cut`) [built, untested in the headset]
+
+Feedback: "cut the arm a little bit more, I still see my wrists". With `hide=hands_skin` (or `hands`) only the
+skin part's hand meshes, display group 44, draw (findings/16 4.2). That one mesh also carries the wrist and the
+start of the forearm, and no display group splits the hand from it. The cut works on the skeleton instead.
+
+**What it does.** After the IK placed the chain, the bones the wrist skin is weighted to are scaled about the
+wrist (the Hand bone's origin) by `k = 1 - arm_cut`. A model transform `(t, q, s)` becomes
+`(wrist + k (t - wrist), q, k s)`, so every vertex those bones carry moves to `wrist + k (v - wrist)`. Skin
+weighted to them is pulled into the hand, and a vertex shared with the Hand bone moves by its forearm share only.
+
+- **Bones** (`arms.cut_of`, found per skeleton by the parent walk and logged as `VR arms: <side> wrist cut bones`):
+  the Forearm and every bone below it that is not below the Hand. On c0000 these are `R_Forearm` 81,
+  `Support_R_ForeArmTwist` 99 (at the wrist) and `Support_R_ForeArmTwist1` 100 (mid-forearm), and on the left
+  `L_Forearm` 52 with its two twist helpers (among 70-76) (findings/13 2.2) [L until the log line is read].
+- **The Hand, the fingers and `L_Weapon`/`R_Weapon` do not move.** The pose's model transforms are absolute model
+  space: each bone is its own hkQsTransform, and writing a parent does not touch its children. The cut runs after
+  the IK has written every bone, and it changes only the cut bones' translation and scale. The Hand subtree keeps
+  the IK's transforms bit for bit (tested), so the weapon, the held items, the gun aim that reads `L_Weapon`, the
+  hitbox overlay (`L_Weapon`/`R_Weapon` only) and the hit scale (the same bones) see no change. First person reads
+  only Head and Neck. Co-op pose sync sends the head and grips, not bones.
+- **The scale reaches the skinning [C].** The AnimationToModel copy converts each model transform with 0x83D4D0.
+  It builds the rotation matrix from the quaternion (+0x10), multiplies it by `diag(scale)` (+0x20), and puts the
+  translation (+0x00) in the last column (out/eboot.elf, 0x83D4D0-0x83D599).
+- **Havok's local rebuild.** The edit marks the bones local-dirty and clears `localInSync` (section 3). A later
+  local read rebuilds the Hand's local from the scaled Forearm: scale `1 / k`, and its translation in the
+  Forearm's frame. Composing it back gives the Hand's model transform again under either scale convention, so k
+  never reaches 0: `VAM_CUT_MIN_SCALE` = 0.02 (`arm_cut=1` leaves 2 %, about 5 mm of a 0.273 m forearm).
+- **A pose the animation did not refresh** (a second sync of the same pose in one frame, or a paused animation)
+  still holds last frame's cut. The edit reads each cut bone's scale. If it is exactly the k written last time,
+  the edit undoes the cut (`vam_cut_undo`) before the IK uses the forearm, then cuts again. A fresh pose has
+  scale 1 and is left alone.
+- **It runs while the IK weight is 0** (an attack with `arm_attack=0`, the fade). The game's own hand is then the
+  wrist, so the wrist stays hidden during swings too.
+
+**When.** Only in first person while the hide mode hides the skin's arms: `hide=hands`, `hands_skin`, `nohands`,
+or a mix with `skinarms`. `vr_fp_hides_arms()` is published by H1 from the same `hiding` it applies. With
+`hide=none`, `head` or `body` and in third person the cut is 0, since the full arm is meant to be seen there.
+With `hide=hands` the armour sleeve/glove (slot 4) is weighted to the same bones and is pulled in too.
+
+**Settings:**
+
+| Variable / key | Effect |
+|---|---|
+| `arm_cut=<0..1>\|auto` (fp.txt, anywhere on the line) | the cut: 0 off, 1 the forearm fully into the wrist; `auto` (the default) = **0.8** while the skin's arms are hidden |
+| `BB_VR_ARMS_CUT=<0..1>\|auto` | the start value |
+
+Logs: `VR arms: arm cut auto (...)` at start, `VR arms: wrist cut <c> (forearm scale <k> ...)` whenever the
+effective value changes (first person on/off, the hide mode, the key), and `cut <value>` on the control line.
+
+**Math** (`src/vr_arm_math.h`): `vam_cut_scale`, `vam_cut_point`, `vam_cut_undo`, `vam_cut_bones` (which the
+game calls through `arms_cut_side`), and `vam_skin_point` for the tests.
+
+**Tests** (`tests/test_vr_arms.c` `test_cut`, 1251 checks in all, C and C++): a posed right arm (Forearm, Twist1,
+Twist, Hand, a finger, Weapon) cut by 0.8, 0.5 and 1:
+- Hand, finger, Weapon and UpperArm are bit-identical, with scale 1.
+- The forearm bones keep their rotation, move to `wrist + k (t - wrist)`, and are restored by the undo.
+- A vertex skinned to each forearm bone lands at `wrist + k (v - wrist)` (11.3 cm from the wrist -> 2.3 cm at 0.8).
+- A 50/50 hand/forearm vertex keeps its hand half.
+- Cut 0 changes nothing; the setting maps 0.8 -> 0.2, and 1 -> the 0.02 floor.
+
+**Needs the headset:** try `arm_cut=0.8` (the default), then `0.6`, `0.9` and `1`. Look at how much wrist is
+left, whether the back of the hand pinches (the hand mesh's own wrist vertices carry forearm weight), and whether
+the sleeve looks right with `hide=hands`. `arm_cut=0` gives the old look for an A/B.

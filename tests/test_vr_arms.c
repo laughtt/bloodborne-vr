@@ -484,6 +484,277 @@ static void test_roll_lag(void) {
     printf("PASS roll lag\n");
 }
 
+/* findings/24 8.2: the shake. A roll at 9 m/s against a camera at 4 m/s (plus the slide's ease: +-3 m/s at 3 rad/s),
+ * a game loop with a variable frame time (20 ms +-2 ms, 5 % hitches of 33 ms: the sim of frame k steps by the time
+ * since the last loop start), H1 and the arms each at their own point in the frame with +-3 / +-2 ms of jitter, and
+ * the real head bobbing (it moves the camera; the hands follow it through the grips anyway). The IK of frame k+1
+ * uses H1(k) plus the lead; the hand is off by lead - (the anchor's true step over frame k+1); the shake is how much
+ * that error changes from one frame to the next. */
+static unsigned lcg_state = 12345u;
+static float lcg01(void) {
+    lcg_state = lcg_state * 1664525u + 1013904223u;
+    return (float)((lcg_state >> 8) & 0xFFFFFFu) / 16777216.0f;
+}
+static float lcg_pm(float a) { return a * (2.0f * lcg01() - 1.0f); }
+static void test_lead_jitter(void) {
+    const float yaw = 0.7f;
+    const VrQuat yq = vr_qaxis(vr_v3(0, 1, 0), yaw);
+    const VrVec3 dir = vr_qrotate(yq, vr_v3(0, 0, 1));
+    const VrQuat cam_q = yq; /* the camera faces along the roll; the head's rotation is identity */
+    enum { N = 600 };
+    static float ft[N + 2];
+    for (int k = 0; k < N + 2; ++k) ft[k] = lcg01() < 0.05f ? 1.0f / 30.0f : 0.020f + lcg_pm(0.002f);
+    VrVec3 body = vr_v3(3, 0, -2), anchor = vr_add(body, vr_v3(0, 1.6f, 0));
+    VrVec3 head = vr_v3(0, 0, 0), prev_head = head, prev_cam = vr_v3(0, 0, 0), prev_body = body;
+    float loop = 0.0f, t_h1 = 0.0f, prev_t_h1 = 0.0f, t_arm = 0.0f, prev_t_arm = 0.0f;
+    VrRollLead filt;
+    vr_roll_lead_reset(&filt);
+    float off[3] = {0, 0, 0}, shake[3] = {0, 0, 0}, worst[3] = {0, 0, 0};
+    VrVec3 e_prev[3];
+    int counted = 0;
+    for (int k = 1; k <= N; ++k) {
+        loop += ft[k - 1]; /* loop start of frame k */
+        const float sim_dt = ft[k - 1];
+        const float cam_speed = 4.0f + 3.0f * sinf(3.0f * loop);
+        body = vr_add(body, vr_scale(dir, 9.0f * sim_dt));
+        anchor = vr_add(anchor, vr_scale(dir, cam_speed * sim_dt));
+        prev_head = head;
+        head = vr_v3(0.02f * sinf(7.0f * loop) + lcg_pm(0.002f), 0.01f * sinf(4.0f * loop) + lcg_pm(0.002f), lcg_pm(0.002f));
+        const VrVec3 cam = vr_add(anchor, vr_qrotate(cam_q, vr_xr_to_game_vec(head)));
+        prev_t_h1 = t_h1;
+        t_h1 = loop + 0.008f + lcg_pm(0.003f);
+        /* the arms of frame k+1 run at their point of the next loop */
+        prev_t_arm = t_arm;
+        t_arm = loop + ft[k] + 0.004f + lcg_pm(0.002f);
+        float dt_arm = t_arm - prev_t_arm;
+        if (dt_arm > 0.1f) dt_arm = 0.1f;
+        /* 8.1: the raw finite difference of the camera over the H1 gap, led by the arms' interval */
+        const VrVec3 lead_old = vr_roll_lead(vr_v3(0, 0, 0), vr_roll_rel_vel(prev_cam, prev_body, cam, body, yaw, t_h1 - prev_t_h1), dt_arm, 1.0f);
+        /* 8.2: the anchor's step, low-passed with its gap, once per snapshot */
+        const VrVec3 point = vr_roll_head_point(prev_cam, cam_q, prev_head, vr_qidentity(), head);
+        const VrVec3 vel = vr_roll_lead_update(&filt, (uint32_t)k, vr_roll_rel_step(point, prev_body, cam, body, yaw),
+                                               k > 1 ? t_h1 - prev_t_h1 : 0.0f, 0.5f);
+        const VrVec3 lead_new = vr_roll_lead(vr_v3(0, 0, 0), vel, dt_arm, 1.0f);
+        /* the truth: the anchor's step relative to the body over frame k+1 (it steps by ft[k]) */
+        const float cam_next = 4.0f + 3.0f * sinf(3.0f * (loop + ft[k]));
+        const VrVec3 truth = vr_qrotate(vr_qconj(yq), vr_scale(dir, (cam_next - 9.0f) * ft[k]));
+        const VrVec3 e[3] = {vr_scale(truth, -1.0f), vr_sub(lead_old, truth), vr_sub(lead_new, truth)};
+        if (k > 10) {
+            for (int m = 0; m < 3; ++m) {
+                const float s = vam_len(vr_sub(e[m], e_prev[m]));
+                off[m] += vam_len(e[m]);
+                shake[m] += s * s;
+                if (s > worst[m]) worst[m] = s;
+            }
+            ++counted;
+        }
+        for (int m = 0; m < 3; ++m) e_prev[m] = e[m];
+        prev_cam = cam;
+        prev_body = body;
+    }
+    for (int m = 0; m < 3; ++m) {
+        off[m] /= (float)counted;
+        shake[m] = sqrtf(shake[m] / (float)counted);
+    }
+    printf("     lead jitter (mm; mean hand offset, frame-to-frame change rms / worst): no lead %.1f, %.1f / %.1f; "
+           "8.1 raw %.1f, %.1f / %.1f; 8.2 filtered %.1f, %.1f / %.1f\n",
+           off[0] * 1e3f, shake[0] * 1e3f, worst[0] * 1e3f, off[1] * 1e3f, shake[1] * 1e3f, worst[1] * 1e3f,
+           off[2] * 1e3f, shake[2] * 1e3f, worst[2] * 1e3f);
+    /* (the hitches stay: a 33 ms frame after 20 ms ones cannot be known one frame ahead; that floor is the "no lead" shake) */
+    CHECK(shake[2] < 0.75f * shake[1], "the filtered lead shakes less than the raw one (rms %.4f vs %.4f m)", shake[2], shake[1]);
+    CHECK(shake[2] < shake[0], "and less than no lead at all (rms %.4f vs %.4f m)", shake[2], shake[0]);
+    CHECK(worst[2] <= worst[1], "its worst frame is no worse (%.4f vs %.4f m)", worst[2], worst[1]);
+    CHECK(off[2] < 0.15f * off[0], "and it still removes the lag (offset %.4f vs %.4f m without a lead)", off[2], off[0]);
+
+    /* steady frames: the filtered lead is exact (the 8.1 result is kept) */
+    {
+        VrRollLead f;
+        vr_roll_lead_reset(&f);
+        const VrVec3 s = vr_v3(0.0f, 0.0f, -0.055f);
+        VrVec3 v = vr_v3(0, 0, 0);
+        for (int i = 0; i < 30; ++i) v = vr_roll_lead_update(&f, (uint32_t)(i + 1), s, 0.011f, 0.5f);
+        CHECK(near_v(v, vr_scale(s, 1.0f / 0.011f), 1e-3f), "a constant step is a constant velocity");
+        CHECK(near_v(vr_roll_lead_update(&f, 30u, vr_v3(1, 1, 1), 0.011f, 0.5f), v, 1e-7f), "the same snapshot does not step the filter twice");
+        CHECK(vam_len(vr_roll_lead_update(&f, 31u, s, 0.3f, 0.5f)) == 0.0f && !f.valid, "a stall starts it again");
+    }
+    /* bounded: junk steps (alternating, up to twice the cap) move the lead by at most half of what the raw one does */
+    {
+        VrRollLead f;
+        vr_roll_lead_reset(&f);
+        VrVec3 prev_new = vr_v3(0, 0, 0), prev_raw = vr_v3(0, 0, 0);
+        float worst_new = 0.0f, worst_raw = 0.0f;
+        for (int i = 0; i < 200; ++i) {
+            const float sgn = (i & 1) ? 1.0f : -1.0f;
+            const VrVec3 junk = vr_v3(sgn * 0.4f * lcg01(), lcg_pm(0.1f), -sgn * 0.15f);
+            const float gap = 0.02f + lcg_pm(0.006f);
+            const VrVec3 l_new = vr_roll_lead(vr_v3(0, 0, 0), vr_roll_lead_update(&f, (uint32_t)(i + 1), junk, gap, 0.5f), 0.02f, 1.0f);
+            const VrVec3 l_raw = vr_roll_lead(vr_v3(0, 0, 0), vr_scale(junk, 1.0f / gap), 0.02f, 1.0f);
+            CHECK(vam_len(l_new) <= 0.2001f, "lead within its cap");
+            if (i > 0) {
+                if (vam_len(vr_sub(l_new, prev_new)) > worst_new) worst_new = vam_len(vr_sub(l_new, prev_new));
+                if (vam_len(vr_sub(l_raw, prev_raw)) > worst_raw) worst_raw = vam_len(vr_sub(l_raw, prev_raw));
+            }
+            prev_new = l_new;
+            prev_raw = l_raw;
+        }
+        CHECK(worst_new < 0.5f * worst_raw && worst_new < 0.2f, "junk input: per-frame change %.3f m (raw %.3f m)", worst_new, worst_raw);
+    }
+    /* the head's own step is not a lead: the camera moving with the head over a still body gives no step */
+    {
+        const VrVec3 c0 = vr_v3(1, 1.6f, 2), h0 = vr_v3(0.1f, 0.0f, -0.05f), h1 = vr_v3(0.13f, 0.02f, -0.09f);
+        const VrQuat cq = vr_qaxis(vr_v3(0, 1, 0), 0.3f);
+        const VrVec3 c1 = vr_add(c0, vr_qrotate(cq, vr_xr_to_game_vec(vr_sub(h1, h0))));
+        const VrVec3 pt = vr_roll_head_point(c0, cq, h0, vr_qidentity(), h1);
+        CHECK(vam_len(vr_roll_rel_step(pt, vr_v3(0, 0, 0), c1, vr_v3(0, 0, 0), 0.3f)) < 1e-5f, "head motion is no step");
+        CHECK(vam_len(vr_roll_rel_step(c0, vr_v3(0, 0, 0), vr_v3(9, 9, 9), vr_v3(0, 0, 0), 0.3f)) == 0.0f, "a jump is no step");
+    }
+    printf("PASS lead jitter\n");
+}
+
+/* findings/24 8.2: the head the grips are measured against. The camera is built from a head that differs from the
+ * grip snapshot's head (true stereo: predicted ahead and extrapolated); a controller held still in the room must
+ * stay still in the world when the camera's head turns. */
+static void test_head_pick(void) {
+    const float yaw = 0.7f;
+    const VrVec3 pos = vr_v3(10.0f, -3.0f, 5.0f);
+    const VrVec3 eye_model = vr_v3(0.0f, 1.6f, -0.1f);
+    const float heading = vr_facing_heading(yaw);
+    const VrVec3 head_p = vr_v3(0.05f, 0.0f, 0.02f);
+    const VrVec3 grip_p = vr_v3(0.25f, -0.35f, -0.4f); /* still in the room */
+    const VrQuat grip_q = vr_xr_ypr(10.0f * VR_DEG, -30.0f * VR_DEG, 0.0f);
+    float worst_view = 0.0f, worst_xr = 0.0f, jump_view = 0.0f, jump_xr = 0.0f;
+    VrVec3 prev_view = vr_v3(0, 0, 0), prev_xr = vr_v3(0, 0, 0);
+    VrVec3 first = vr_v3(0, 0, 0);
+    for (int i = 0; i < 100; ++i) {
+        /* game frames at 50 fps; the head turns at 60 deg/s with a wobble. The camera's head is predicted 111 ms
+         * ahead (the stereo log's "views for 111.1 ms ahead") with up to 1.5 deg of prediction error; the grip
+         * snapshot's head is that of the bridge's latest 90 Hz frame (its display time, ~20 ms ahead, 0-11 ms old) */
+        const float t = (float)i / 50.0f;
+        const float age = 0.0111f * lcg01();
+#define HEAD_YAW(s) (60.0f * VR_DEG * (s) + 8.0f * VR_DEG * sinf(9.0f * (s)))
+        const float yaw_xr = HEAD_YAW(t + 0.02f - age);
+        const float yaw_cam = HEAD_YAW(t + 0.111f) + 1.5f * VR_DEG * sinf(31.0f * t);
+#undef HEAD_YAW
+        const VrQuat hq_xr = vr_xr_ypr(yaw_xr, 0.0f, 0.0f), hq_cam = vr_xr_ypr(yaw_cam, 5.0f * VR_DEG * sinf(5.0f * t), 0.0f);
+        float cam[4][4];
+        vr_cam_from_heading(cam, heading, vr_model_to_world(pos, yaw, eye_model));
+        vr_cam_compose(cam, vr_head_rel_game(hq_cam, vr_qidentity()), vr_v3(0, 0, 0), 1);
+        VrVec3 cp, w_view, w_xr, hp;
+        VrQuat cq, r, hq;
+        vam_camera_in_model((const float (*)[4])cam, pos, yaw, &cp, &cq);
+        CHECK(vr_arm_pick_head(1, 1, head_p, hq_cam, head_p, hq_xr, &hp, &hq) == 1, "same space: the camera's head");
+        vam_grip_to_model(hp, hq, grip_p, grip_q, vr_v3(0, 0, 0), vr_qidentity(), cp, cq, &w_view, &r);
+        vr_arm_pick_head(0, 1, head_p, hq_cam, head_p, hq_xr, &hp, &hq);
+        vam_grip_to_model(hp, hq, grip_p, grip_q, vr_v3(0, 0, 0), vr_qidentity(), cp, cq, &w_xr, &r);
+        if (i == 0) first = w_view;
+        if (vam_len(vr_sub(w_view, first)) > worst_view) worst_view = vam_len(vr_sub(w_view, first));
+        if (vam_len(vr_sub(w_xr, first)) > worst_xr) worst_xr = vam_len(vr_sub(w_xr, first));
+        if (i > 0) {
+            if (vam_len(vr_sub(w_view, prev_view)) > jump_view) jump_view = vam_len(vr_sub(w_view, prev_view));
+            if (vam_len(vr_sub(w_xr, prev_xr)) > jump_xr) jump_xr = vam_len(vr_sub(w_xr, prev_xr));
+        }
+        prev_view = w_view;
+        prev_xr = w_xr;
+    }
+    printf("     head pick: a still controller moves %.1f mm (worst frame %.1f mm) with the camera's head, %.1f mm (%.1f mm) with the snapshot's\n",
+           worst_view * 1000.0f, jump_view * 1000.0f, worst_xr * 1000.0f, jump_xr * 1000.0f);
+    CHECK(worst_view < 0.001f, "with the camera's head a still controller stays still (%.4f m)", worst_view);
+    CHECK(worst_xr > 0.03f && jump_xr > 0.01f, "with the snapshot's head it swims (%.4f m) and shakes (%.4f m a frame)", worst_xr, jump_xr);
+    /* the fallbacks */
+    VrVec3 hp;
+    VrQuat hq;
+    const VrQuat q0 = vr_qidentity(), q70 = vr_xr_ypr(70.0f * VR_DEG, 0.0f, 0.0f);
+    CHECK(!vr_arm_pick_head(1, 1, vr_v3(0, 1.6f, 0), q0, vr_v3(0, 0, 0), q0, &hp, &hq) && near_v(hp, vr_v3(0, 0, 0), 1e-7f),
+          "1.6 m apart (STAGE vs LOCAL): the snapshot's head");
+    CHECK(!vr_arm_pick_head(1, 1, vr_v3(0, 0, 0), q70, vr_v3(0, 0, 0), q0, &hp, &hq), "70 deg apart: the snapshot's head");
+    CHECK(!vr_arm_pick_head(1, 0, vr_v3(0, 0, 0), q0, vr_v3(0, 0, 0), q0, &hp, &hq), "no camera head: the snapshot's head");
+    CHECK(!vr_arm_pick_head(0, 1, vr_v3(0, 0, 0), q0, vr_v3(0, 0, 0), q0, &hp, &hq), "arm_head=xr: the snapshot's head");
+    printf("PASS head pick\n");
+}
+
+/* The wrist cut (findings/24 section 9): the Forearm and its twist helpers scaled about the wrist; the Hand, the
+ * fingers and the Weapon bone (the held weapon) bit-identical; skin on the forearm pulled into the wrist by k. */
+enum { CUT_UPPER, CUT_FORE, CUT_TWIST1, CUT_TWIST, CUT_HAND, CUT_FINGER, CUT_WEAPON, CUT_N };
+static void cut_rig(VrXform *bind, VrXform *model) {
+    const VamArmBind b = right_bind();
+    const VrVec3 seg = vr_sub(b.hand, b.fore);
+    bind[CUT_UPPER] = vr_xf(b.upper, b.upper_rot);
+    bind[CUT_FORE] = vr_xf(b.fore, b.fore_rot);
+    bind[CUT_TWIST1] = vr_xf(vr_add(b.fore, vr_scale(seg, 0.5f)), b.fore_rot);
+    bind[CUT_TWIST] = vr_xf(b.hand, b.fore_rot);
+    bind[CUT_HAND] = vr_xf(b.hand, b.hand_rot);
+    bind[CUT_FINGER] = vr_xf(vr_add(b.hand, vr_qrotate(b.hand_rot, vr_v3(0.09f, 0.01f, -0.015f))), b.hand_rot);
+    bind[CUT_WEAPON] = vr_xf(vr_add(b.hand, vr_qrotate(b.hand_rot, vr_v3(0.076f, 0.005f, 0.017f))), b.hand_rot);
+    /* a posed arm: the whole chain moved and turned, the forearm bent by 40 deg at the elbow and the twist
+     * helpers rolled (rigid per bone, so the bind locals hold) */
+    const VrXform body = vr_xf(vr_v3(0.3f, -0.1f, 0.5f), vr_qaxis(vam_norm(vr_v3(0.2f, 1.0f, -0.3f), vr_v3(0, 1, 0)), 0.7f));
+    const VrXform elbow_bend = vr_xf_mul(vr_xf(b.fore, vr_qaxis(vr_v3(0, 0, 1), 40.0f * VR_DEG)), vr_xf(vr_scale(b.fore, -1.0f), vr_qidentity()));
+    for (int i = 0; i < CUT_N; ++i) {
+        VrXform x = i == CUT_UPPER ? bind[i] : vr_xf_mul(elbow_bend, bind[i]);
+        if (i == CUT_TWIST || i == CUT_TWIST1)
+            x.q = vr_qnormalize(vr_qmul(x.q, vr_qaxis(vr_v3(1, 0, 0), (i == CUT_TWIST ? 30.0f : 15.0f) * VR_DEG)));
+        model[i] = vr_xf_mul(body, x);
+    }
+}
+static void test_cut(void) {
+    VrXform bind[CUT_N], model[CUT_N], cut[CUT_N];
+    float scale[CUT_N];
+    const unsigned char mask[CUT_N] = {0, 1, 1, 1, 0, 0, 0};
+    cut_rig(bind, model);
+    /* the setting */
+    CHECK(vam_cut_scale(0.0f) == 1.0f && vam_cut_scale(-0.5f) == 1.0f && vam_cut_scale(NAN) == 1.0f, "cut <= 0: scale 1");
+    CHECK(near_f(vam_cut_scale(0.8f), 0.2f, 1e-6f) && near_f(vam_cut_scale(0.25f), 0.75f, 1e-6f), "cut 0.8 -> 0.2, 0.25 -> 0.75");
+    CHECK(vam_cut_scale(1.0f) == VAM_CUT_MIN_SCALE && vam_cut_scale(7.0f) == VAM_CUT_MIN_SCALE && VAM_CUT_MIN_SCALE > 0.0f,
+          "cut 1 (and above): the floor %.2f, never 0", VAM_CUT_MIN_SCALE);
+    /* cut 0 changes nothing */
+    memcpy(cut, model, sizeof(cut));
+    for (int i = 0; i < CUT_N; ++i) scale[i] = 1.0f;
+    vam_cut_bones(cut, scale, mask, CUT_N, model[CUT_HAND].t, vam_cut_scale(0.0f));
+    int same = !memcmp(cut, model, sizeof(cut));
+    for (int i = 0; i < CUT_N; ++i) same = same && scale[i] == 1.0f;
+    CHECK(same, "cut 0: every bone and scale bit-identical");
+    /* cut 0.8 */
+    const VrVec3 wrist = model[CUT_HAND].t;
+    for (int c = 0; c < 3; ++c) {
+        const float amount = c == 0 ? 0.8f : c == 1 ? 0.5f : 1.0f, k = vam_cut_scale(amount);
+        memcpy(cut, model, sizeof(cut));
+        for (int i = 0; i < CUT_N; ++i) scale[i] = 1.0f;
+        vam_cut_bones(cut, scale, mask, CUT_N, wrist, k);
+        CHECK(!memcmp(&cut[CUT_HAND], &model[CUT_HAND], sizeof(VrXform)) && !memcmp(&cut[CUT_FINGER], &model[CUT_FINGER], sizeof(VrXform)) &&
+              !memcmp(&cut[CUT_WEAPON], &model[CUT_WEAPON], sizeof(VrXform)) && !memcmp(&cut[CUT_UPPER], &model[CUT_UPPER], sizeof(VrXform)),
+              "cut %.1f: Hand, finger, Weapon and UpperArm bit-identical", amount);
+        CHECK(scale[CUT_HAND] == 1.0f && scale[CUT_FINGER] == 1.0f && scale[CUT_WEAPON] == 1.0f && scale[CUT_UPPER] == 1.0f,
+              "cut %.1f: their scales stay 1", amount);
+        CHECK(scale[CUT_FORE] == k && scale[CUT_TWIST] == k && scale[CUT_TWIST1] == k, "cut %.1f: the forearm bones scaled by %.2f", amount, k);
+        for (int i = CUT_FORE; i <= CUT_TWIST; ++i)
+            CHECK(near_q(cut[i].q, model[i].q, 1e-7f) && near_v(cut[i].t, vam_cut_point(model[i].t, wrist, k), 1e-6f) &&
+                  near_v(vam_cut_undo(cut[i].t, wrist, k), model[i].t, 2e-5f),
+                  "cut %.1f: bone %d moved toward the wrist (rotation kept, undo restores it)", amount, i);
+        /* skin: a forearm vertex (60% down the forearm, 3 cm off the axis) weighted to each forearm bone */
+        const VamArmBind b = right_bind();
+        const VrVec3 v = vr_add(vam_lerp(b.fore, b.hand, 0.6f), vr_v3(0.0f, 0.0f, 0.03f));
+        for (int i = CUT_FORE; i <= CUT_TWIST; ++i) {
+            const VrVec3 p0 = vam_skin_point(model[i], 1.0f, bind[i], v), p1 = vam_skin_point(cut[i], scale[i], bind[i], v);
+            CHECK(near_v(p1, vam_lerp(wrist, p0, k), 1e-5f), "cut %.1f: a vertex on bone %d at wrist + %.2f (v - wrist) (%.4f m off)",
+                  amount, i, k, vam_len(vr_sub(p1, vam_lerp(wrist, p0, k))));
+            CHECK(near_f(vam_len(vr_sub(p1, wrist)), k * vam_len(vr_sub(p0, wrist)), 1e-5f), "cut %.1f: its distance to the wrist x %.2f", amount, k);
+        }
+        /* a wrist vertex half on the Hand, half on the Forearm: the hand half stays, the forearm half is pulled */
+        const VrVec3 vw = vr_add(vam_lerp(b.fore, b.hand, 0.95f), vr_v3(0.0f, 0.02f, 0.0f));
+        const VrVec3 h0 = vam_skin_point(model[CUT_HAND], 1.0f, bind[CUT_HAND], vw), h1 = vam_skin_point(cut[CUT_HAND], scale[CUT_HAND], bind[CUT_HAND], vw);
+        const VrVec3 f0 = vam_skin_point(model[CUT_FORE], 1.0f, bind[CUT_FORE], vw), f1 = vam_skin_point(cut[CUT_FORE], scale[CUT_FORE], bind[CUT_FORE], vw);
+        const VrVec3 blend0 = vam_lerp(h0, f0, 0.5f), blend1 = vam_lerp(h1, f1, 0.5f);
+        CHECK(near_v(h1, h0, 1e-7f) && near_v(blend1, vam_lerp(h0, vam_lerp(wrist, f0, k), 0.5f), 1e-5f),
+              "cut %.1f: a 50/50 wrist vertex keeps its hand half, its forearm half pulled", amount);
+        if (c == 0)
+            printf("     cut 0.8: a forearm vertex %.1f cm from the wrist -> %.1f cm; a 50/50 wrist vertex moves %.1f mm\n",
+                   vam_len(vr_sub(vam_skin_point(model[CUT_FORE], 1.0f, bind[CUT_FORE], v), wrist)) * 100.0f,
+                   vam_len(vr_sub(vam_skin_point(cut[CUT_FORE], scale[CUT_FORE], bind[CUT_FORE], v), wrist)) * 100.0f,
+                   vam_len(vr_sub(blend1, blend0)) * 1000.0f);
+    }
+    printf("PASS wrist cut\n");
+}
+
 int main(void) {
     test_math();
     test_two_bone();
@@ -496,6 +767,9 @@ int main(void) {
     test_body_follow();
     test_roll_detach();
     test_roll_lag();
+    test_lead_jitter();
+    test_head_pick();
+    test_cut();
     if (failures) { printf("%d of %d checks failed\n", failures, checks); return 1; }
     printf("All VR arm tests passed (%d checks)\n", checks);
     return 0;

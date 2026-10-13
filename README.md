@@ -35,8 +35,8 @@ steps, known issues and how to report bugs. The controls are summarised below.
 | Swing with the right grip held, or a very hard swing | Heavy attack (R2); keep the grip held after the swing to charge |
 | Quick right-grip tap (under 0.35 s, no swing) | Swap the right-hand weapon |
 | Right trigger | Nothing in the world |
-| Left trigger (hold) | Hold the gun (L2) |
-| Left-hand thrust forward (gun held) | Shoot |
+| Left trigger | Hold: aim the gun with a laser; release: shoot |
+| Left-hand thrust forward | Shoot |
 | Left grip (squeeze) | L1 (transform) |
 | A (right controller) | Swap the right-hand weapon |
 | B (right controller) | Roll / dodge, hold to sprint |

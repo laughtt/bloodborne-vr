@@ -431,6 +431,11 @@ add_executable(vr-throw-anim-test EXCLUDE_FROM_ALL ../tests/test_vr_throw_anim.c
 set_target_properties(vr-throw-anim-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
 target_compile_options(vr-throw-anim-test PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vr-throw-anim-test PRIVATE ../src)
+# VR instant items (src/vr_instant_items.h, src/runtime_vr_items.c): our own throw, the game's burst, findings/44.
+add_executable(vr-instant-items-test EXCLUDE_FROM_ALL ../tests/test_vr_instant_items.c)
+set_target_properties(vr-instant-items-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+target_compile_options(vr-instant-items-test PRIVATE -Wall -Wextra -Werror)
+target_include_directories(vr-instant-items-test PRIVATE ../src)
 # VR gun-shot animation speed (src/vr_gun_speed.h, src/runtime_vr_atkspeed.c): findings/27 section 8.
 add_executable(vr-gun-speed-test EXCLUDE_FROM_ALL ../tests/test_vr_gun_speed.c)
 set_target_properties(vr-gun-speed-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)

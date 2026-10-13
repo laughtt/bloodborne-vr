@@ -22,8 +22,8 @@
  * clip is a gun shot (sub-id 51000-52999) the same dt is scaled by the gun multiplier, with the same
  * stop / hitch guards, so the wind-up and the recovery around the bullet event are shorter. The bullet is
  * still spawned by the game's own TAE event (once) and redirected by the gun aim hook. On while online too.
- * Hit reactions (BB_VR_HURT_SPEED, OFF by default (1.0) until the anim range is confirmed, src/vr_hurt_speed.h, findings/27 section 9): while the newest
- * clip is a damage reaction (sub-id 9000-12999, UNCONFIRMED, see the header and BB_VR_HURT_RANGE) dt is scaled the
+ * Hit reactions (BB_VR_HURT_SPEED, on by default (2.0), anim range still unconfirmed, src/vr_hurt_speed.h, findings/27 section 9): while the newest
+ * clip is a damage reaction (sub-id 20000-20999, read off a headset run, see the header and BB_VR_HURT_RANGE) dt is scaled the
  * same way, so staggers last half as long. dt 0 (hit stop) and hitches are untouched; the victim side of grabs
  * and visceral hits (100000+) is excluded. On while online too. With BB_VR_FP_LOG=1 clip ids outside every known
  * class are logged ("new clip") so the real reaction ids can be read off after getting hit.
@@ -46,8 +46,8 @@
  *                           control file (a missing key = the env value / 2.0); logs the value at start and on
  *                           every change, and with BB_VR_FP_LOG=1 the measured clip rate of a shot;
  *                           stays on while online (co-op); BB_VR_GUN_SPEED_ONLINE=0 turns it off online
- *   BB_VR_HURT_SPEED=<k>    hit-reaction clip speed multiplier (default 1 = off until the anim range is confirmed; max 4); hurt_speed=<k> in the
- *                           control file; BB_VR_HURT_RANGE=<from>-<to> overrides the sub-id range (default 9000-12999);
+ *   BB_VR_HURT_SPEED=<k>    hit-reaction clip speed multiplier (default 2.0; 1 = off; max 4); hurt_speed=<k> in the
+ *                           control file; BB_VR_HURT_RANGE=<from>-<to> overrides the sub-id range (default 20000-20999);
  *                           stays on while online (co-op); BB_VR_HURT_SPEED_ONLINE=0 turns it off online
  *   BB_VR_ATK_SPEED=<mult>  start value (default 0 = off; 1 = off; 0.5-3)
  *   BB_VR_FP_LOG=1          log every value change and, while an attack plays, the measured clip rate

@@ -682,6 +682,53 @@ static void TestTriggerEdge() {
     CHECK(!e.Update(0.8f));
 }
 
+void TestGunRelease() {
+    using xrpad::GunRelease;
+    GunRelease g; // release mode (default)
+    // Held: no L2, aiming. Release after a long hold: a 100 ms pulse, then idle.
+    GunRelease::Out o = g.Update(0, true, true);
+    CHECK(!o.pulse && o.aiming && !o.fired);
+    o = g.Update(500, true, true);
+    CHECK(!o.pulse && o.aiming);
+    o = g.Update(600, false, true);
+    CHECK(o.pulse && o.fired && !o.aiming);
+    CHECK(g.Update(699, false, true).pulse);
+    CHECK(!g.Update(700, false, true).pulse);
+    CHECK(!g.Update(800, false, true).aiming);
+    // A one-frame tap fires too.
+    g.Update(1000, true, true);
+    o = g.Update(1010, false, true);
+    CHECK(o.pulse && o.fired);
+    CHECK(!g.Update(1110, false, true).pulse);
+    // A pull during a pulse waits for it to end; no shot from that early release.
+    g.Update(2000, true, true);
+    g.Update(2100, false, true); // pulse until 2200
+    o = g.Update(2150, true, true);
+    CHECK(o.pulse && !o.aiming);
+    o = g.Update(2250, true, true); // pulse over, still held: now aiming, no L2
+    CHECK(!o.pulse && o.aiming);
+    o = g.Update(2300, false, true);
+    CHECK(o.pulse && o.fired);
+    // Not the gun (menu pointer, held item, switch mode): no aiming, no pulse on release.
+    GunRelease m;
+    o = m.Update(0, true, false);
+    CHECK(!o.pulse && !o.aiming);
+    CHECK(!m.Update(50, false, false).pulse);
+    // The role is lost while held (a held item appears): the release does not fire.
+    GunRelease h;
+    h.Update(0, true, true);
+    h.Update(50, true, false);
+    CHECK(!h.Update(100, false, false).pulse);
+    CHECK(!h.Update(120, false, true).pulse);
+    // Press mode: L2 follows the trigger, as before.
+    GunRelease p;
+    p.release = false;
+    CHECK(p.Update(0, true, true).pulse);
+    CHECK(p.Update(900, true, true).pulse);
+    CHECK(!p.Update(1000, false, true).pulse);
+    CHECK(!p.Update(1010, true, false).pulse);
+}
+
 void TestGripTap() {
     // Quick squeeze and release: one tap, on the release.
     xrpad::GripTap g;
@@ -1043,6 +1090,7 @@ int main() {
     TestYBeforeL3StaysTriangle();
     TestL3Touchpad();
     TestTriggerEdge();
+    TestGunRelease();
     TestGripTap();
     TestSwingDirection();
     TestShootGate();

@@ -386,6 +386,50 @@ struct GripFlick {
     }
 };
 
+/// The left trigger as a gun that fires on release (BB_XR_GUN_FIRE=release, the default). While
+/// the trigger is held in the gun role the game gets nothing (`aiming` is true, for the laser);
+/// the release sends one L2 pulse of kPulseMs (`pulse`), a tap included. A pull that starts
+/// during a pulse waits for it to end. `role` false (menu pointer, held item, switch mode) means
+/// the trigger is not the gun: no aiming and no pulse on release. `release` false keeps the old
+/// behaviour: `pulse` follows the trigger while it is held.
+class GunRelease {
+public:
+    bool release = true;
+    static constexpr double kPulseMs = 100.0;
+
+    struct Out {
+        bool pulse = false;  // L2 (and analog 255) goes to the game
+        bool aiming = false; // trigger held in the gun role: show the laser
+        bool fired = false;  // the release shot starts this frame
+    };
+
+    Out Update(double now_ms, bool pulled, bool role) {
+        Out out;
+        const bool pulsing = now_ms < pulse_until;
+        if (!release) {
+            out.pulse = pulled && role;
+            out.aiming = out.pulse;
+            return out;
+        }
+        if (held && (!pulled || !role)) {
+            if (!pulled && role && !pulsing) {
+                pulse_until = now_ms + kPulseMs;
+                out.fired = true;
+            }
+            held = false;
+        } else if (!held && pulled && role && !pulsing) {
+            held = true;
+        }
+        out.pulse = now_ms < pulse_until;
+        out.aiming = held;
+        return out;
+    }
+
+private:
+    bool held = false;
+    double pulse_until = -1e18;
+};
+
 /// One log line per kind per kIntervalMs.
 struct RateLimit {
     static constexpr double kIntervalMs = 2000.0;

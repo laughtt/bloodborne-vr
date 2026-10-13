@@ -11,5 +11,10 @@
 void vr_arms_view(const float rows[4][4], int head_valid, const float head_pos[3], const float head_rot[4]);
 /* Registers the AnimationToModel hooks' handlers ("bb_hook_vr_arms_a1"/"_a2"). */
 void vr_arms_register(void);
+/* The held weapon's bone (side 0: L_Weapon, 1: R_Weapon) as the IK last wrote it, relative to the H1
+ * camera that placed it (camera frame <- bone frame, src/vr_gun_math.h vg_weapon_in_cam; x y z w) and
+ * its age. 0 when the arms have not written that side (arms off, weight 0, no first person). The gun
+ * aim's barrel source (findings/27 section 11). */
+int vr_arms_weapon_cam(int side, float q_xyzw[4], unsigned long long *age_us);
 
 #endif

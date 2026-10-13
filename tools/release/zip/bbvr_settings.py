@@ -116,7 +116,7 @@ def _build_schema():
          help='Debug: swaps left and right.'))
     # Display size (docs/vr/findings/41-display-size.md): sets the game's render size and the eye image size for a
     # headset before the game starts. display_size / display_custom are "sticky": kept when the profile changes.
-    a(_o('display_size', 'display', 'Display size', 'choice', ('launch', 'display_size'), 'auto',
+    a(_o('display_size', 'display', 'Display size', 'choice', ('launch', 'display_size'), 'game',
          choices=['auto', 'game'] + [h[0] for h in HEADSETS] + ['custom'],
          labels=dict({'auto': 'Auto (match my headset)', 'game': 'Game default (1080p frame)',
                       'custom': 'Custom size...'}, **{h[0]: h[1] for h in HEADSETS}),
@@ -248,6 +248,15 @@ def _build_schema():
     a(_o('stamina_hits', 'combat', 'Stamina from hits', 'bool', ('hook', 'VR Stamina Hits'), True, advanced=True))
     a(_o('dash', 'combat', 'VR dodge (dash)', 'bool', ('env', 'BB_VR_DASH'), True))
     a(_o('gun', 'combat', 'Gun aiming', 'bool', ('env', 'BB_VR_GUN_AIM'), True))
+    a(_o('gun_yaw', 'combat', 'Gun aim turn (deg, + = right)', 'float', ('fp', 'gun_yaw'), 10.0, min=-45.0, max=45.0, step=1.0,
+         help='Turns the shots right (+) or left (-); the laser has the same 10 deg turn (gun_laser_yaw_deg). Live.'))
+    a(_o('gun_speed', 'combat', 'Gun shot animation speed', 'float', ('fp', 'gun_speed'), 3.0, min=1.0, max=4.0, step=0.1,
+         help='How much faster the gun-shot animation plays (1 = normal speed). Live.'))
+    a(_o('instant_items', 'combat', 'Instant items (no use animation)', 'bool', ('fp', 'instant_items'), True,
+         help='Vials, throwables and tools work at once from the hand, with no animation (single player; off online). Live.'))
+    a(_o('throw_mode', 'combat', 'Throwing', 'choice', ('env', 'BB_VR_THROW_MODE'), 'flick', choices=['flick', 'aim'],
+         labels={'flick': 'Swing and let go', 'aim': 'Hold the grip to aim (arc), let go to throw'},
+         help='Swing and let go: the item flies the way and as fast as your hand moved.'))
     a(_o('hitscale_env', 'combat', 'Hit shape scaling (feature)', 'bool', ('env', 'BB_VR_HIT_SCALE'), True, advanced=True))
     # ---- Body / arms ----
     a(_o('hide', 'body', 'Hide parts of the body', 'choice', ('fp', 'hide'), 'hands_skin',
@@ -291,8 +300,10 @@ def _build_schema():
     # ---- Advanced ----
     a(_o('exe', 'advanced', 'Game executable', 'text', ('launch', 'exe'), None, advanced=False,
          help='Blank = the one next to the launcher (bin\\bb-probe.exe, or out\\bb-probe.exe in a source tree).'))
-    a(_o('runtime', 'advanced', 'OpenXR runtime', 'runtime', ('launch', 'runtime'), '',
-         help='Blank = the system\'s active runtime. A choice only affects this game (XR_RUNTIME_JSON).'))
+    a(_o('runtime', 'advanced', 'OpenXR runtime', 'runtime', ('launch', 'runtime'), 'steamvr',
+         help='SteamVR (default): this game uses SteamVR\'s OpenXR runtime when SteamVR is installed, except on a '
+              'Pimax setup whose active runtime is Pimax (SteamVR doubles images there). Blank = the system\'s active '
+              'runtime. A choice only affects this game (XR_RUNTIME_JSON).'))
     a(_o('fp_log', 'advanced', 'First-person log', 'bool', ('env', 'BB_VR_FP_LOG'), False, advanced=True))
     a(_o('dash_log', 'advanced', 'Dash log', 'bool', ('env', 'BB_VR_DASH_LOG'), False, advanced=True))
     a(_o('stereo_log', 'advanced', 'Stereo log', 'bool', ('env', 'BB_VR_STEREO_LOG'), False, advanced=True))
@@ -342,7 +353,8 @@ PAGES = [
         ('Wrist bars', ['hp_color', 'stamina_color'])]},
     {'id': 'combat', 'label': 'Combat & hands', 'vr': True, 'sections': [
         ('Combat', ['hit', 'hit_scale', 'hit_reach', 'atk_speed', 'face', 'face_dodge', 'face_lockon', 'stamina',
-                    'stamina_hits', 'gun', 'hitscale_env']),
+                    'stamina_hits', 'gun', 'gun_yaw', 'gun_speed', 'hitscale_env']),
+        ('Items', ['instant_items', 'throw_mode']),
         ('Hands and body', ['hide', 'arms', 'arm_attack', 'arm_weight', 'arm_offset', 'arm_rot_l', 'arm_rot_r', 'arm_body',
                             'arm_log'])]},
     {'id': 'controls', 'label': 'Controls', 'vr': True},
@@ -1164,13 +1176,37 @@ def detect_runtimes():
     return {'active': active, 'runtimes': runtimes, 'warnings': []}
 
 
-PIMAX_STEAMVR_WARNING = 'SteamVR on Pimax can show double images: use the Pimax OpenXR runtime for this game.'
+def steamvr_default(runtime_info):
+    """The SteamVR runtime manifest for runtime = 'steamvr', or '' (the system's active runtime): no SteamVR
+    installed, or the active runtime is Pimax's (SteamVR doubles the image on Pimax, PIMAX_STEAMVR_WARNING)."""
+    active = runtime_info.get('active') or ''
+    if active and classify_runtime(active, '') == 'pimax':
+        return ''
+    for r in runtime_info.get('runtimes', []):
+        if r['kind'] == 'steamvr':
+            return r['path']
+    return ''
+
+
+def resolve_runtime(choice, runtime_info=None):
+    """XR_RUNTIME_JSON for the 'runtime' setting: a manifest path as is, 'steamvr' through steamvr_default,
+    blank = '' (the system's active runtime)."""
+    choice = (choice or '').strip()
+    if choice != 'steamvr':
+        return choice
+    try:
+        return steamvr_default(runtime_info if runtime_info is not None else detect_runtimes())
+    except Exception:  # registry or file trouble: the system's runtime
+        return ''
+
+
+PIMAX_STEAMVR_WARNING ='SteamVR on Pimax can show double images: use the Pimax OpenXR runtime for this game.'
 
 
 def runtime_warning(runtime_info, chosen_path):
     """Warns when SteamVR will run on a Pimax setup."""
     kinds = {r['kind'] for r in runtime_info['runtimes']}
-    chosen = chosen_path or runtime_info.get('active') or ''
+    chosen = resolve_runtime(chosen_path, runtime_info) or runtime_info.get('active') or ''
     if 'pimax' in kinds and classify_runtime(chosen, '') == 'steamvr':
         return PIMAX_STEAMVR_WARNING
     return ''
@@ -1567,8 +1603,9 @@ def build_launch(values, paths, caps=None, public=None, view='vr'):
         e('BB_XR_DLSSNR', '0')
     if v.get('online') and not public:
         e('BB_ONLINE', '1')
-    if v.get('runtime'):
-        e('XR_RUNTIME_JSON', str(v['runtime']))
+    rt = resolve_runtime(v.get('runtime'))
+    if rt:
+        e('XR_RUNTIME_JSON', rt)
     if not public:
         env.update(parse_extra_env(v.get('extra_env')))
     # control files

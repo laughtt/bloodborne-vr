@@ -481,7 +481,7 @@ class DisplaySizeTests(unittest.TestCase):
             f = Path(tmp) / 'settings.json'
             S.save_settings(f, s)
             self.assertEqual(S.load_settings(f)['hw'], {'display_size': 'quest2'})
-        back = S.apply_edit(s, dict(S.effective_values(s), display_size='auto'))
+        back = S.apply_edit(s, dict(S.effective_values(s), display_size='game'))  # the default (native 1080p)
         self.assertEqual(back['hw'], {})
 
     def write_log(self, folder, runtime, headset, rec):
@@ -499,7 +499,19 @@ class DisplaySizeTests(unittest.TestCase):
             self.assertEqual((det['source'], det['preset'], det['rec']), ('runtime', 'index', [2016, 2240]))
         self.assertIsNone(S.detect_headset({'active': None, 'runtimes': []}, None)['rec'])
         caps = dict(NO_GPU, headset={'source': 'log', 'rec': [2064, 2208], 'name': 'Meta Quest 3'})
-        self.assertEqual(self.plan({'upscale': 'fsr1'}, caps)['env']['BB_XR_EYE_RES'], '3840x2160')
+        self.assertEqual(self.plan({'upscale': 'fsr1'}, caps, hw={'display_size': 'auto'})['env']['BB_XR_EYE_RES'], '3840x2160')
+
+    def test_steamvr_is_the_default_runtime_except_on_pimax(self):
+        self.assertEqual(S.BY_ID['runtime']['default'], 'steamvr')
+        self.assertEqual(S.BY_ID['display_size']['default'], 'game')
+        steam = {'active': r'C:\oc\oculus_openxr_64.json', 'warnings': [],
+                 'runtimes': [{'path': r'C:\sv\steamxr_win64.json', 'name': 'SteamVR', 'kind': 'steamvr', 'active': False}]}
+        self.assertEqual(S.resolve_runtime('steamvr', steam), r'C:\sv\steamxr_win64.json')
+        pimax = dict(steam, active=r'C:\Program Files\Pimax\Runtime\PiRuntime.json')
+        self.assertEqual(S.resolve_runtime('steamvr', pimax), '')  # Pimax keeps its own runtime
+        self.assertEqual(S.resolve_runtime('steamvr', {'active': None, 'runtimes': []}), '')  # no SteamVR: the system's
+        self.assertEqual(S.resolve_runtime('', steam), '')
+        self.assertEqual(S.resolve_runtime(r'C:\x\vdxr.json', steam), r'C:\x\vdxr.json')
 
     def test_runtime_kinds_and_headset_names(self):
         self.assertEqual(S.classify_runtime(r'C:\Program Files\Virtual Desktop Streamer\OpenXR\virtualdesktop-openxr.json',
@@ -515,7 +527,9 @@ class DisplaySizeTests(unittest.TestCase):
     def test_page_state_reports_detection_and_sizes(self):
         caps = dict(NO_GPU, headset={'kind': 'oculus', 'source': 'runtime', 'rec': [1832, 1920],
                                      'name': 'Meta Quest 2 / Quest 3S', 'preset': 'quest2'})
-        st = S.page_state(S.default_settings(), caps, public=False)
+        s = S.default_settings()
+        s['hw'] = {'display_size': 'auto'}  # the default is 'game' (native 1080p); Auto sizes for the headset
+        st = S.page_state(s, caps, public=False)
         self.assertEqual(st['display']['detected']['runtime_label'], 'Meta Quest Link / Air Link')
         self.assertEqual(st['display']['sizes']['render'], [1668, 938])
         opt = next(o for o in st['options'] if o['id'] == 'display_size')

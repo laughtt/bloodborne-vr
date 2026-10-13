@@ -132,12 +132,12 @@ delay is the shot clip's wind-up before the TAE bullet event plus its recovery a
   `BB_ONLINE=1` or `BB_ONLINE_ROLE` is set, one `VR online: gun_speed x.. and hurt_speed x.. are active` line
   is logged. What a peer sees: section 10.
 - **Files.** `src/vr_gun_speed.h` (decision logic), `src/runtime_vr_atkspeed.c` (hook), `tests/test_vr_gun_speed.c`
-  (`vr-gun-speed-test`, 24 checks). Not run in the game yet.
+  (`vr-gun-speed-test`, 24 checks). Not run in the game yet (range unconfirmed).
 
 ## 9. Hit-reaction animation speed (2026-10-12)
 
 Request: "reduce stagger time to half from all hits too". The player's damage-reaction clips play `hurt_speed`
-times faster (set `BB_VR_HURT_SPEED=2` and the stagger lasts half as long; **OFF by default (1.0) until the anim range is confirmed**, the feature is postponed), through the same dt hook as sections 8 and the
+times faster (set `BB_VR_HURT_SPEED=2` and the stagger lasts half as long; **on by default at 2x**, per the user's request on 2026-10-13; `BB_VR_HURT_SPEED=1` turns it off; the anim range is still unconfirmed), through the same dt hook as sections 8 and the
 attack speed, with the same guards (dt 0 = hit stop and dt > 0.2 hitches are untouched, so the freeze after a hit
 keeps its length).
 
@@ -148,6 +148,7 @@ keeps its length).
   not used; 13000+ is left out because deaths probably live there); the play logs show `a003_011100` and
   `a003_012000` as the clip that followed a dodge and `a003_008000` once (consistent, not proof). If the range
   is wrong the failure is harmless: a wrong id is simply not sped up, or a non-reaction clip in the range is.
+- **Confirmed range (headset run 2026-10-13, run28all3): sub-id 20000-20999.** Each time an enemy attack behaviour (e.g. 226300160) ran just before, the player started a003_020100 / 020103 / 020104 / 020113 / 020123 / 020133 / 020134 / 020500 / 020900 (the eye dropped to 0.94 m in one: a knockdown); no clip in 9000-12999 played in two runs. The default is now 20000-20999 (`VR_HURT_ANIM_FROM/TO`); the 9000-12999 evidence below was a guess and is superseded.
 - **Finding the real ids.** `BB_VR_FP_LOG=1` prints `VR hurt speed: new clip <id> (sub-id N) is not an attack...`
   for every clip with sub-id 8000 up that is not an attack, a shot or in the range (once per change). Get hit
   (flinch, big stagger, knockdown, get-up), read the ids, then set `BB_VR_HURT_RANGE=<from>-<to>` (inclusive, no
@@ -156,8 +157,8 @@ keeps its length).
   is: those clips are timing-locked to the enemy's clip and could desync when scaled), 13000+ (deaths),
   attacks 30000-49999, gun shots 51000-52999, dodges 7000s. Anything in 9000-12999 that is a synced grab
   victim would be scaled; none is known to be.
-- **Settings.** `BB_VR_HURT_SPEED=<k>` (default 1.0 = off until the range is confirmed, max 4), `hurt_speed=<k>` in `out/fp.txt`
-  (polled 4 Hz; a missing key falls back to the env value / 1.0 = off), `BB_VR_HURT_RANGE`. Logged at start and on
+- **Settings.** `BB_VR_HURT_SPEED=<k>` (default 2.0 = on, 1 = off, max 4), `hurt_speed=<k>` in `out/fp.txt`
+  (polled 4 Hz; a missing key falls back to the env value / 2.0), `BB_VR_HURT_RANGE`. Logged at start and on
   every change; with `BB_VR_FP_LOG=1` also the measured clip rate during a reaction.
 - **Online.** Stays ON in co-op; `BB_VR_HURT_SPEED_ONLINE=0` opts out (section 10).
 - **Files.** `src/vr_hurt_speed.h`, `src/runtime_vr_atkspeed.c`, `tests/test_vr_hurt_speed.c`
@@ -182,3 +183,76 @@ stagger means we recover earlier than the game's timings on the other machine ex
 view of us during our get-up could look odd, or the peer could consider us still staggered). Both are a gameplay
 advantage in co-op. To check: two instances with `BB_VR_FP_LOG=1` and the peer's view recorded (needs the P2P sync
 working end to end, which it was not).
+
+## 11. Shots too far left: the bullets followed the controller, not the visible barrel (2026-10-13)
+
+Player report: "when I point the gun and shoot, it goes totally too much to the left".
+
+**Cause.** The bullets followed the left controller's aim pose (its −Z), but the gun the player sees and points
+with hangs off `L_Weapon`, which the arms IK places at grip · `arm_offset` · `arm_rot_l` (24, commit 863efde:
+the trim is applied in the controller frame, yaw right = about −Y, pitch up = about +X, not mirrored for the
+left hand). The player's `out/fp.txt` has `arm_rot_l=30,25` and `arm_offset=0,0.04,0.07,-105`: the visible gun is
+turned 30° right and 25° up from the controller, about 38° in all (`tests/test_vr_gun.c`). Lining the visible
+barrel up with a target therefore puts the controller ray, and the bullets, about 30° left and 25° below it.
+No sign flip: the trim's signs are right (+30 = right, +25 = up in the world, tested), and so is the log's.
+
+- **Log sign.** `vg_yaw_pitch` heading = atan2(x, z): 0 along world +Z, growing toward +X. The camera rows are a
+  rotation (right × up = forward), so a camera looking along +Z has right = +X: **a growing heading is a turn
+  right, a negative change is left** (tested: a controller turned 10° left reads heading −10).
+- **Live log** (`out/vr_all_stereo.log`, run with that fp.txt, 31 redirected shots): every turn from the game's
+  aim is to the left and down, e.g. shot 87 bullet 600 `yaw -148.1 pitch -3.2 -> yaw -158.3 pitch -7.2 (turn
+  10.8 deg)`, shots 67-71 −13°/−6°, shots 92-96 (bullet 601) −10.4°/−3.8°. The game's aim is the body's facing,
+  so these numbers are the controller ray against the facing, consistent with a ray that sits left of and
+  below where the player pointed the visible gun.
+
+**Fix.** A new ray source **`barrel`**, the default: the arms module publishes, after each IK write, the weapon
+bone's model rotation relative to the H1 camera that placed it (`vr_arms_weapon_cam`, `vg_weapon_in_cam`), and
+the hook takes the bone's barrel axis through the same camera rows as the old ray (`vg_barrel_in_world`). So
+`arm_offset`, `arm_rot_l`, the bind and the animated hand → weapon local are all in it, and the body's pose is
+not. The barrel axis is the bone's **−Z** (the weapon models' barrel: the pistol's muzzle dummy at z −0.44, 13
+7.3; the sandbox aims guns along the model's −Z) [L, not seen in the headset yet]. Guards: without the arms (no
+`BB_VR_ARMS=1`, no first person, weight 0) or when the barrel is more than 70° from the controller ray (a wrong
+axis), the shot uses the aim ray and the log says why. Then the live trim: heading + `gun_yaw`, pitch +
+`gun_pitch` (`vg_trim`).
+
+**Settings** (env = start value; the `out/fp.txt` keys are read as tokens anywhere on its one line, 4 Hz, a
+missing key falls back to the env value; logged at start and on every change):
+
+| Env | fp.txt | Default | |
+|---|---|---|---|
+| `BB_VR_GUN_AIM_POSE=barrel\|aim\|grip` | `gun_src=` | barrel | aim / grip: the old controller rays (aim falls back to grip) |
+| `BB_VR_GUN_YAW=<deg>` | `gun_yaw=` | 0 | + = shots further right (−90..90) |
+| `BB_VR_GUN_PITCH=<deg>` | `gun_pitch=` | 0 | + = shots higher (−90..90) |
+| `BB_VR_GUN_BARREL_AXIS=-z` | `gun_axis=` | −z | the bone axis that is the barrel (±x, ±y, ±z) |
+| `BB_VR_GUN_BARREL_MAX_DEG` | | 70 | farther from the controller ray: the aim ray |
+
+Log lines: `VR gun aim: source barrel axis -z, trim yaw +0.0 pitch +0.0 deg (...)` at start and on change;
+per shot `... (turn ... from the aim point, barrel -z ray; ...)` and `VR gun aim: shot N: barrel 38.4 deg from
+the controller ray, trim ...`, or `aim (barrel: <why>) ray` when it fell back.
+
+**What to try.** Keep `arm_rot_l=30,25`, aim with the visible gun. If the shots still drift, A/B `gun_yaw=5` /
+`gun_yaw=-5` (then 10 / −10) and `gun_pitch=±5` in fp.txt while shooting a wall. "barrel N deg from the
+controller ray" near 38 confirms the axis; a fallback line "barrel too far" means −Z is not the barrel: try
+`gun_axis=+y` / `-y` / `+x`. `gun_src=aim` gives the old behaviour.
+
+**Files.** `src/vr_gun_math.h` (`vg_weapon_in_cam`, `vg_barrel_in_world`, `vg_trim`, `vg_hand_trim`,
+`vg_key_float/word`, `vg_axis_parse`, `vg_src_parse`), `src/runtime_vr_gun.c` (sources, trims, control poll,
+logs), `src/runtime_vr_arms.c` + `src/vr_arms.h` (`vr_arms_weapon_cam`), `tests/test_vr_gun.c` (`vr-gun-test`,
+249 checks: the barrel equals the controller ray turned like the IK hand for the player's settings, a skewed
+bind and any body pose; trim signs; fp.txt keys).
+
+## Fire on release and the gun laser
+
+The left trigger (gun role) now fires when it is let go, not while it is pulled. While it is held past
+the threshold the game gets no L2 and an analog l2 of 0; on release (a tap too) xr_input sends one L2
+pulse of 100 ms (digital L2, analog 255), logged as "left trigger released: L2 pulse 100 ms". A pull during
+a pulse waits for it to end. `BB_XR_GUN_FIRE=release|press` (default `release`; `press` is the old
+held-L2). Other meanings of the left trigger (menu pointer, held-item put back, switch mode) make no
+pulse. The gun-thrust gesture (ShootGate) and parry paths still emit their own L2 pulses and are untouched.
+State machine: `xrpad::GunRelease` in `gpu/xr_bridge/xr_input_logic.h`, tested in `xr_math_test.cpp`.
+
+Laser: layout key `game.gun_laser` = `"hold"` (default: shown while the trigger is held aiming,
+`BBXR_RAW_GUN_AIM` in `BbXrInput.reserved[1]`, and flashed on the shot), `"always"` or `"off"`;
+`debug_gun_ray: true` still means always. Trim: `game.gun_laser_yaw_deg` / `game.gun_laser_pitch_deg`
+(default 0) turn the drawn ray like the host's `gun_yaw` / `gun_pitch` (`vg_trim`): + = right / up, yaw
+about the world vertical. Set them equal to the fp.txt keys so laser and shots agree.

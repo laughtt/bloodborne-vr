@@ -130,8 +130,9 @@ and a hand pose (the share of the fist for the thumb, the index and the other th
   sandbox's tuned pose for the 22 goods its tables have (`MeshSpec.pos/rot_deg` plus the per-kind
   `KindTweak`, already a grip-frame socket), keeping the category's finger curls. Last comes the
   category default.
-- Meshes come through the shared lookup `held::MeshFor(assets, goods)`: the sandbox's tables
-  first, then `items/items.json` (the extraction for every goods with a game model; that index also
+- Meshes come through the shared lookup `held::MeshFor(assets, goods)`: the game's own in-hand
+  models of `held/held.json` first (section 9: real size, the game's grip), then the sandbox's tables,
+  then `items/items.json` (the extraction for every goods with a game model; that index also
   carries a `grip` category with the same six names and a size-based scale). A newly extracted mesh
   appears in the hand with no code change. Goods with no model keep the coloured disc. Stage 2:
   feed `CategoryFor` from items.json's `grip` field when present, so there is one source.
@@ -254,3 +255,125 @@ user's own FLVER with `scripts/vr_assets/extract.py` (nothing shipped), and map 
 bind frames, which `sb::Model` already has. Then draw it through the same `TriBatch` path. It
 solves sleeves completely and works in menus, but has stage 1's no-depth limit and lighting that
 does not match the game. The WebXR hand remains the fallback when no glove can be extracted.
+
+## 9. The game's own item models (held/)
+
+Date: 2026-10-13. Branch `item-models` (from `test-all3`). Static data only (the dump read through
+`scripts/vr_assets`), the game was not run. **What the held items looked like before was wrong** for
+three reasons:
+
+1. **The mapping was guessed** from material names (docs 35/36): the Blood Vial got `s10009` (the Numbing
+   Mist's bottle), Iosefka's Blood Vial `s10015` (the Pungent Blood Cocktail's), the Sedative and the
+   Blue Elixir the `s10000` / `s10001` flasks no goods uses, the Throwing Knife `s10020` (the Shaman Bone
+   Blade), every bell `s10025` (the Choir Bell).
+2. **The FLVER bone transform was skipped.** These effect meshes are static meshes whose vertices are in
+   their default bone's space, and the bones carry scales: the vial is a cylinder scaled 1 x 2.9 x 1 mm, so
+   it came out 40 x 61 x 40 "metres" and squashed; the bells 0.42-0.58 m (bone scale 0.40) instead of
+   0.17 m; the Molotov 0.41 m instead of 0.30 m. The effect's own model scale (FXR) was skipped too.
+3. The bridge then forced a guessed size and a category socket on top.
+
+### 9.1 The chain (all read from the dump)
+
+`EquipParamGoods.modelId` is 0 everywhere: a used item is an **SFX model** spawned by its use animation.
+
+| Step | Data | Example (Blood Vial 1000) |
+|---|---|---|
+| 1 | `EquipParamGoods.goodsUseAnim` N -> the behaviour graph (`c0000.anibnd` `Behaviors/c0000.hkx`) generator `UseItem_N Selector` -> its clip | 26 -> `a000_100080` |
+| 2 | `a00.tae` events of that anim: **type 96** (i32 ffx, i32 dummy) and **type 114** (i32 base, i16, i16 dummy: ffx = base x 100 + `EquipParamGoods.sfxVariationId`) at a dummy that follows `R_Hand` / `L_Hand` | 96: ffx 20156, dummy 1 (`R_Hand`) |
+| 3 | otherwise `SpEffectParam.stateInfo` -> `SpEffectVfxParam.midstSfxId`, then `Bullet.sfxId_Bullet` | - |
+| 4 | `f<ffx>.fxr` (`frpg_sfxbnd_{commoneffects,dlceffects}`): a model layer is the record `41, 0, <mesh>, 0` followed by three keyframe properties (type 11): the X/Y/Z scale at t = 0; zero-scale layers are hidden | `s10002` x 1 |
+| 5 | `s<mesh>.flver` with each mesh through its default bone's bind transform, times the FXR scale | 0.039 x 0.175 x 0.039 m |
+
+The 114 formula is confirmed by a pair of anims: `a000_100080` (Blood Vial) spawns 20056 / 20256 with type
+96 where `a000_100081` (the blood samples) has type 114 with bases 200 / 202, and the vial's variation is
+56. The `goodsUseAnim` -> anim table is in `held.json` (`use_anims`): 0 -> 100000, 1 -> 100130 (papers),
+2 -> 100031 (knives), 3 -> 100030 (bottles, pebble), 9 -> 100020 (Madman's Knowledge, coldblood), 10 ->
+100050 (drinks), 13 -> 100032, 14 -> 100110 (bells), 26 -> 100080, 28 -> 100081, 34 -> 100033 ...
+
+**Grip.** The model is drawn in the frame of its dummy (XNA `CreateWorld`: Z = -forward, Y = upward). The
+socket is that frame in the bind pose of `c0000.flver` relative to `R_Weapon` (X mirrored like the
+weapon models): `socket` in `held.json`. Checked on the animations (the havok skeleton, `dodge_extract`'s
+spline decoder): in `a000_100050` the Sedative jar's +Y (its neck) points down to the face while
+drinking; in `a000_100080` the vial's pointed end points into the thigh at the stab (with Y = forward
+instead, both point away). `grip_socket` is the same frame in the controller's grip frame, through the
+arms IK's hand placement (`vam_hand_rotation` / `vam_grip_wrist`, default offset (0, -0.01, 0.07) m,
+-15 deg): it equals (R_Weapon in the grip) x socket, checked to 2e-5. R_Weapon sits 2 cm from the grip
+origin but is turned well away from the grip axes, which is why the two are kept apart.
+
+### 9.2 The items
+
+| Goods | Item | Model (scale) | Size m | Found through | Confidence |
+|---|---|---|---|---|---|
+| 1000 | Blood Vial | `s10002` | 0.04 x 0.18 | a000_100080 ffx 20156, dummy 1 | game |
+| 701-706 | Iosefka's, Arianna's, Adella's, Adeline's, Queenly blood | `s10002` (the same vial) | 0.04 x 0.18 | a000_100081 ffx 20156 | game |
+| 1101 | Sedative | `s10022` (x0.75) | 0.09 x 0.16 | a000_100050 ffx 20057, dummy 26 | game |
+| 1120 | Blue Elixir | `s10017` (x0.625) | 0.07 x 0.14 | ffx 20009 | game |
+| 2030 | Lead Elixir | `s10023` | 0.09 x 0.12 | ffx 20010 | game |
+| 1200, 1250 | Molotov, Rope Molotov | `s10010` | 0.11 x 0.30 | a000_100030 / 100032 ffx 20000, dummy 17 | game |
+| 1201, 1251 | Delayed (Rope) Molotov | `s10051` (DLC bundle) | 0.15 x 0.36 | ffx 20020 | game |
+| 1220 | Oil Urn | `s10014` | 0.11 x 0.18 | ffx 20001 | game |
+| 1230 | Pebble | `s10012` | 0.12 | ffx 20003 | game |
+| 1240, 1210 | Throwing / Poison Knife | `s10016` (the old guess `s10020` is the Shaman Bone Blade) | 0.41 | a000_100031 ffx 20004 / 20005 | game |
+| 1260 | Pungent Blood Cocktail | `s10015` (3 more layers hidden at spawn) | 0.11 x 0.25 | ffx 20007 | game |
+| 1270 | Numbing Mist | `s10009` | 0.13 x 0.23 | ffx 20008 | game |
+| 200, 205, 225 | Beckoning, Small / Sinister Resonant Bell | `s10005`, `s10006`, `s10007` | 0.17-0.23 | a000_100110 ffx 20060-62 | game |
+| 2050 | Choir Bell | `s10025` | 0.13 | a000_100300 ffx 200005 | game |
+| 700, 130, 131 | Tiny Music Box (and the two ranking items) | `s11012` | 0.13 | a000_100170 ffx 20180, dummy 3 (left hand) | game |
+| 2060, 2070, 2080, 2090 | Old Hunter Bone, Tiny Tonitrus, Executioner's Gloves, Shaman Bone Blade | `s11015` (x0.75), `s11010` (x3.25), `s11016`, `s10020` (x2.5) | 0.38, 0.87, 0.33, 0.53 | a000_1003x0 ffx 2000xx | game |
+| 2010, 2020, 2110, 2130, 2140, 111 | A Call Beyond, Beast Roar, Messenger's Gift, Accursed Brew (skull), Madaras Whistle, Silencing Blank | `s11014`, `s11013`, `s10013`, `s11051`, `s11050`, `s11401` | | the same | game |
+| 1411, 1412 | Monocular, Hand Lantern | `s10024` (x0.625), `s10021` (x1.5) | 0.06, 0.16 | SpEffect 2000 / 2010 vfx (at the head / the waist, not a hand) | game, category socket |
+| 2120 | Blacksky Eye | `s25103` | 0.19 | its bullet's flight effect (the use anim draws at the head) | flight model |
+| 1100 | Antidote | `s10000` ("m_kaifuku" medicine flask) | 0.07 x 0.15 | **no model in the game** (a000_100000 spawns only the body effect) | guess |
+| 1410 | Shining Coins | `s10004` ("coin" disc) | 0.08 | no model in a000_100040 | guess |
+| 1110, 1300, 1310, 1320, 1330, 1500, 1501, 1510-1594, 704, 100, 1400, 120, runes, gems | Pellet, papers, Shell, Ash, Madman's Knowledge, coldblood, marks, Notebook... | none | | their anims spawn no model (1500/1510: particle effects 20090-20097 only) | stand-in / icon card |
+
+Scale: the FXR scale is applied as read, also where it is large. Tiny Tonitrus x3.25 (0.87 m) is
+consistent with its animation: at the slam of `a000_100350` the tip reaches the ground (at x1 it would
+stop 0.2 m above it). The DLC effects' layers set only the first scale value; it is read as uniform
+(the Accursed Brew's skull is 21 cm). Textures: each submesh's albedo from the bundles' TPFs
+(`items/tex_sheet`); dark metal (the knives' albedo averages 0.08) gets a lift (`tex_gain`, at most
+x2.5) because the bridge lights flat.
+
+### 9.3 Tool, bridge, tests
+
+- **Regenerate:** from the repo root, `python scripts/vr_assets/extract.py --held` (`--game` for the dump,
+  default `C:/games/CUSA03173`; `--out`, default `out/vr_assets`). Writes `held/<goods>.json/.bin`,
+  `held/held.json` and adds the textures to `items/tex/` and `items/tex_sheet.*`. Read-only on the dump,
+  a few seconds. The other folders (`throwables/`, `consumables/`, `items/`) are left as they were.
+- **Bridge** (`vr_held_mesh.h`): `MeshFor(assets, goods)` looks in `held/held.json` first, then the
+  sandbox's table, then `items/items.json`. A held/ model keeps its size (`real_size`, scale 1, unless the
+  row is a guess); `SocketMeshWorld(..., bone_frame)` puts it at `socket` when the item is at the game's
+  hand bone (`PlaceInHand` from_bone) and at `grip_socket` at a controller or the custom hands; the left
+  hand mirrors either like every socket. A model with no hand dummy is centred on the category socket.
+  The instant throw draws it centred on the arc (`FlightMeshWorld`). The blood vials keep a 0.6 red tint
+  over their glass texture. **Textures in the game:** the held and thrown meshes go into the HUD canvas,
+  whose renderer (`GameUi::hud_gpu`) only ever got the font: its icon texture stayed the 1x1 white
+  default, so in the headset every held mesh was drawn untextured (the menus' renderer had the atlas,
+  the offline tests rasterise from the CPU atlas, so neither showed it). `GameUi::Load` now loads the
+  icon atlas with the item sheet appended and uploads it to `hud_gpu` too (log: `HUD icon atlas WxH
+  uploaded`); `TestHeldTexturesInHud` checks the HUD atlas has the sheet's layout and that the vial's
+  triangles sample its texture's rect. Log: `held item: goods N mesh file found: ...held/N.json` and
+  `held item: goods N is the game's model (game): use animation a000_..., TAE ..., s10002 ...; socket dummy 1 on R_Hand`.
+- **Tests:** `bbport_xr_game_ui_test.exe out/vr_assets`: `TestHeldGameModels` (a synthetic index: lookup
+  order, real size, both sockets, the left mirror, centring, flight, the in-game log and triangles; then
+  the real folder: 16 items at their sizes, sockets in the hand, texture lift) and the placement tests
+  updated for the game models. `python scripts/vr_assets/test_vr_assets.py`: the FXR layer and TAE 114
+  decoding on synthetic data and, with the dump, the whole extraction (anim table, meshes, sizes,
+  chains, the missing list).
+- **Offline look:** `bbport_xr_game_ui_test.exe out/vr_assets --render DIR` (the list now has 703, 1101,
+  1270 too).
+
+### 9.4 Still open
+
+- Items the game draws nothing for keep the stand-ins (papers, Shell, Ash, pellets, Madman's Knowledge,
+  coldblood, marks, Notebook, runes, gems). Antidote and Shining Coins are guesses.
+- The FXR is read only for the model layer and its scale at t = 0: emitter offsets, rotations and
+  animated scales are not (the Accursed Brew's skull floats ~0.2 m above the hand through its bone
+  offset; the effect may move it).
+- The vial's blood colour is our tint; the game's shader colour is not read.
+- Items without a game socket (stand-ins, the category sockets) are still placed at the R_Weapon bone as
+  if it were the controller grip; `held.json`'s two sockets give the conversion (R_Weapon in the grip) if
+  that is to be fixed for them too.
+- `grip_socket` uses the default arms offset; a changed `vr_tune.ini [arms]` offset shifts the hand, not
+  this socket. Judge in the headset: the vial, a Molotov and a bell in the game's hands (bone socket)
+  and with `BB_XR_CUSTOM_HANDS=1` (grip socket).

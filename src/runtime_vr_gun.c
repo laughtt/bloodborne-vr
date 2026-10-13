@@ -17,9 +17,18 @@
  * (the matrix position) is kept. With a lock-on target the game's aim is kept unless
  * BB_VR_GUN_AIM_LOCK=aim. Both are caller stack copies: only this bullet changes.
  *
- * The controller's ray: bbgpu_vr_hands (the aim pose, its -Z; or the grip pitched by
- * BB_VR_GUN_AIM_GRIP_PITCH when the runtime gives no aim pose), relative to the head of the same
- * snapshot, through the first-person camera H1 just showed (vr_gun_view). Needs first person.
+ * The ray (findings/27 section 11), by source:
+ *   barrel (default): the visible gun's barrel, the held weapon bone (L_Weapon) as the arms IK wrote
+ *     it (vr_arms_weapon_cam: relative to the H1 camera, so arm_offset and arm_rot_l are in it) along
+ *     its axis BB_VR_GUN_BARREL_AXIS (-z), through the camera rows. Falls back to the aim pose while
+ *     the arms have not written the hand (BB_VR_ARMS off, no first person) or when the barrel is more
+ *     than BB_VR_GUN_BARREL_MAX_DEG from the controller ray (a wrong axis must not throw shots away).
+ *   aim: bbgpu_vr_hands' aim pose -Z (or the grip pitched by BB_VR_GUN_AIM_GRIP_PITCH when the
+ *     runtime gives no aim pose), relative to the head of the same snapshot, through the first-person
+ *     camera H1 just showed (vr_gun_view). It ignores the arms' offset and trim: with arm_rot_l=30,25
+ *     the shots left 30 deg left / 25 deg below the visible barrel (the player's "too much to the left").
+ *   grip: the grip pose the same way.
+ * Then the live trim: heading + gun_yaw (+ = right), pitch + gun_pitch (+ = up). Needs first person.
  *
  * Environment (needs BB_HOOKS="...;VR Gun Aim (bullet spawn)"):
  *   BB_VR_GUN_AIM=1              on (default off: the handler returns at once)
@@ -29,7 +38,14 @@
  *                                firearms, their child bullets and the other left-hand bullets;
  *                                thrown items are 100-370)
  *   BB_VR_GUN_AIM_REF=auto|target|forward  the game's direction the turn starts from (findings/27 3)
- *   BB_VR_GUN_AIM_POSE=aim|grip  the controller pose used as the ray (aim; grip when aim is invalid)
+ *   BB_VR_GUN_AIM_POSE=barrel|aim|grip  the ray's source (barrel; aim falls back to grip when the aim
+ *                                pose is invalid); gun_src=barrel|aim|grip in the control file overrides it live
+ *   BB_VR_GUN_YAW=<deg> BB_VR_GUN_PITCH=<deg>  trim of the ray (0, 0; + = right / up), live: gun_yaw= gun_pitch=
+ *                                in the control file (BB_VR_ARMS_CONTROL / BB_VR_FP_CONTROL, out/fp.txt, polled
+ *                                4 Hz; a missing key = the env value)
+ *   BB_VR_GUN_BARREL_AXIS=auto   the weapon bone axis that is the barrel (+-x, +-y, +-z; auto = the one closest to the
+ *                                controller ray at the first shot, logged with all six angles), live: gun_axis=
+ *   BB_VR_GUN_BARREL_MAX_DEG=70  the barrel farther than this from the controller ray: the aim ray is used
  *   BB_VR_GUN_AIM_GRIP_PITCH=<deg>  the grip's ray pitch when the grip is used (0)
  *   BB_VR_PARRY_ASSIST=0.8       parry aim assist strength 0..1 (0 off; findings/41): the ray is pulled toward the
  *                                lock-on candidate it nearly points at (cone atan(RADIUS/d) clamped to MIN..MAX deg)
@@ -77,6 +93,8 @@
 #include "vr_fp.h"
 #include "vr_gun_math.h"
 #include "vr_visceral.h"
+#include "vr_items.h"
+#include "vr_arms.h"
 #include "gpu/bbgpu.h"
 #include "gpu/xr_bridge/bbport_xr_bridge.h"
 #include <stdatomic.h>
@@ -85,6 +103,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -101,8 +120,15 @@
 #define GUN_LOG_PER_S 20
 
 static struct {
-    int on, log, side, lock_aim, ref, use_grip;
-    float grip_pitch, max_off;
+    int on, log, side, lock_aim, ref;
+    float grip_pitch, max_off, barrel_max;
+    /* the env start values of the live settings (a key missing from the control file falls back to them) */
+    int src0;
+    float yaw0, pitch0;
+    char axis0[8];
+    const char *control;
+    uint64_t control_checked;
+    long long control_mtime, control_size;
     char ids[128];
     VgAssist assist;       /* parry aim assist (strength 0: off) */
     unsigned assist_n, assist_hits;
@@ -115,6 +141,18 @@ static struct {
     int log_lines;
     uint32_t shots, redirected;
 } gun;
+
+/* The live settings (BB_VR_GUN_AIM_POSE / _YAW / _PITCH / BARREL_AXIS, the control file's gun_src /
+ * gun_yaw / gun_pitch / gun_axis): written by the H1 thread's poll into the other slot, then published. */
+typedef struct {
+    int src;          /* VG_SRC_* */
+    float yaw, pitch; /* deg, + = right / up */
+    VrVec3 axis;      /* the barrel in the weapon bone's frame */
+    char axis_name[8];
+} GunTune;
+static GunTune gun_tune[2];
+static _Atomic int gun_tune_idx;
+static GunTune gun_tune_get(void) { return gun_tune[atomic_load_explicit(&gun_tune_idx, memory_order_acquire) & 1]; }
 
 typedef struct {
     uint64_t time_us;
@@ -187,8 +225,9 @@ static uint64_t gun_now_us(void) {
 }
 
 static void thr_speed_poll(uint64_t now);
+static void gun_poll_control(uint64_t now);
 void vr_gun_view(const float rows[4][4]) {
-    if (!gun.on && !thr.on && !vr_visceral_active()) return;
+    if (!gun.on && !thr.on && !vr_visceral_active() && !vr_items_active()) return;
     const uint64_t prof_t0 = bb_vrprof_t0();
     const uint64_t now = gun_now_us();
     const uint32_t seq = atomic_load_explicit(&gun_view_seq, memory_order_relaxed);
@@ -204,6 +243,7 @@ void vr_gun_view(const float rows[4][4]) {
         gun.hands_changed_us = now;
     }
     thr_speed_poll(now);
+    if (gun.on) gun_poll_control(now);
     bb_vrprof_end(BB_PROF_GUN_VIEW, prof_t0);
 }
 static int gun_view_read(GunView *out) {
@@ -224,6 +264,21 @@ int vr_gun_view_latest(float rows[4][4], uint64_t *age_us) {
     if (!gun_view_read(&v) || now - v.time_us > GUN_VIEW_STALE_US) return 0;
     memcpy(rows, v.rows, sizeof(v.rows));
     if (age_us) *age_us = now - v.time_us;
+    return 1;
+}
+
+/* Instant items (pad thread): the release into the world with the camera of this moment (vr_gun.h). */
+int vr_gun_rel_to_world(const int32_t mm[3], const int32_t dir_1e4[3], float origin[3], float dir[3]) {
+    GunView view;
+    if (!gun_view_read(&view) || gun_now_us() - view.time_us > 1000000u) return 0;
+    const VrVec3 rel_o = vr_v3((float)mm[0] * 0.001f, (float)mm[1] * 0.001f, (float)mm[2] * 0.001f);
+    const VrVec3 rel_d = vr_v3((float)dir_1e4[0] * 1e-4f, (float)dir_1e4[1] * 1e-4f, (float)dir_1e4[2] * 1e-4f);
+    const VrVec3 d = vam_norm(vg_rel_dir_to_world(rel_d, (const float (*)[4])view.rows), vr_v3(0, 0, 0));
+    if (vam_len(d) < 0.5f) return 0;
+    const VrVec3 cam = vr_v3(view.rows[3][0], view.rows[3][1], view.rows[3][2]);
+    const VrVec3 o = vg_rel_pos_to_world(rel_o, (const float (*)[4])view.rows, cam);
+    origin[0] = o.x, origin[1] = o.y, origin[2] = o.z;
+    dir[0] = d.x, dir[1] = d.y, dir[2] = d.z;
     return 1;
 }
 
@@ -329,26 +384,133 @@ static int gun_log_ok(uint64_t now) {
     return gun.log_lines++ < GUN_LOG_PER_S;
 }
 
-/* The controller's ray in the world; 0 (and why) when there is none. */
-static int gun_aim(uint64_t now, VrVec3 *aim, const char **why, const char **pose_name) {
-    GunView view;
-    if (!gun_view_read(&view) || now - view.time_us > GUN_VIEW_STALE_US) { *why = "no first-person camera"; return 0; }
+/* The controller's ray (aim pose, or the grip) in the world; 0 (and why) when there is none. */
+static int gun_controller_ray(const GunView *view, uint64_t now, int use_grip, VrVec3 *aim, const char **why,
+                              const char **pose_name) {
     BbVrHands h;
     if (!bbgpu_vr_hands(&h) || now - gun.hands_changed_us > GUN_HANDS_STALE_US) { *why = "no controller snapshot"; return 0; }
     if (!(h.valid & 4u)) { *why = "head not tracked"; return 0; }
     const int s = gun.side;
     const BbVrPose *p = NULL;
     float pitch = 0.0f;
-    if (!gun.use_grip && (h.valid & (8u << s))) { p = &h.aim[s]; *pose_name = "aim"; }
+    if (!use_grip && (h.valid & (8u << s))) { p = &h.aim[s]; *pose_name = "aim"; }
     else if (h.valid & (1u << s)) { p = &h.grip[s]; pitch = gun.grip_pitch; *pose_name = "grip"; }
     if (!p) { *why = s ? "right controller not tracked" : "left controller not tracked"; return 0; }
     const VrQuat head = vr_q(h.head.orientation[0], h.head.orientation[1], h.head.orientation[2], h.head.orientation[3]);
     VrQuat q = vr_q(p->orientation[0], p->orientation[1], p->orientation[2], p->orientation[3]);
     if (!vr_qvalid(head) || !vr_qvalid(q)) { *why = "invalid pose"; return 0; }
     if (pitch != 0.0f) q = vg_pitched(q, pitch);
-    *aim = vg_aim_in_world(head, q, (const float (*)[4])view.rows);
+    *aim = vg_aim_in_world(head, q, (const float (*)[4])view->rows);
     if (vam_len(*aim) < 0.5f) { *why = "degenerate ray"; return 0; }
     return 1;
+}
+
+/* What the last gun_aim used (for the shot log; the game thread only). */
+static struct {
+    char src[96];
+    float barrel_off; /* the barrel's angle to the controller ray (deg; -1: not measured) */
+} gun_last;
+
+/* The shot's ray in the world (the source of findings/27 11, then the live trim); 0 (and why) when
+ * there is none. *pose_name: what was used, for the logs. */
+static int gun_aim(uint64_t now, VrVec3 *aim, const char **why, const char **pose_name) {
+    GunView view;
+    if (!gun_view_read(&view) || now - view.time_us > GUN_VIEW_STALE_US) { *why = "no first-person camera"; return 0; }
+    const GunTune t = gun_tune_get();
+    VrVec3 ray = vr_v3(0, 0, 0);
+    const char *ray_why = "", *ray_pose = "";
+    const int have_ray = gun_controller_ray(&view, now, t.src == VG_SRC_GRIP, &ray, &ray_why, &ray_pose);
+    gun_last.barrel_off = -1.0f;
+    if (t.src == VG_SRC_BARREL) {
+        float q[4];
+        unsigned long long age = 0;
+        const char *fallback = NULL;
+        VrVec3 barrel = vr_v3(0, 0, 0);
+        if (!vr_arms_weapon_cam(gun.side, q, &age) || age > GUN_VIEW_STALE_US) {
+            fallback = "no weapon bone from the arms IK";
+        } else {
+            VrVec3 axis = t.axis;
+            if (vam_len(axis) < 0.5f) { /* gun_axis=auto: lock the bone axis closest to the controller ray once */
+                static int auto_idx = -1;
+                if (auto_idx < 0 && have_ray) {
+                    float ang[6];
+                    auto_idx = vg_best_axis(vr_q(q[0], q[1], q[2], q[3]), (const float (*)[4])view.rows, ray, ang);
+                    fprintf(stderr, "VR gun aim: barrel axis auto: %s locked (deg from the controller ray: +x %.1f -x %.1f +y %.1f -y %.1f +z %.1f -z %.1f)\n",
+                            auto_idx >= 0 ? vg_axis_names[auto_idx] : "none", ang[0], ang[1], ang[2], ang[3], ang[4], ang[5]);
+                    fflush(stderr);
+                }
+                if (auto_idx >= 0) vg_axis_parse(vg_axis_names[auto_idx], &axis);
+            }
+            barrel = vam_len(axis) < 0.5f ? vr_v3(0, 0, 0)
+                                          : vg_barrel_in_world(vr_q(q[0], q[1], q[2], q[3]), axis, (const float (*)[4])view.rows);
+            if (vam_len(barrel) < 0.5f) fallback = "degenerate barrel";
+            else if (have_ray) {
+                gun_last.barrel_off = vg_angle_deg(barrel, ray);
+                if (gun_last.barrel_off > gun.barrel_max) fallback = "barrel too far from the controller ray (axis?)";
+            }
+        }
+        if (!fallback) {
+            *aim = barrel;
+            snprintf(gun_last.src, sizeof(gun_last.src), "barrel %s", t.axis_name);
+            *pose_name = gun_last.src;
+        } else {
+            if (!have_ray) { *why = ray_why; return 0; }
+            *aim = ray;
+            snprintf(gun_last.src, sizeof(gun_last.src), "%s (barrel: %s)", ray_pose, fallback);
+            *pose_name = gun_last.src;
+        }
+    } else {
+        if (!have_ray) { *why = ray_why; return 0; }
+        *aim = ray;
+        *pose_name = ray_pose;
+    }
+    *aim = vg_trim(*aim, t.yaw, t.pitch);
+    return 1;
+}
+
+static void gun_tune_log(const GunTune *t, const char *why) {
+    fprintf(stderr, "VR gun aim: source %s%s%s, trim yaw %+.1f pitch %+.1f deg (+ = right / up) (%s)%s\n", vg_src_name(t->src),
+            t->src == VG_SRC_BARREL ? " axis " : "", t->src == VG_SRC_BARREL ? t->axis_name : "", t->yaw, t->pitch, why,
+            t->src == VG_SRC_BARREL ? "; the barrel needs BB_VR_ARMS=1 (else the aim pose)" : "");
+}
+/* The live keys gun_src / gun_yaw / gun_pitch / gun_axis of the control file (out/fp.txt: one line of
+ * key=value tokens), 4 Hz; a missing key = the env start value. Logged when the result changes. */
+static void gun_poll_control(uint64_t now) {
+    if (!gun.control || now - gun.control_checked < 250000u) return;
+    gun.control_checked = now;
+    struct stat st;
+    if (stat(gun.control, &st) != 0) return;
+    if ((long long)st.st_mtime == gun.control_mtime && (long long)st.st_size == gun.control_size) return;
+    gun.control_mtime = (long long)st.st_mtime;
+    gun.control_size = (long long)st.st_size;
+    FILE *f = fopen(gun.control, "rb");
+    if (!f) return;
+    char text[4096];
+    const size_t n = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    text[n] = 0;
+    const GunTune old = gun_tune_get();
+    GunTune t = old;
+    char word[16];
+    float x;
+    int src = -1;
+    if (vg_key_word(text, "gun_src", word, sizeof(word))) src = vg_src_parse(word);
+    t.src = src >= 0 ? src : gun.src0;
+    t.yaw = vg_key_float(text, "gun_yaw", &x) ? vr_clampf(x, -90.0f, 90.0f) : gun.yaw0;
+    t.pitch = vg_key_float(text, "gun_pitch", &x) ? vr_clampf(x, -90.0f, 90.0f) : gun.pitch0;
+    const char *ax = vg_key_word(text, "gun_axis", word, sizeof(word)) ? word : gun.axis0;
+    VrVec3 a;
+    if (!vg_axis_parse(ax, &a) || strlen(ax) >= sizeof(t.axis_name)) {
+        ax = gun.axis0;
+        vg_axis_parse(ax, &a);
+    }
+    t.axis = a;
+    snprintf(t.axis_name, sizeof(t.axis_name), "%s", ax);
+    if (t.src == old.src && t.yaw == old.yaw && t.pitch == old.pitch && !strcmp(t.axis_name, old.axis_name)) return;
+    const int idx = atomic_load_explicit(&gun_tune_idx, memory_order_relaxed);
+    gun_tune[(idx + 1) & 1] = t;
+    atomic_store_explicit(&gun_tune_idx, idx + 1, memory_order_release);
+    gun_tune_log(&t, "control file");
 }
 
 /* The lock-on candidates' points (the enemies the game would let the player lock onto, findings/41);
@@ -763,6 +925,11 @@ static ABI void gun_hook(BbHookContext *ctx) {
                 gun.shots, bullet_id, (int)(uint32_t)ctx->r8, oy, op, ny, np, turn,
                 used_target ? "aim point" : "launch Z", pose_name, locked ? ", lock-on overridden" : "",
                 off, o.x, o.y, o.z);
+        if (gun_last.barrel_off >= 0.0f) {
+            const GunTune tt = gun_tune_get();
+            fprintf(stderr, "VR gun aim: shot %u: barrel %.1f deg from the controller ray, trim yaw %+.1f pitch %+.1f\n", gun.shots,
+                    gun_last.barrel_off, tt.yaw, tt.pitch);
+        }
         if (gun.assist.strength > 0.0f)
             fprintf(stderr, "VR gun aim: assist %s (%d candidates, %u of %u shots pulled)\n",
                     assist_idx >= 0 ? "pulled" : "no target in the cone", assist_n, gun.assist_hits, gun.assist_n);
@@ -783,7 +950,30 @@ void vr_gun_register(void) {
     v = getenv("BB_VR_GUN_AIM_REF");
     gun.ref = v && !strcmp(v, "target") ? VG_REF_TARGET : v && !strcmp(v, "forward") ? VG_REF_FORWARD : VG_REF_AUTO;
     v = getenv("BB_VR_GUN_AIM_POSE");
-    gun.use_grip = v && !strcmp(v, "grip");
+    gun.src0 = v && vg_src_parse(v) >= 0 ? vg_src_parse(v) : VG_SRC_AIM; /* aim: the barrel source shot high in the headset (gun_axis auto picked -y) */
+    v = getenv("BB_VR_GUN_YAW");
+    gun.yaw0 = v ? vr_clampf((float)atof(v), -90.0f, 90.0f) : 0.0f;
+    v = getenv("BB_VR_GUN_PITCH");
+    gun.pitch0 = v ? vr_clampf((float)atof(v), -90.0f, 90.0f) : 0.0f;
+    v = getenv("BB_VR_GUN_BARREL_AXIS");
+    {
+        VrVec3 a;
+        snprintf(gun.axis0, sizeof(gun.axis0), "%s", v && strlen(v) < sizeof(gun.axis0) && vg_axis_parse(v, &a) ? v : "auto");
+    }
+    v = getenv("BB_VR_GUN_BARREL_MAX_DEG");
+    gun.barrel_max = v && atof(v) > 0.0 ? (float)atof(v) : 70.0f;
+    {
+        GunTune t;
+        memset(&t, 0, sizeof(t));
+        t.src = gun.src0;
+        t.yaw = gun.yaw0;
+        t.pitch = gun.pitch0;
+        vg_axis_parse(gun.axis0, &t.axis);
+        snprintf(t.axis_name, sizeof(t.axis_name), "%s", gun.axis0);
+        gun_tune[0] = gun_tune[1] = t;
+    }
+    gun.control = getenv("BB_VR_ARMS_CONTROL");
+    if (!gun.control || !*gun.control) gun.control = getenv("BB_VR_FP_CONTROL");
     v = getenv("BB_VR_GUN_AIM_GRIP_PITCH");
     gun.grip_pitch = v ? (float)atof(v) : 0.0f;
     gun.max_off = 30.0f;
@@ -831,7 +1021,14 @@ void vr_gun_register(void) {
                         "and first person\n",
                 gun.side ? "right" : "left", gun.lock_aim ? "aim" : "keep", gun.ids,
                 gun.ref == VG_REF_TARGET ? "target" : gun.ref == VG_REF_FORWARD ? "forward" : "auto",
-                gun.use_grip ? "grip" : "aim", gun.log ? ", log" : "");
+                vg_src_name(gun.src0), gun.log ? ", log" : "");
+    if (gun.on) {
+        const GunTune t = gun_tune_get();
+        gun_tune_log(&t, "start: BB_VR_GUN_AIM_POSE / BB_VR_GUN_YAW / BB_VR_GUN_PITCH / BB_VR_GUN_BARREL_AXIS");
+        fprintf(stderr, "VR gun aim: live keys gun_src= gun_yaw= gun_pitch= gun_axis= in %s; barrel more than %.0f deg from the "
+                        "controller ray: the aim ray\n",
+                gun.control ? gun.control : "(no control file)", gun.barrel_max);
+    }
     if (gun.on)
         fprintf(stderr, "VR gun aim: parry assist strength %.2f (cone %.1f-%.1f deg, radius %.2f m, range %.0f m; BB_VR_PARRY_ASSIST=0 off)\n",
                 gun.assist.strength, gun.assist.cone_min, gun.assist.cone_max, gun.assist.radius, gun.assist.range);

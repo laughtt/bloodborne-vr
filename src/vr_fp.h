@@ -48,6 +48,9 @@ int vr_fp_yaw_live(float *yaw);
 /* How far this H1's comfort dash moved the camera away from the eye (world, meters; 0 outside a
  * dash, findings/19 follow mode): the arms move their shoulders by it (findings/24 5.5). */
 VrVec3 vr_fp_dash_offset(void);
+/* 1 while first person hides the skin's arms (hide= hands, hands_skin, nohands or skinarms), as of H1's last
+ * frame: the arms default their arm_cut to it (findings/24 section 9). Any thread. */
+int vr_fp_hides_arms(void);
 /* Registers the pad filter (snap turn, stick remap) and the follow-camera yaw hook handler. */
 void vr_fp_register(void);
 

@@ -27,6 +27,7 @@
 #ifndef VR_ARM_MATH_H
 #define VR_ARM_MATH_H
 #include "vr_head_math.h"
+#include "vr_fp_math.h" /* VrXform */
 
 /* ---- vectors and rotations (the sandbox's math3d.h names, C style) ---- */
 
@@ -375,6 +376,41 @@ static inline float vam_weight_step(float w, float target, float dt, float in_s,
     if (target > w) w = in_s > 0.0f ? (w + dt / in_s < target ? w + dt / in_s : target) : target;
     else if (target < w) w = out_s > 0.0f ? (w - dt / out_s > target ? w - dt / out_s : target) : target;
     return vr_clampf(w, 0.0f, 1.0f);
+}
+
+/* ---- the arm cut (findings/24 section 9) ---- */
+
+/* The first-person hands show the wrist and the start of the forearm (the skin's hand mesh, display
+ * group 44, is one mesh). The cut scales the bones that skin is weighted to (the Forearm and its
+ * helpers, never the Hand subtree) about the wrist (the Hand bone's origin) by k: a model transform
+ * (t, q, uniform scale s) becomes (wrist + k (t - wrist), q, k s), so every vertex they carry moves to
+ * wrist + k (v - wrist). The game's skinning reads the scale (0x83D4D0: hkQsTransform -> matrix,
+ * rotation x diag(scale)). k never reaches 0 (Havok rebuilds the children's locals by dividing by it). */
+#define VAM_CUT_MIN_SCALE 0.02f
+/* arm_cut 0..1 -> the scale k: 0 -> 1 (nothing), 1 -> VAM_CUT_MIN_SCALE (fully into the wrist). */
+static inline float vam_cut_scale(float cut) {
+    if (!(cut > 0.0f)) return 1.0f;
+    const float k = 1.0f - (cut < 1.0f ? cut : 1.0f);
+    return k > VAM_CUT_MIN_SCALE ? k : VAM_CUT_MIN_SCALE;
+}
+/* A cut bone's model position, and back (a pose re-read before the animation refreshed it). */
+static inline VrVec3 vam_cut_point(VrVec3 p, VrVec3 wrist, float k) { return vr_add(wrist, vr_scale(vr_sub(p, wrist), k)); }
+static inline VrVec3 vam_cut_undo(VrVec3 p, VrVec3 wrist, float k) {
+    return k > 0.0f ? vr_add(wrist, vr_scale(vr_sub(p, wrist), 1.0f / k)) : p;
+}
+/* Cuts the bones with mask[i] != 0 in place (x: model transforms, scale: their uniform scales); the
+ * others, the Hand, fingers and Weapon bones among them, are not touched. */
+static inline void vam_cut_bones(VrXform *x, float *scale, const unsigned char *mask, int n, VrVec3 wrist, float k) {
+    for (int i = 0; i < n; ++i) {
+        if (!mask[i]) continue;
+        x[i].t = vam_cut_point(x[i].t, wrist, k);
+        scale[i] *= k;
+    }
+}
+/* Linear blend skinning of one bind-pose point `v` by bone i: model[i] . diag(scale[i]) . inverse(bind[i]). */
+static inline VrVec3 vam_skin_point(VrXform model, float scale, VrXform bind, VrVec3 v) {
+    const VrVec3 local = vr_qrotate(vr_qconj(bind.q), vr_sub(v, bind.t));
+    return vr_add(model.t, vr_scale(vr_qrotate(model.q, local), scale));
 }
 
 #endif

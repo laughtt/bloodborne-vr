@@ -155,7 +155,7 @@ const char* const kDefaultLayout = R"JSON({
     "active": ["dashboard", "wrist_counters"],
     "r3_hold_s": 0.5,
     "press_s": 0.06,
-    "debug_gun_ray": false, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
+    "debug_gun_ray": false, "gun_laser": "hold", "gun_laser_yaw_deg": 10, "gun_laser_pitch_deg": 0, "debug_gun_ray_length_m": 30, "debug_gun_ray_color": [1.0, 0.15, 0.1, 1.0],
     "debug_hitboxes": {"weapon": false, "attack": false, "enemies": false, "self": false, "hits": false,
                        "line_mrad": 1.5, "idle_alpha": 0.6},
     "hud": {"on": true, "head": false, "wrist": true, "bar": "always", "hp_color": "green", "stamina_color": "green", "distance": 0.9,
@@ -166,7 +166,7 @@ const char* const kDefaultLayout = R"JSON({
     "held_items": true,
     "custom_hands": {"on": false, "color": [0.30, 0.22, 0.17, 1.0], "scale": 1.0, "weapon_grip": true},
     "held": {"grab_squeeze": 0.6, "release_squeeze": 0.35, "pickup_grace_s": 5.0,
-             "mouth": [0.0, -0.10, -0.07], "mouth_radius_m": 0.24, "below_eyes_m": 0.03, "mouth_hold_s": 0.3,
+             "hand_ring": false, "mouth": [0.0, -0.10, -0.07], "mouth_radius_m": 0.24, "below_eyes_m": 0.03, "mouth_hold_s": 0.3,
              "blade_radius_m": 0.10, "blade_start": 0.25, "blade_mid_radius_m": 0.42, "blade_mid_offset_m": 0.25, "blade_hold_s": 0.12, "blade_fallback_m": 0.18,
              "throw_min_speed": 1.5, "throw_window_s": 0.08, "throw_peak_weight": 0.5,
              "crush_squeeze": 0.92, "crush_hold_s": 0.4, "hide_weapon": true,
@@ -534,6 +534,12 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
         Read(g["press_s"], game.press_s);
         game.press_s = std::clamp(game.press_s, 0.04f, 0.5f);
         Read(g["debug_gun_ray"], game.debug_gun_ray);
+        Read(g["gun_laser"], game.gun_laser);
+        if (game.gun_laser != "always" && game.gun_laser != "off") game.gun_laser = "hold";
+        Read(g["gun_laser_yaw_deg"], game.gun_laser_yaw_deg);
+        Read(g["gun_laser_pitch_deg"], game.gun_laser_pitch_deg);
+        game.gun_laser_yaw_deg = std::clamp(game.gun_laser_yaw_deg, -180.0f, 180.0f);
+        game.gun_laser_pitch_deg = std::clamp(game.gun_laser_pitch_deg, -89.0f, 89.0f);
         Read(g["debug_gun_ray_length_m"], game.debug_gun_ray_length_m);
         game.debug_gun_ray_length_m = std::clamp(game.debug_gun_ray_length_m, 0.5f, 200.0f);
         Read(g["debug_gun_ray_color"], game.debug_gun_ray_color);
@@ -594,6 +600,7 @@ void Apply(const json::Value& d, UiLayout& out, std::string& warnings) {
             Read(hv["hold"], hi.hold);
             Read(hv["mouth"], hi.mouth);
             Read(hv["mouth_radius_m"], hi.mouth_radius_m);
+            Read(hv["hand_ring"], hi.hand_ring);
             Read(hv["below_eyes_m"], hi.below_eyes_m);
             Read(hv["mouth_hold_s"], hi.mouth_hold_s);
             Read(hv["blade_radius_m"], hi.blade_radius_m);

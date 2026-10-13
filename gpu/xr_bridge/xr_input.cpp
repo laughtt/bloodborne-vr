@@ -118,6 +118,7 @@ struct State {
     bool gestures = true;
     bool trigger_switch = true; // triggers swap weapons (d-pad left/right) instead of R1/L2
     bool left_gun = true;       // with trigger_switch: the left trigger still shoots (L2)
+    xrpad::GunRelease gun_release; // BB_XR_GUN_FIRE: the gun fires when the trigger is let go
     bool profile_logged = false;
 
     std::mutex mutex;
@@ -650,6 +651,12 @@ bool Create(XrInstance instance, XrSession session, LogFn log) {
     const char* triggers = std::getenv("BB_XR_TRIGGERS");
     s->trigger_switch = triggers ? std::strcmp(triggers, "attack") != 0 : s->gestures;
     s->left_gun = !(triggers && std::strcmp(triggers, "switch") == 0);
+    {
+        const char* fire = std::getenv("BB_XR_GUN_FIRE");
+        s->gun_release.release = !(fire && std::strcmp(fire, "press") == 0);
+        s->log(0, "left trigger gun: fire on %s (BB_XR_GUN_FIRE=release|press)",
+            s->gun_release.release ? "release" : "press");
+    }
     if (const char* tap = std::getenv("BB_XR_GRIP_TAP_MS")) {
         const double v = std::atof(tap);
         if (v >= 50.0 && v <= 2000.0) s->grip_tap.max_ms = v;
@@ -809,10 +816,12 @@ void Update(XrTime time, bool focused) {
     const bool a_button = BoolState(s->a, -1);
     s->menu_raw = BoolState(s->menu, -1);
     uint32_t buttons = 0;
+    bool gun_pulled = false, gun_role = false, gun_aiming = false;
     if (s->trigger_switch) {
         // Edge triggered: one d-pad pulse per pull, not a held d-pad.
         const uint32_t pad[2] = {BBXR_BTN_LEFT, BBXR_BTN_RIGHT};
-        if (s->left_gun && trigger[0] > 0.5f) buttons |= BBXR_BTN_L2;
+        gun_pulled = s->left_gun && trigger[0] > 0.5f;
+        gun_role = s->left_gun;
         // The right trigger does nothing (the right weapon swap is the right grip tap).
         for (int hand = s->left_gun ? 2 : 0; hand < 1; ++hand) {
             if (s->trigger_edge[hand].Update(trigger[hand])) {
@@ -827,7 +836,17 @@ void Update(XrTime time, bool focused) {
         }
     } else {
         if (trigger[1] > 0.5f) buttons |= BBXR_BTN_R1;
-        if (trigger[0] > 0.5f) buttons |= BBXR_BTN_L2;
+        gun_pulled = trigger[0] > 0.5f;
+        gun_role = true;
+    }
+    {
+        const double gun_ms = std::chrono::duration<double, std::milli>(now - s->start).count();
+        const xrpad::GunRelease::Out g = s->gun_release.Update(gun_ms, gun_pulled, gun_role);
+        if (g.pulse) buttons |= BBXR_BTN_L2;
+        gun_aiming = g.aiming && s->gun_release.release;
+        if (g.fired) {
+            s->log(0, "left trigger released: L2 pulse %.0f ms", xrpad::GunRelease::kPulseMs);
+        }
     }
     {
         const bool squeezed = s->l1_down ? grip[0] > 0.35f : grip[0] > 0.6f;
@@ -964,9 +983,11 @@ void Update(XrTime time, bool focused) {
     in.ry = Axis(-look.y);
     // The left trigger's analog value is L2 only when it attacks; when it swaps weapons a pulled
     // trigger must not also read as an L2 (the gun) through the analog axis.
+    // Fire on release: the held trigger is no analog L2 either (only the pulse is).
     in.l2 = (buttons & BBXR_BTN_L2)                 ? 255
-            : s->trigger_switch && !s->left_gun ? 0
+            : (s->trigger_switch && !s->left_gun) || s->gun_release.release ? 0
                                                 : Trigger(trigger[0]);
+    in.reserved[1] = gun_aiming ? BBXR_RAW_GUN_AIM : 0;
     in.r2 = (buttons & BBXR_BTN_R2) ? 255 : 0;
     std::scoped_lock lock{s->mutex};
     s->latest = in;

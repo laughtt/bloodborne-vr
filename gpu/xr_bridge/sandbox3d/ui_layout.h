@@ -151,6 +151,7 @@ struct UiDebugHitboxes {
 struct UiHeldItems {
     float grab_squeeze = 0.60f, release_squeeze = 0.35f; // the grip that holds / lets go
     float pickup_grace_s = 5.0f;      // the grip must close this soon after the pick
+    bool hand_ring = false; // the progress ring at the hand and the mouth ring (off: the hint text only)
     m3::Vec3 hold{0.0f, 0.0f, -0.05f}; // the item's point relative to the grip pose
     // Heals, cures, body buffs: the item within mouth_radius_m of the mouth (head local) and below
     // the eyes for mouth_hold_s (the sandbox's consumables: mouth, mouth_radius_m, below_eyes_m).
@@ -235,6 +236,11 @@ struct UiGameLayout {
     bool debug_gun_ray = false;
     float debug_gun_ray_length_m = 30.0f;
     UiColor debug_gun_ray_color{1.0f, 0.02f, 0.01f, 1.0f}; // linear = sRGB (1, 0.15, 0.1)
+    // The gun laser: "hold" (while the left trigger is held aiming, and the flash on the shot),
+    // "always" (what debug_gun_ray: true means) or "off". The trim turns the drawn ray like the
+    // host's gun_yaw / gun_pitch keys turn the shots: + = right / up, degrees.
+    std::string gun_laser = "hold";
+    float gun_laser_yaw_deg = 10.0f, gun_laser_pitch_deg = 0.0f;
     // DEBUG: the sandbox's hitboxes over the game (vr_game_hitbox.h, findings/29).
     UiDebugHitboxes debug_hitboxes;
 };

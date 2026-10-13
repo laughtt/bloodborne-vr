@@ -8,6 +8,7 @@ model format (bbmodel.py) under out/vr_assets/ (git-ignored; never commit game a
     python scripts/vr_assets/extract.py --throwables [--sfx-mesh ID ...]   (hand-thrown goods)
     python scripts/vr_assets/extract.py --consumables                      (item wheel meshes)
     python scripts/vr_assets/extract.py --items                            (a mesh per goods id, items/)
+    python scripts/vr_assets/extract.py --held             (the game's own in-hand item models, held/)
 
 The dump is only read. Writes:
     hunter.json/.bin   the body: c0000's skeleton (+ face/cloth bones from the parts), its dummy
@@ -317,6 +318,10 @@ def main() -> int:
     parser.add_argument('--items', action='store_true',
                         help='only export a mesh for every goods id the game has a model for, plus '
                              'the index: out/vr_assets/items/ (items_extract.py)')
+    parser.add_argument('--held', action='store_true',
+                        help='only export the models the game draws in the hand when an item is used '
+                             '(use animation -> effect -> mesh, real size, grip socket): '
+                             'out/vr_assets/held/ (held_extract.py)')
     parser.add_argument('--sfx-mesh', type=int, action='append', default=[],
                         help='also export this flight-effect mesh s#####.flver (repeatable; '
                              'implies --throwables)')
@@ -338,6 +343,10 @@ def main() -> int:
     if args.consumables:
         import consumables_extract  # noqa: PLC0415
         consumables_extract.export(root, out, args.quiet)
+        return 0
+    if args.held:
+        import held_extract  # noqa: PLC0415
+        held_extract.export(root, out, args.quiet)
         return 0
     if args.items:
         import items_extract  # noqa: PLC0415

@@ -99,10 +99,10 @@ class CliTests(unittest.TestCase):
         caps['headset'] = S.detect_headset(caps['runtimes'], logs)
         with mock.patch.object(S, 'detect_all', return_value=caps):
             st = bbvr_cli.run(['state'])
-            self.assertEqual(st['values']['display_size'], 'auto')
+            self.assertEqual(st['values']['display_size'], 'game')  # the default: native 1080p
             self.assertEqual(st['display']['detected']['name'], 'Meta Quest 3')
             self.assertEqual(st['display']['detected']['source'], 'log')
-            self.assertTrue(st['display']['sizes']['eye'])
+            self.assertIn('sizes', st['display'])  # sizes for Auto are tested in test_bbvr_menu
             vals = dict(st['values'], display_size='quest2')
             st = bbvr_cli.run(['save'], json.dumps({'values': vals}))
             self.assertEqual(st['profile'], 'Default')

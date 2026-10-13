@@ -239,10 +239,12 @@ the swing recoils as in vanilla. 3-5 days on top of 4B; risk of stuck animation 
 ## 7. Decisions (the user's answers) and what phase 1 implements
 
 1. Keep the game's use animations (sped up later, phase 2); not instant.
+   **Changed 2026-10-13:** instant use with no animation, our own throw and the game's burst where it lands, behind
+   `BB_VR_INSTANT_ITEMS=1` / `instant_items=1` (default off): docs/vr/findings/44-instant-items.md.
 2. Throw: a real throw only (grab, throw with the arm); no "throw along the view" button.
 3. Weapon buff: a simple touch of the item to the blade, not a rub.
 4. (no answer) Right hand only throws, as recommended.
-5. The held item is drawn simply (a coloured disc and a hint at the hand); no extracted meshes yet.
+5. The held item is drawn simply (a coloured disc and a hint at the hand); no extracted meshes yet. Update: the progress ring at the hand and the mouth ring are off by default (`game.held.hand_ring`); only the hint text stays.
 6. Weapon vs world: haptics only, no solid weapons.
 7. Single player first; co-op ignored.
 Extra request: the weapon hand vibrates when the in-game weapon hits an enemy or an attack bounces off a wall or object.

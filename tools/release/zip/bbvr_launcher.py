@@ -266,7 +266,7 @@ def check_vulkan():
 
 def extract_assets(game, config):
     marker = OUT / 'vr_assets' / 'ui' / 'icons.json'
-    if marker.is_file() and config.get('assets_for') == str(game):
+    if marker.is_file() and config.get('assets_for') == str(game) and (OUT / 'vr_assets' / 'held').is_dir():
         return
     say('Step 4: building the VR menu and hit-shape data from your own game folder (a few minutes,')
     say('once). This stays on your PC in out\\vr_assets and is never uploaded or shared.')
@@ -274,7 +274,8 @@ def extract_assets(game, config):
     assets.mkdir(parents=True, exist_ok=True)
     jobs = [('menu icons and item names', 'ui_extract.py', ['--game', str(game), '--out', str(assets), '--quiet']),
             ('hit shapes', 'hitbox_extract.py', ['--game', str(game), '--out', str(assets / 'hitbox')]),
-            ('dodge data', 'dodge_extract.py', ['--game', str(game), '--out', str(assets / 'dash')])]
+            ('dodge data', 'dodge_extract.py', ['--game', str(game), '--out', str(assets / 'dash')]),
+            ('item models for your hands', 'extract.py', ['--game', str(game), '--out', str(assets), '--held', '--quiet'])]
     failed = False
     for label, script, extra in jobs:
         say(f'  - {label} ...')

@@ -375,7 +375,144 @@ static void test_throw_logged_case(void) {
     if (!failures) printf("PASS: the logged backwards throw (conversion right, the body faced away; body turned to the aim)\n");
 }
 
+/* findings/27 11: the barrel source and the live trims. */
+static void set_rows4(float rows[4][4], VrVec3 r, VrVec3 u, VrVec3 f, VrVec3 p) {
+    const VrVec3 v[4] = {r, u, f, p};
+    for (int i = 0; i < 4; ++i) {
+        rows[i][0] = v[i].x;
+        rows[i][1] = v[i].y;
+        rows[i][2] = v[i].z;
+        rows[i][3] = i == 3 ? 1.0f : 0.0f;
+    }
+}
+static void rows3_of(float rows[3][4], const float rows4[4][4]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j) rows[i][j] = rows4[i][j];
+}
+/* The weapon bone as runtime_vr_arms.c builds it (arms_target -> vam_grip_to_model -> vam_hand_rotation,
+ * then the hand's child), published relative to the camera (vg_weapon_in_cam), and the bone axis that is
+ * the offset grip frame's pointing direction (OpenXR -Z = the game grip frame's +Z) for that bind. */
+static VrQuat ik_weapon_cam(const float rows[4][4], VrVec3 body, float body_yaw, VrQuat head, VrQuat grip, float rot_yaw,
+                            float rot_pitch, float off_pitch, VrVec3 *axis_bone) {
+    VrVec3 cam_pos, wrist, off_p;
+    VrQuat cam_rot, q, off_q;
+    vam_camera_in_model(rows, body, body_yaw, &cam_pos, &cam_rot);
+    vam_side_offset(0, vr_v3(0, 0.04f, 0.07f), vam_axis_angle(vr_v3(1, 0, 0), off_pitch * VR_DEG), &off_p, &off_q);
+    off_q = vr_qnormalize(vr_qmul(vg_hand_trim(rot_yaw, rot_pitch), off_q));
+    vam_grip_to_model(vr_v3(0, 1.6f, 0), head, vr_v3(-0.2f, 1.2f, -0.3f), grip, off_p, off_q, cam_pos, cam_rot, &wrist, &q);
+    /* a skewed bind and an animated hand -> weapon local: the result must not depend on them */
+    const VrVec3 fingers_bind = vr_v3(1, 0, 0), thumb_bind = vr_v3(0, 0, -1);
+    const VrQuat bind_hand = vr_qnormalize(vr_q(0.2f, -0.4f, 0.1f, 0.9f));
+    const VrQuat local = vr_qnormalize(vr_q(-0.3f, 0.1f, 0.5f, 0.8f));
+    const VrQuat hand = vam_hand_rotation(q, vr_v3(0, 0, 1), vr_v3(0, 1, 0), fingers_bind, thumb_bind, bind_hand);
+    const VrQuat weapon = vr_qnormalize(vr_qmul(hand, local));
+    const VrQuat chain = vr_qnormalize(vr_qmul(vr_qmul(vam_hand_basis(fingers_bind, thumb_bind, vr_v3(0, 0, 1), vr_v3(0, 1, 0)),
+                                                       bind_hand), local));
+    *axis_bone = vr_qrotate(vr_qconj(chain), vr_v3(0, 0, 1));
+    return vg_weapon_in_cam(cam_rot, weapon);
+}
+static void test_barrel(void) {
+    float rows4[4][4], rows[3][4];
+    /* the camera looks along world +X (right = world -Z), the body stands elsewhere, turned */
+    set_rows4(rows4, vr_v3(0, 0, -1), vr_v3(0, 1, 0), vr_v3(1, 0, 0), vr_v3(3, 1.7f, -2));
+    rows3_of(rows, (const float (*)[4])rows4);
+    const VrQuat head = vr_xr_ypr(0.3f, -0.1f, 0.05f);
+    const VrQuat grip = vr_xr_ypr(0.5f, -0.2f, 0.3f);
+    /* the player's settings: arm_rot_l=30,25, arm_offset pitch -105 */
+    VrVec3 axis, unused_p;
+    const VrQuat wc = ik_weapon_cam(rows4, vr_v3(2.5f, 0, -1.5f), 0.9f, head, grip, 30.0f, 25.0f, -105.0f, &axis);
+    VrQuat off_q;
+    vam_side_offset(0, vr_v3(0, 0, 0), vam_axis_angle(vr_v3(1, 0, 0), -105.0f * VR_DEG), &unused_p, &off_q);
+    const VrQuat hand_xr = vr_qnormalize(vr_qmul(grip, vr_qnormalize(vr_qmul(vg_hand_trim(30.0f, 25.0f), off_q))));
+    const VrVec3 want = vg_aim_in_world(head, hand_xr, (const float (*)[4])rows);
+    const VrVec3 got = vg_barrel_in_world(wc, axis, (const float (*)[4])rows);
+    CHECK(near_v(got, want, 1e-4f), "barrel = the controller ray turned like the IK hand (%.4f %.4f %.4f vs %.4f %.4f %.4f)", got.x, got.y,
+          got.z, want.x, want.y, want.z);
+    /* the body's pose does not enter (the bone is published relative to the camera) */
+    VrVec3 axis2;
+    const VrQuat wc2 = ik_weapon_cam(rows4, vr_v3(-7, 0, 4), -2.1f, head, grip, 30.0f, 25.0f, -105.0f, &axis2);
+    CHECK(near_v(vg_barrel_in_world(wc2, axis2, (const float (*)[4])rows), want, 1e-4f), "barrel independent of the body pose");
+
+    /* the trim alone: level grip straight ahead, no offset rotation; camera along world +Z */
+    set_rows4(rows4, vr_v3(1, 0, 0), vr_v3(0, 1, 0), vr_v3(0, 0, 1), vr_v3(0, 1.7f, 0));
+    rows3_of(rows, (const float (*)[4])rows4);
+    const VrQuat id = vr_qidentity();
+    float h, p;
+    vg_yaw_pitch(vg_aim_in_world(id, id, (const float (*)[4])rows), &h, &p);
+    CHECK(near_f(h, 0.0f, 1e-3f) && near_f(p, 0.0f, 1e-3f), "controller ray straight ahead: heading 0 pitch 0");
+    const VrQuat wy = ik_weapon_cam(rows4, vr_v3(0, 0, 0), 0.0f, id, id, 30.0f, 0.0f, 0.0f, &axis);
+    vg_yaw_pitch(vg_barrel_in_world(wy, axis, (const float (*)[4])rows), &h, &p);
+    CHECK(near_f(h, 30.0f, 1e-2f) && near_f(p, 0.0f, 1e-2f), "arm_rot_l yaw 30: barrel heading +30 (right), got %.2f %.2f", h, p);
+    const VrQuat wp = ik_weapon_cam(rows4, vr_v3(0, 0, 0), 0.0f, id, id, 0.0f, 25.0f, 0.0f, &axis);
+    vg_yaw_pitch(vg_barrel_in_world(wp, axis, (const float (*)[4])rows), &h, &p);
+    CHECK(near_f(h, 0.0f, 1e-2f) && near_f(p, 25.0f, 1e-2f), "arm_rot_l pitch 25: barrel pitch +25 (up), got %.2f %.2f", h, p);
+    const VrQuat wb = ik_weapon_cam(rows4, vr_v3(0, 0, 0), 0.0f, id, id, 30.0f, 25.0f, 0.0f, &axis);
+    const VrVec3 barrel = vg_barrel_in_world(wb, axis, (const float (*)[4])rows);
+    vg_yaw_pitch(barrel, &h, &p);
+    CHECK(h > 25.0f && p > 20.0f, "arm_rot_l=30,25: the barrel is right of and above the controller ray (%.1f %.1f)", h, p);
+    CHECK(near_f(vg_angle_deg(barrel, vr_v3(0, 0, 1)), 38.4f, 0.5f), "arm_rot_l=30,25: %.1f deg between the barrel and the ray",
+          vg_angle_deg(barrel, vr_v3(0, 0, 1)));
+    /* the log's sign: the controller turned left (OpenXR +yaw about +Y) gives a negative heading */
+    vg_yaw_pitch(vg_aim_in_world(id, vr_xr_ypr(10.0f * VR_DEG, 0, 0), (const float (*)[4])rows), &h, &p);
+    CHECK(near_f(h, -10.0f, 1e-2f), "a controller turned 10 deg left: heading -10 (negative = left), got %.2f", h);
+    /* a bone that is the camera itself: its -z is the camera's back */
+    CHECK(near_v(vg_barrel_in_world(id, vr_v3(0, 0, -1), (const float (*)[4])rows), vr_v3(0, 0, -1), 1e-5f), "bone axis through the rows");
+    /* gun_axis=auto: the axis closest to the ray wins (the headset run's -z was 103 deg off) */
+    float ang[6];
+    VrVec3 a;
+    CHECK(vg_best_axis(id, (const float (*)[4])rows, vr_v3(0, 0, 1), ang) == 4 && near_f(ang[5], 180.0f, 1e-2f), "auto: +z for a +z ray");
+    CHECK(vg_best_axis(id, (const float (*)[4])rows, vam_norm(vr_v3(0.3f, -1.0f, 0.2f), vr_v3(0, 0, 0)), ang) == 3, "auto: -y");
+    CHECK(vg_axis_parse("auto", &a) && vam_len(a) < 1e-6f && !vg_axis_parse("au", &a), "auto parses as the zero axis");
+}
+static void test_trim(void) {
+    const VrVec3 f = vr_v3(0, 0, 1);
+    float h, p;
+    CHECK(near_v(vg_trim(f, 0, 0), f, 0.0f), "zero trim: unchanged");
+    vg_yaw_pitch(vg_trim(f, 10.0f, 0.0f), &h, &p);
+    CHECK(near_f(h, 10.0f, 1e-3f) && near_f(p, 0.0f, 1e-3f), "gun_yaw=10: heading +10");
+    CHECK(vg_trim(f, 10.0f, 0.0f).x > 0.17f, "gun_yaw=+10 moves toward world +X (the camera's right)");
+    vg_yaw_pitch(vg_trim(f, -7.5f, 4.0f), &h, &p);
+    CHECK(near_f(h, -7.5f, 1e-3f) && near_f(p, 4.0f, 1e-3f), "gun_yaw=-7.5 gun_pitch=4");
+    const VrVec3 d = vam_norm(vr_v3(-0.5f, -0.1f, -0.8f), f);
+    float h0, p0;
+    vg_yaw_pitch(d, &h0, &p0);
+    vg_yaw_pitch(vg_trim(d, 12.0f, -3.0f), &h, &p);
+    CHECK(near_f(vg_heading_diff_deg(h, h0 + 12.0f), 0.0f, 1e-2f) && near_f(p, p0 - 3.0f, 1e-2f), "trim on any heading");
+    CHECK(near_f(vam_len(vg_trim(d, 40.0f, 30.0f)), 1.0f, 1e-5f), "trim keeps unit length");
+    vg_yaw_pitch(vg_trim(vr_v3(0, 0.99f, 0.14f), 0.0f, 30.0f), &h, &p);
+    CHECK(near_f(p, 89.0f, 1e-2f), "pitch clamped at 89");
+}
+static void test_keys(void) {
+    const char *line = "fp=1 hide=hands_skin arm_offset=0,0.04,0.07,-105 arm_rot_l=30,25 gun_yaw=-5 gun_pitch=2.5 "
+                       "gun_src=aim gun_axis=+y instant_items=1\r\n";
+    float x = 99.0f;
+    char w[16];
+    CHECK(vg_key_float(line, "gun_yaw", &x) && x == -5.0f, "gun_yaw on the line");
+    CHECK(vg_key_float(line, "gun_pitch", &x) && x == 2.5f, "gun_pitch on the line");
+    CHECK(vg_key_word(line, "gun_src", w, sizeof(w)) && vg_src_parse(w) == VG_SRC_AIM, "gun_src=aim");
+    VrVec3 a;
+    CHECK(vg_key_word(line, "gun_axis", w, sizeof(w)) && vg_axis_parse(w, &a) && near_v(a, vr_v3(0, 1, 0), 0.0f), "gun_axis=+y");
+    CHECK(!vg_key_float("fp=1 xgun_yaw=3 gun_yaw_x=4", "gun_yaw", &x), "only whole keys");
+    CHECK(vg_key_float("gun_yaw=7", "gun_yaw", &x) && x == 7.0f, "key at the start");
+    CHECK(vg_key_float("a=1\tgun_yaw=-12.5", "gun_yaw", &x) && x == -12.5f, "key after a tab");
+    CHECK(!vg_key_float("gun_yaw= 3", "gun_yaw", &x) && !vg_key_float("gun_yaw=abc", "gun_yaw", &x), "no number: missing");
+    CHECK(!vg_key_float("fp=1 arm_rot_l=30,25", "gun_yaw", &x), "missing key");
+    CHECK(vg_key_word("gun_src=barrel", "gun_src", w, sizeof(w)) && !strcmp(w, "barrel"), "word at the end of the text");
+    CHECK(!vg_key_word("gun_src=", "gun_src", w, sizeof(w)), "empty word");
+    CHECK(vg_src_parse("barrel") == VG_SRC_BARREL && vg_src_parse("grip") == VG_SRC_GRIP && vg_src_parse("Aim") == -1 &&
+              vg_src_parse(NULL) == -1, "source names");
+    CHECK(vg_axis_parse("-z", &a) && near_v(a, vr_v3(0, 0, -1), 0.0f), "-z");
+    CHECK(vg_axis_parse("x", &a) && near_v(a, vr_v3(1, 0, 0), 0.0f), "x = +x");
+    CHECK(vg_axis_parse("+Y", &a) && near_v(a, vr_v3(0, 1, 0), 0.0f), "+Y");
+    CHECK(!vg_axis_parse("w", &a) && !vg_axis_parse("--z", &a) && !vg_axis_parse("-", &a) && !vg_axis_parse("zz", &a) &&
+              !vg_axis_parse("", &a), "bad axes");
+    CHECK(!strcmp(vg_src_name(VG_SRC_BARREL), "barrel") && !strcmp(vg_src_name(VG_SRC_AIM), "aim"), "source name");
+}
+
 int main(void) {
+    test_barrel();
+    test_trim();
+    test_keys();
     test_throw_logged_case();
     test_throw_speed();
     test_assist();

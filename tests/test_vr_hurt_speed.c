@@ -7,23 +7,23 @@ static int failures, checks;
 int main(void) {
     const float dt = 0.0166f;
     const VrHurtRange r = vr_hurt_default_range();
-    CHECK(vr_hurt_is_reaction(3009000, r) && vr_hurt_is_reaction(3011100, r) && vr_hurt_is_reaction(3012000, r) &&
-              vr_hurt_is_reaction(12999, r),
+    CHECK(vr_hurt_is_reaction(3020100, r) && vr_hurt_is_reaction(3020133, r) && vr_hurt_is_reaction(3020900, r) &&
+              vr_hurt_is_reaction(20999, r),
           "default range");
-    CHECK(!vr_hurt_is_reaction(8999, r) && !vr_hurt_is_reaction(13000, r) && !vr_hurt_is_reaction(-1, r), "just outside");
+    CHECK(!vr_hurt_is_reaction(19999, r) && !vr_hurt_is_reaction(21000, r) && !vr_hurt_is_reaction(3011100, r) && !vr_hurt_is_reaction(-1, r), "just outside");
     CHECK(!vr_hurt_is_reaction(3005000, r) && !vr_hurt_is_reaction(3007200, r) && !vr_hurt_is_reaction(3019000, r), "idle, dodge, style change");
     CHECK(!vr_hurt_is_reaction(112040000, r) && !vr_hurt_is_reaction(102051000, r), "attack and gun shot");
     CHECK(!vr_hurt_is_reaction(100033000, r) && !vr_hurt_is_reaction(3101200, r) && !vr_hurt_is_reaction(3104999, r),
           "visceral / grab / gesture ids (100000+) are excluded");
-    CHECK(vr_hurt_factor(3011100, dt, 2.0f, r) == 2.0f, "scaled");
-    CHECK(vr_hurt_factor(3011100, 0.0f, 2.0f, r) == 1.0f, "hit stop (dt 0) untouched");
-    CHECK(vr_hurt_factor(3011100, 0.25f, 2.0f, r) == 1.0f, "hitch untouched");
-    CHECK(vr_hurt_factor(3011100, NAN, 2.0f, r) == 1.0f, "NaN");
-    CHECK(vr_hurt_factor(3011100, dt, 0.0f, r) == 1.0f, "off");
+    CHECK(vr_hurt_factor(3020133, dt, 2.0f, r) == 2.0f, "scaled");
+    CHECK(vr_hurt_factor(3020133, 0.0f, 2.0f, r) == 1.0f, "hit stop (dt 0) untouched");
+    CHECK(vr_hurt_factor(3020133, 0.25f, 2.0f, r) == 1.0f, "hitch untouched");
+    CHECK(vr_hurt_factor(3020133, NAN, 2.0f, r) == 1.0f, "NaN");
+    CHECK(vr_hurt_factor(3020133, dt, 0.0f, r) == 1.0f, "off");
     CHECK(vr_hurt_factor(3000000, dt, 2.0f, r) == 1.0f, "walking untouched");
     /* discovery log classes */
     CHECK(vr_hurt_is_unclassified(3013000, r) && vr_hurt_is_unclassified(3101200, r) && vr_hurt_is_unclassified(3019000, r), "unclassified");
-    CHECK(!vr_hurt_is_unclassified(3011100, r) && !vr_hurt_is_unclassified(3040000, r) && !vr_hurt_is_unclassified(102051000, r) &&
+    CHECK(!vr_hurt_is_unclassified(3020133, r) && !vr_hurt_is_unclassified(3040000, r) && !vr_hurt_is_unclassified(102051000, r) &&
               !vr_hurt_is_unclassified(3005000, r),
           "classified or quiet ids");
     /* range override */
@@ -36,8 +36,8 @@ int main(void) {
     /* clamp, parse, online */
     CHECK(vr_hurt_clamp(1.0f) == 0.0f && vr_hurt_clamp(NAN) == 0.0f && vr_hurt_clamp(-1.0f) == 0.0f, "off values");
     CHECK(vr_hurt_clamp(2.0f) == 2.0f && vr_hurt_clamp(1.01f) == 1.05f && vr_hurt_clamp(99.0f) == VR_HURT_SPEED_MAX, "clamp");
-    CHECK(VR_HURT_SPEED_DEFAULT == 1.0f && vr_hurt_clamp(VR_HURT_SPEED_DEFAULT) == 0.0f, "default is off (1.0) until the range is confirmed");
-    CHECK(vr_hurt_factor(3011100, dt, vr_hurt_clamp(VR_HURT_SPEED_DEFAULT), r) == 1.0f, "default leaves reactions untouched");
+    CHECK(VR_HURT_SPEED_DEFAULT == 2.0f && vr_hurt_clamp(VR_HURT_SPEED_DEFAULT) == 2.0f, "default is on (2.0)");
+    CHECK(vr_hurt_factor(3020133, dt, vr_hurt_clamp(VR_HURT_SPEED_DEFAULT), r) == 2.0f, "default speeds reactions up 2x");
     float x = 0;
     CHECK(vr_hurt_parse("gun_speed=2\nhurt_speed=3\n", &x) && x == 3.0f, "parse later line");
     CHECK(!vr_hurt_parse("xhurt_speed=3", &x) && !vr_hurt_parse("", &x), "token start / empty");

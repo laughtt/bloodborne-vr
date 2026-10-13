@@ -16,7 +16,10 @@
 // (items/<goods>.json) with its size in metres and a grip category: MeshFor(assets, goods) falls back to
 // it with a default pose and a scale from the bounding box; the sandbox rows stay authoritative. Goods
 // the game has no model for keep the disc (the index's "icon" says where their menu icon is, the card
-// fallback). Pure CPU, no I/O except the mesh load: unit tested in
+// fallback). Ahead of all of these, <assets>/held/held.json (scripts/vr_assets/held_extract.py, --held;
+// findings/40 section 9) lists the models the game itself draws in the hand when the item is used
+// (use animation -> effect -> mesh), at their real size, with the game's own grip (a socket for the
+// R_Weapon bone and one for a controller grip). Pure CPU, no I/O except the mesh load: unit tested in
 // vr_game_ui_test.cpp.
 
 #pragma once
@@ -40,7 +43,7 @@
 namespace vrui {
 namespace held {
 
-/// How one goods looks in the hand (from the sandbox's tables).
+/// How one goods looks in the hand (from the sandbox's tables, items.json, or held/held.json).
 struct MeshSpec {
     int goods = 0;
     std::string file;          // under the assets: "throwables/th_1200.json"
@@ -48,6 +51,18 @@ struct MeshSpec {
     m3::Vec3 pos;              // item centre relative to the grip pose (sandbox value)
     m3::Vec3 rot_deg;          // Euler degrees, X then Y then Z, relative to the grip pose
     sb::UiColor color;
+    // held/held.json (scripts/vr_assets/held_extract.py): the model the game itself draws in the hand
+    // when the item is used, at its real size, in the frame its effect is spawned in (not recentred).
+    bool game_model = false;
+    bool real_size = false;    // keep the extracted size (scale 1), no in-game size target
+    bool has_socket = false;   // the game's own grip: the mesh frame in the right hand's R_Weapon bone frame
+    m3::Vec3 socket_pos, socket_rot_deg;
+    bool has_grip_socket = false; // the same through the arms IK's hand placement, in the controller's grip frame
+    m3::Vec3 grip_pos, grip_rot_deg;
+    m3::Vec3 centre;           // the mesh's bounding-box centre (its frame is not recentred)
+    float tex_tint = 0.0f;     // how much of `color` tints the texture (the blood vials' red)
+    float tex_gain = 1.0f;     // the texture's lift under the flat lighting (dark metal: up to 2.5)
+    std::string why;           // where it came from (for the log)
 };
 
 /// The in-game adjustments on top of the sandbox's pose, per kind of item (the one place to tune
@@ -206,9 +221,105 @@ private:
     }
 };
 
-/// The mesh of a goods row: the sandbox's own table first (authoritative), else the items.json fallback
-/// under `assets`; null when the game has no model for it (the caller draws the disc / icon card).
+// ---- held/held.json: the game's own in-hand models (held_extract.py, findings/40 section 9) ----
+
+inline bool IsBloodVial(int goods) { return goods == 1000 || (goods >= 701 && goods <= 706); }
+
+/// The spec of a row of held.json: real size, the game's socket when the effect sat on a hand dummy.
+inline bool SpecFromHeldRow(const json::Value& row, MeshSpec& out) {
+    const std::string& mesh = row["mesh"].Str();
+    if (mesh.empty() || row["goods"].Int() <= 0) {
+        return false;
+    }
+    out = {};
+    out.goods = row["goods"].Int();
+    out.file = "held/" + mesh;
+    out.game_model = true;
+    out.real_size = row["confidence"].Str() != "guess";
+    const json::Value& sock = row["socket"];
+    if (sock["pos"].Size() == 3 && sock["rot_deg"].Size() == 3) {
+        out.has_socket = true;
+        out.socket_pos = {sock["pos"][0].Float(), sock["pos"][1].Float(), sock["pos"][2].Float()};
+        out.socket_rot_deg = {sock["rot_deg"][0].Float(), sock["rot_deg"][1].Float(), sock["rot_deg"][2].Float()};
+    }
+    const json::Value& grip = row["grip_socket"];
+    if (grip["pos"].Size() == 3 && grip["rot_deg"].Size() == 3) {
+        out.has_grip_socket = true;
+        out.grip_pos = {grip["pos"][0].Float(), grip["pos"][1].Float(), grip["pos"][2].Float()};
+        out.grip_rot_deg = {grip["rot_deg"][0].Float(), grip["rot_deg"][1].Float(), grip["rot_deg"][2].Float()};
+    }
+    out.tex_gain = std::clamp(row["tex_gain"].Float(1.0f), 1.0f, 2.5f);
+    if (row["centre"].Size() == 3) {
+        out.centre = {row["centre"][0].Float(), row["centre"][1].Float(), row["centre"][2].Float()};
+    }
+    const hand::HoldCategory cat = hand::CategoryFor(BBXR_ITEM_GOODS | uint32_t(out.goods));
+    out.color = GripLookFor(hand::CategoryName(cat)).color;
+    if (IsBloodVial(out.goods)) {
+        out.color = {0.75f, 0.05f, 0.08f, 1.0f}; // the blood in the glass (the texture is the glass and metal)
+        out.tex_tint = 0.6f;
+    }
+    const json::Value& chain = row["chain"];
+    out.why = "the game's model (" + row["confidence"].Str() + "): " + chain["step"].Str();
+    if (!chain["anim"].Str().empty()) {
+        out.why += " " + chain["anim"].Str();
+    }
+    if (!chain["event"].Str().empty()) {
+        out.why += ", " + chain["event"].Str();
+    }
+    for (size_t i = 0; i < row["sources"].Size(); ++i) {
+        out.why += "; " + row["sources"][i].Str();
+    }
+    if (out.has_socket) {
+        out.why += "; socket dummy " + std::to_string(sock["dummy"].Int()) + " on " + sock["hand_bone"].Str();
+    }
+    return true;
+}
+
+/// held/held.json of an assets folder, parsed once per folder (an empty table when it is missing).
+class HeldIndex {
+public:
+    const MeshSpec* Find(const std::filesystem::path& assets, int goods) {
+        if (!loaded || assets != loaded_from) {
+            Load(assets);
+        }
+        const auto it = specs.find(goods);
+        return it == specs.end() ? nullptr : &it->second;
+    }
+    size_t Size() const { return specs.size(); }
+
+private:
+    bool loaded = false;
+    std::filesystem::path loaded_from;
+    std::map<int, MeshSpec> specs;
+
+    void Load(const std::filesystem::path& assets) {
+        loaded = true;
+        loaded_from = assets;
+        specs.clear();
+        bool ok = false;
+        const std::string text = sb::ReadText(assets / "held" / "held.json", &ok);
+        if (!ok) {
+            return;
+        }
+        const json::Value doc = json::Parse(text);
+        const json::Value& items = doc["items"];
+        for (size_t i = 0; i < items.Size(); ++i) {
+            MeshSpec s;
+            if (SpecFromHeldRow(items[i], s)) {
+                specs[s.goods] = s;
+            }
+        }
+    }
+};
+
+/// The mesh of a goods row: the game's own in-hand model (held/held.json) first, then the sandbox's
+/// table, then the items.json fallback under `assets`; null when there is none (the caller draws the
+/// stand-in / disc).
 inline const MeshSpec* MeshFor(const std::filesystem::path& assets, int goods) {
+    static HeldIndex held_index;
+    if (const MeshSpec* s = held_index.Find(assets, goods)) {
+        return s;
+    }
     if (const MeshSpec* s = MeshFor(goods)) {
         return s;
     }
@@ -498,11 +609,15 @@ public:
         }
         if (got) {
             e.spec = *spec;
-            e.from_table = MeshFor(goods) != nullptr;
+            e.from_table = !spec->game_model && MeshFor(goods) != nullptr;
             e.source = spec->file;
-            // The in-game size (a real item's), whatever the sandbox's or items.json's scale was.
             e.longest = ModelLongest(e.model);
-            e.spec.scale = InGameScale(goods, false, hand::CategoryFor(BBXR_ITEM_GOODS | uint32_t(goods)), e.longest);
+            // The game's own model keeps the size the game draws it at (a sane one: 1 cm to 1.2 m);
+            // anything else gets the in-game size of a real item, whatever its file's scale was.
+            const bool keep = spec->real_size && e.longest > 0.01f && e.longest < 1.2f;
+            e.spec.scale = keep ? 1.0f
+                                : InGameScale(goods, false, hand::CategoryFor(BBXR_ITEM_GOODS | uint32_t(goods)),
+                                              e.longest);
             e.radius = ModelRadius(e.model, e.spec.scale);
             return &e;
         }
@@ -641,14 +756,32 @@ inline HandPlacement PlaceInHand(const float* bone, m3::Vec3 ctrl_pos, m3::Quat 
 /// matrix for the holding hand `h`'s grip pose. The item's hold category socket (hand::GripFor, with
 /// its per-item overrides; the sandbox's own pose is NOT used in game), then, for an items.json mesh,
 /// its own upright turn (rot_deg); then the in-game scale (spec.scale, set by MeshCache::Resolve).
+/// `bone_frame`: the pose is the game hand's R_Weapon / L_Weapon bone (PlaceInHand from_bone), not a
+/// controller grip; only the game's own models (held.json) tell the two apart.
 inline m3::Mat4 SocketMeshWorld(const MeshSpec& spec, bool from_table, Kind /*kind*/, uint32_t game_id, int h,
-                                m3::Vec3 grip_pos, m3::Quat grip_rot) {
+                                m3::Vec3 grip_pos, m3::Quat grip_rot, bool bone_frame = false) {
+    if (spec.game_model && (spec.has_socket || spec.has_grip_socket)) {
+        // The game's own grip (held.json): the effect's frame at its hand dummy, in the weapon bone's
+        // frame, or for a controller in the grip frame the arms IK puts the game's hand at; the left
+        // hand mirrors it like every socket.
+        const bool bone = spec.has_socket && (bone_frame || !spec.has_grip_socket);
+        hand::GripDef sock;
+        sock.pos = bone ? spec.socket_pos : spec.grip_pos;
+        sock.rot_deg = bone ? spec.socket_rot_deg : spec.grip_rot_deg;
+        return hand::SocketWorld(sock, h, grip_pos, grip_rot) * m3::Scale(spec.scale);
+    }
     const hand::GripDef sock = hand::GripFor(game_id);
     m3::Mat4 world = hand::SocketWorld(sock, h, grip_pos, grip_rot);
     if (!from_table) {
         world = world * m3::FromQuat(m3::FromEulerDeg(spec.rot_deg));
     }
-    return world * m3::Scale(spec.scale);
+    // A game model without a hand dummy is not recentred: its centre goes to the category's socket.
+    return world * m3::Scale(spec.scale) * m3::Translate(-spec.centre);
+}
+
+/// A thrown item in flight: centred on the arc point, upright.
+inline m3::Mat4 FlightMeshWorld(const MeshSpec& spec, m3::Vec3 at) {
+    return m3::Translate(at) * m3::Scale(spec.scale) * m3::Translate(-spec.centre);
 }
 
 /// Flat-lit triangles from several meshes, sorted together far to near (the UI layer has no depth
@@ -661,6 +794,7 @@ struct TexBinding {
     const sb::ItemSheet* sheet = nullptr;
     const std::string* key = nullptr;
     float tint_mix = 0.0f; // 0: white (the texture as is), 1: the item's flat colour (tinted glass: vials)
+    float gain = 1.0f;     // a lift of the textured colour (a dark albedo under flat lighting)
 };
 
 class TriBatch {
@@ -709,7 +843,7 @@ public:
                     t.textured = true;
                     const float m = tex->tint_mix;
                     // A tinted texture (vials) is dark (grey glass times a deep red): lifted so it shows.
-                    const float gain = 1.0f + 0.9f * m;
+                    const float gain = (1.0f + 0.9f * m) * tex->gain;
                     t.color = {(1.0f + (color.r - 1.0f) * m) * gain, (1.0f + (color.g - 1.0f) * m) * gain,
                                (1.0f + (color.b - 1.0f) * m) * gain, color.a};
                 }
@@ -779,7 +913,7 @@ inline void TransformModel(const sb::Model& model, const m3::Mat4& world, std::v
 /// textured (white tint), every other range with the flat `color`. Returns the triangles kept.
 inline size_t AddModel(TriBatch& batch, const sb::Model& model, const std::vector<m3::Vec3>& pos,
                        const std::vector<m3::Vec3>& nrm, sb::UiColor color, const sb::ItemSheet* sheet,
-                       float tex_tint = 0.0f) {
+                       float tex_tint = 0.0f, float tex_gain = 1.0f) {
     size_t kept = 0;
     bool any = false;
     for (const sb::MeshRange& r : model.meshes) {
@@ -793,6 +927,7 @@ inline size_t AddModel(TriBatch& batch, const sb::Model& model, const std::vecto
             tb.sheet = sheet;
             tb.key = &r.texture;
             tb.tint_mix = tex_tint;
+            tb.gain = tex_gain;
         }
         kept += batch.Add(pos, nrm, model.indices.data() + r.first_index, r.index_count, color, &tb);
     }
@@ -806,11 +941,11 @@ inline size_t AddModel(TriBatch& batch, const sb::Model& model, const std::vecto
 /// near so the translucent look blends right) to `out`. `eye`: the head position. Returns the count.
 inline size_t AppendMesh(std::vector<sb::UiVertex>& out, const sb::Model& model, const m3::Mat4& world,
                          sb::UiColor color, m3::Vec3 eye, const sb::ItemSheet* sheet = nullptr,
-                         float tex_tint = 0.0f) {
+                         float tex_tint = 0.0f, float tex_gain = 1.0f) {
     std::vector<m3::Vec3> pos, nrm;
     TransformModel(model, world, pos, nrm);
     TriBatch batch(eye);
-    AddModel(batch, model, pos, nrm, color, sheet, tex_tint);
+    AddModel(batch, model, pos, nrm, color, sheet, tex_tint, tex_gain);
     return batch.Emit(out);
 }
 

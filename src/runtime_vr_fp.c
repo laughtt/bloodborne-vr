@@ -243,6 +243,7 @@ static _Atomic uint32_t fp_cam_own_bits;      /* float: the game camera's own he
 static _Atomic uint32_t fp_cam_turns;         /* frames the hook turned the game camera */
 static _Atomic int fp_cutscene_on;            /* H1: this frame shows a cutscene (vr_fp_cutscene) */
 static _Atomic int fp_frame_active;           /* H1 put this frame's camera in first person */
+static _Atomic int fp_hides_arms;             /* vr_fp_hides_arms: the skin's arms (group 43) hidden this frame */
 static _Atomic int fp_held_hand = -1;         /* vr_fp_held_item: the hand holding a bridge item (0 left, 1 right), -1 none */
 static _Atomic uint64_t fp_held_time_us;      /* ... when the bridge last said so (it refreshes every ~2 s) */
 static _Atomic int fp_held_last_hand = -1;    /* the hand that held an item last (the fire block's tail) */
@@ -523,6 +524,7 @@ void vr_fp_held_item(int hand, uint32_t item) {
 
 /* The hand whose attack inputs are blocked now (gpu/xr_bridge/vr_held_fire.h): the one holding a bridge item
  * (refreshed within 5 s), or the one that let go less than tail_ms ago; -1 none. Any thread. */
+int vr_fp_hides_arms(void) { return atomic_load_explicit(&fp_hides_arms, memory_order_relaxed); }
 int vr_fp_held_fire_hand(unsigned tail_ms) {
     const uint64_t now = fp_now_us();
     const int hh = atomic_load_explicit(&fp_held_hand, memory_order_relaxed);
@@ -1434,6 +1436,7 @@ int vr_fp_frame(const BbHookContext *ctx, const float game[4][4], int head_valid
     if (c.player) {
         if (fp.log) fp_parts_dump(c.player);
         const int hiding = fp.hide && (active || fp.hide_tp);
+        atomic_store_explicit(&fp_hides_arms, hiding && active && (fp.hide & FP_HIDE_SKIN_ARMS) != 0, memory_order_relaxed);
         /* A held bridge item: its hand's weapons (slots 7-10 left, 11-14 right) too, even with hide=0;
          * lapses 5 s after the last refresh (the bridge repeats every 2 s) or at once on hand -1. The
          * game sets the draw bit every frame, so not clearing it again shows the weapons. */

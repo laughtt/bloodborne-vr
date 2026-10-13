@@ -48,6 +48,15 @@
  *     arm_roll_detach=0|1 (1): while a roll / quickstep / backstep plays the shoulders and clavicles come from a
  *       camera-frame pin of the last frame before it, not from the tumbling animation (findings/24 section 8)
  *   BB_VR_ARMS_ROLL_DETACH=0|1 (1) the start value of arm_roll_detach; BB_VR_FP_LOG / BB_VR_EVADE_LOG=1: a line per detach/attach
+ *     arm_lead=0|1 (1): in an evade the H1 view is advanced by the camera-body step of one frame (findings/24 8.1, 8.2)
+ *     arm_lead_smooth=<0.05..1> (0.5): weight of the newest H1 in the lead's low-passed velocity (1 = raw, as 8.1)
+ *     arm_head=view|xr (view): the controllers are measured against the head the H1 camera was built from (view),
+ *       or against the head of their own pad snapshot (xr, the old behaviour) (findings/24 8.2)
+ *   BB_VR_ARMS_LEAD=0|1, BB_VR_ARMS_LEAD_SMOOTH=<a>, BB_VR_ARMS_HEAD=view|xr: their start values
+ *     arm_cut=<0..1>|auto (auto): the wrist cut (findings/24 section 9): the Forearm and its helpers (not the Hand,
+ *       fingers or Weapon) scaled about the wrist by 1 - cut, so the visible skin hands lose the wrist and forearm;
+ *       only in first person while hide= hides the skin's arms (hands, hands_skin), else 0; auto = 0.8
+ *   BB_VR_ARMS_CUT=<0..1>|auto: its start value
  */
 #define _GNU_SOURCE
 #include "hooks.h"
@@ -67,6 +76,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "vr_gun_math.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -88,6 +98,7 @@
 #define VA_PLAYER_INS_VTABLE 0x578F310u
 #define ARM_MAX_BONES 256
 #define ARM_VIEW_STALE_US 300000u
+#define ARM_CUT_AUTO 0.8f            /* arm_cut=auto while the skin's arms are hidden (findings/24 section 9) */
 
 enum { SRC_REST = 0, SRC_FAKE = 1, SRC_XR = 2 };
 enum { AT_PLAYER = 0, AT_COPY = 1, AT_SYNC = 2 };
@@ -124,6 +135,11 @@ static struct {
     ArmBones arm[2];        /* 0 left, 1 right */
     int16_t parent[ARM_MAX_BONES];
     uint8_t side_of[ARM_MAX_BONES]; /* 1 left subtree, 2 right subtree (UpperArm and below), 0 other */
+    uint8_t cut_of[ARM_MAX_BONES];  /* the wrist cut's bones: 1 left, 2 right (the Forearm and below, not the Hand subtree) */
+    /* the wrist cut (arm_cut=, findings/24 section 9) */
+    float cut_set;          /* 0..1, or < 0: auto (ARM_CUT_AUTO while the skin's arms are hidden) */
+    float cut_logged;       /* the effective cut last logged (-1: none yet) */
+    float cut_k[2];         /* the scale last written per side (1: none), to undo it on a re-read of the same pose */
     /* player pose address (refreshed every 100 ms) */
     uintptr_t player, pose, bag;
     uint64_t pose_checked;
@@ -153,6 +169,11 @@ static struct {
     int anim, attack;
     int roll_detach, roll_log, roll_was; /* arm_roll_detach, the log switch, the last frame's state */
     VrArmsRoll roll;
+    int lead_on;          /* arm_lead=0|1 (1) */
+    float lead_alpha;     /* arm_lead_smooth (0.5) */
+    VrRollLead lead;      /* the low-passed camera-body velocity, stepped once per H1 snapshot (findings/24 8.2) */
+    int head_view;        /* arm_head=view (1) | xr (0) */
+    int head_fallback_logged;
     float reach[2];
     int clamped[2];
     float roll_prev[2];  /* last wrist roll per side (unwrapped continuity) */
@@ -195,7 +216,9 @@ typedef struct {
     VrVec3 head_pos;  /* OpenXR */
     VrQuat head_rot;
     VrVec3 body_pos;  /* the character's world position (vr_fp_body), for the hitbox overlay */
-    VrVec3 rel_vel;   /* (camera - body) in model space per second, from the last two snapshots (vr_roll_rel_vel) */
+    VrVec3 rel_step;  /* the (anchor - body) step in model space from the previous snapshot, metres (vr_roll_rel_step) */
+    float rel_gap;    /* the time since that snapshot (s; 0: none) */
+    uint32_t seq;     /* which H1 this is (the lead's low-pass steps once per snapshot) */
 } ArmView;
 static ArmView arm_view[2];
 static _Atomic uint32_t arm_view_seq;
@@ -213,13 +236,30 @@ void vr_arms_view(const float rows[4][4], int head_valid, const float head_pos[3
     const uint32_t seq = atomic_load_explicit(&arm_view_seq, memory_order_relaxed);
     ArmView *v = &arm_view[(seq + 1) & 1];
     const uint64_t t_us = arm_now_us();
-    static VrVec3 prev_cam, prev_body;
+    /* The camera-body step of this H1 (findings/24 8.1, 8.2), of the anchor (the camera minus the real head's own
+     * step, which the hands follow through the grips anyway), in metres: no clock enters the product. */
+    static VrVec3 prev_cam, prev_body, prev_head_p;
+    static VrQuat prev_cam_q, prev_head_q;
+    static int prev_head_ok;
     static uint64_t prev_us;
-    const VrVec3 cam_w = vr_v3(rows[3][0], rows[3][1], rows[3][2]);
-    v->rel_vel = prev_us ? vr_roll_rel_vel(prev_cam, prev_body, cam_w, pos, yaw, (float)(t_us - prev_us) * 1e-6f) : vr_v3(0, 0, 0);
+    const int head_ok = head_valid && head_pos && head_rot;
+    const VrVec3 now_head_p = head_ok ? vr_v3(head_pos[0], head_pos[1], head_pos[2]) : vr_v3(0, 0, 0);
+    const VrQuat now_head_q = head_ok ? vr_qnormalize(vr_q(head_rot[0], head_rot[1], head_rot[2], head_rot[3])) : vr_qidentity();
+    VrVec3 cam_w;
+    VrQuat cam_wq;
+    vam_camera_in_model(rows, vr_v3(0, 0, 0), 0.0f, &cam_w, &cam_wq); /* the camera in the world */
+    VrVec3 prev_point = prev_cam;
+    if (prev_us && head_ok && prev_head_ok) prev_point = vr_roll_head_point(prev_cam, prev_cam_q, prev_head_p, prev_head_q, now_head_p);
+    v->rel_step = prev_us ? vr_roll_rel_step(prev_point, prev_body, cam_w, pos, yaw) : vr_v3(0, 0, 0);
+    v->rel_gap = prev_us ? (float)(t_us - prev_us) * 1e-6f : 0.0f;
     prev_cam = cam_w;
+    prev_cam_q = cam_wq;
     prev_body = pos;
+    prev_head_p = now_head_p;
+    prev_head_q = now_head_q;
+    prev_head_ok = head_ok;
     prev_us = t_us;
+    v->seq = seq + 1;
     v->time_us = t_us;
     vam_camera_in_model(rows, pos, yaw, &v->cam_pos, &v->cam_rot);
     v->yaw = yaw;
@@ -255,6 +295,44 @@ int vr_arms_hitbox_view(VhbView *out, uint64_t max_age_us) {
     out->body_pos = v.body_pos;
     out->body_yaw = v.yaw;
     return 1;
+}
+
+/* The weapon bones after the IK, relative to the camera (vr_arms_weapon_cam): two slots, a sequence.
+ * Written by arms_edit (one thread at a time, arms_busy), read by the gun aim hook (the game thread). */
+typedef struct {
+    uint64_t time_us[2];
+    VrQuat q[2];
+} ArmWeaponPub;
+static ArmWeaponPub arm_weapon_pub[2];
+static _Atomic uint32_t arm_weapon_seq;
+static void arm_weapon_publish(const VrQuat q[2], const int have[2], uint64_t now) {
+    const uint32_t seq = atomic_load_explicit(&arm_weapon_seq, memory_order_relaxed);
+    ArmWeaponPub *w = &arm_weapon_pub[(seq + 1) & 1];
+    *w = arm_weapon_pub[seq & 1];
+    for (int s = 0; s < 2; ++s)
+        if (have[s]) {
+            w->q[s] = q[s];
+            w->time_us[s] = now;
+        }
+    atomic_store_explicit(&arm_weapon_seq, seq + 1, memory_order_release);
+}
+int vr_arms_weapon_cam(int side, float q_xyzw[4], unsigned long long *age_us) {
+    if (side < 0 || side > 1) return 0;
+    for (int tries = 0; tries < 3; ++tries) {
+        const uint32_t a = atomic_load_explicit(&arm_weapon_seq, memory_order_acquire);
+        if (!a) return 0;
+        const ArmWeaponPub p = arm_weapon_pub[a & 1];
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&arm_weapon_seq, memory_order_relaxed) != a) continue;
+        if (!p.time_us[side]) return 0;
+        q_xyzw[0] = p.q[side].x;
+        q_xyzw[1] = p.q[side].y;
+        q_xyzw[2] = p.q[side].z;
+        q_xyzw[3] = p.q[side].w;
+        if (age_us) *age_us = arm_now_us() - p.time_us[side];
+        return 1;
+    }
+    return 0;
 }
 
 /* ---- guest memory (own guard: this may run on another thread than H1's) ---- */
@@ -305,6 +383,14 @@ static int env_on(const char *name) {
     const char *e = getenv(name);
     return e && *e && strcmp(e, "0") != 0;
 }
+/* arm_cut / BB_VR_ARMS_CUT: 0..1, or "auto" (< 0); `keep` when absent or not a number. */
+static float cut_parse(const char *v, float keep) {
+    if (!v || !*v) return keep;
+    if (!strcmp(v, "auto")) return -1.0f;
+    char *end;
+    const float x = strtof(v, &end);
+    return end != v && isfinite(x) ? vr_clampf(x, 0.0f, 1.0f) : keep;
+}
 static int src_parse(const char *v) {
     return !strcmp(v, "fake") ? SRC_FAKE : !strcmp(v, "xr") ? SRC_XR : SRC_REST;
 }
@@ -316,6 +402,18 @@ static void arms_init(void) {
     arms.on = 1;
     arms.roll_detach = !getenv("BB_VR_ARMS_ROLL_DETACH") || env_on("BB_VR_ARMS_ROLL_DETACH");
     arms.roll_log = env_on("BB_VR_FP_LOG") || env_on("BB_VR_EVADE_LOG");
+    arms.lead_on = !getenv("BB_VR_ARMS_LEAD") || env_on("BB_VR_ARMS_LEAD");
+    arms.lead_alpha = 0.5f;
+    {
+        const char *a = getenv("BB_VR_ARMS_LEAD_SMOOTH");
+        const float x = a ? strtof(a, NULL) : 0.0f;
+        if (a && isfinite(x) && x > 0.0f) arms.lead_alpha = vr_clampf(x, 0.05f, 1.0f);
+    }
+    {
+        const char *h = getenv("BB_VR_ARMS_HEAD");
+        arms.head_view = !h || strcmp(h, "xr") != 0;
+    }
+    vr_roll_lead_reset(&arms.lead);
     const char *e = getenv("BB_VR_ARMS_SRC");
     arms.src = e ? src_parse(e) : SRC_XR; /* xr falls back to rest while there are no valid hands */
     arms.weight_max = 1.0f;
@@ -339,13 +437,22 @@ static void arms_init(void) {
     arms.body_tau = 0.2f;
     e = getenv("BB_VR_ARMS_AT");
     arms.at = e ? at_parse(e) : AT_PLAYER;
+    arms.cut_set = cut_parse(getenv("BB_VR_ARMS_CUT"), -1.0f);
+    arms.cut_logged = -1.0f;
+    arms.cut_k[0] = arms.cut_k[1] = 1.0f;
     arms.control = getenv("BB_VR_ARMS_CONTROL");
     if (!arms.control || !*arms.control) arms.control = getenv("BB_VR_FP_CONTROL");
     arms.start = arm_now_us();
-    if (arms.enabled)
+    if (arms.enabled) {
         fprintf(stderr, "VR arms: on (src %s, written at %s (arm_at=); player site 0x%x, A1 0x%x / A2 0x%x; control %s)\n",
                 src_names[arms.src], at_names[arms.at], VA_SITE_PLAYER, VA_SITE_A1,
                 VA_SITE_A2, arms.control ? arms.control : "none");
+        if (arms.cut_set < 0.0f)
+            fprintf(stderr, "VR arms: arm cut auto (%.2f while first person hides the skin's arms: hide=hands / hands_skin; else 0)\n",
+                    ARM_CUT_AUTO);
+        else
+            fprintf(stderr, "VR arms: arm cut %.2f (BB_VR_ARMS_CUT; only while first person hides the skin's arms)\n", arms.cut_set);
+    }
 }
 
 static void set_floats(const char *v, float *dst, int min_n, int max_n) {
@@ -367,6 +474,9 @@ static void arms_apply_key(const char *k, const char *v) {
     else if (!strcmp(k, "arm_log")) arms.log = ok && x != 0.0f;
     else if (!strcmp(k, "arm_at")) arms.at = at_parse(v);
     else if (!strcmp(k, "arm_roll_detach")) arms.roll_detach = ok && x != 0.0f;
+    else if (!strcmp(k, "arm_lead")) arms.lead_on = ok && x != 0.0f;
+    else if (!strcmp(k, "arm_lead_smooth") && ok && x > 0.0f) arms.lead_alpha = vr_clampf(x, 0.05f, 1.0f);
+    else if (!strcmp(k, "arm_head")) arms.head_view = strcmp(v, "xr") != 0;
     else if (!strcmp(k, "arm_body")) arms.body_on = ok && x != 0.0f;
     else if (!strcmp(k, "arm_body_dz") && ok) arms.body_dz = vr_clampf(x, 0.0f, 180.0f);
     else if (!strcmp(k, "arm_body_tau") && ok) arms.body_tau = vr_clampf(x, 0.0f, 5.0f);
@@ -381,6 +491,7 @@ static void arms_apply_key(const char *k, const char *v) {
     else if (!strcmp(k, "arm_fake_l")) set_floats(v, arms.fake[0], 3, 6);
     else if (!strcmp(k, "arm_rot_l")) set_floats(v, arms.rot[0], 2, 2);
     else if (!strcmp(k, "arm_rot_r")) set_floats(v, arms.rot[1], 2, 2);
+    else if (!strcmp(k, "arm_cut")) arms.cut_set = cut_parse(v, arms.cut_set);
 }
 /* The control file (the first-person one by default): only the arm* keys are ours. */
 static void arms_poll_control(uint64_t now) {
@@ -404,12 +515,17 @@ static void arms_poll_control(uint64_t now) {
         *eq = 0;
         arms_apply_key(tok, eq + 1);
     }
+    char cut_name[16];
+    if (arms.cut_set < 0.0f) snprintf(cut_name, sizeof(cut_name), "auto");
+    else snprintf(cut_name, sizeof(cut_name), "%.2f", arms.cut_set);
     fprintf(stderr, "VR arms: control: arm %d src %s weight %.2f attack %.2f in %.2f out %.2f tp %d rest (%.2f %.2f %.2f, %.0f deg) "
-                    "pole (%.2f %.2f %.2f) twist %.2f soft %.2f give %.3f fore_roll %.2f offset (%.3f %.3f %.3f, %.0f deg) fake_r (%.2f %.2f %.2f) fake_l (%.2f %.2f %.2f)\n",
+                    "pole (%.2f %.2f %.2f) twist %.2f soft %.2f give %.3f fore_roll %.2f offset (%.3f %.3f %.3f, %.0f deg) fake_r (%.2f %.2f %.2f) fake_l (%.2f %.2f %.2f) "
+                    "roll_detach %d lead %d (smooth %.2f) head %s cut %s\n",
             arms.on, src_names[arms.src], arms.weight_max, arms.attack_weight, arms.in_s, arms.out_s, arms.tp, arms.rest[0],
             arms.rest[1], arms.rest[2], arms.rest[3], arms.pole[0], arms.pole[1], arms.pole[2], arms.twist_share, arms.soft, arms.give, arms.fore_roll,
             arms.offset[0], arms.offset[1], arms.offset[2], arms.offset[3], arms.fake[1][0], arms.fake[1][1],
-            arms.fake[1][2], arms.fake[0][0], arms.fake[0][1], arms.fake[0][2]);
+            arms.fake[1][2], arms.fake[0][0], arms.fake[0][1], arms.fake[0][2], arms.roll_detach, arms.lead_on, arms.lead_alpha,
+            arms.head_view ? "view" : "xr", cut_name);
 }
 
 /* ---- the skeleton ---- */
@@ -463,6 +579,8 @@ static int arms_skeleton(uintptr_t skel) {
     for (int i = 0; i < n_bones; ++i)
         if (arms.parent[i] >= i) { fprintf(stderr, "VR arms: skeleton not parent-first at %d\n", i); return 0; }
     memset(arms.side_of, 0, sizeof(arms.side_of));
+    memset(arms.cut_of, 0, sizeof(arms.cut_of));
+    arms.cut_k[0] = arms.cut_k[1] = 1.0f;
     for (int side = 0; side < 2; ++side) {
         const char *p = side ? "R_" : "L_";
         char name[64];
@@ -516,6 +634,26 @@ static int arms_skeleton(uintptr_t skel) {
             for (int k = i; k >= 0 && !under; k = arms.parent[k]) under = k == a->upper;
             if (under) arms.side_of[i] = (uint8_t)(side + 1);
         }
+        /* the wrist cut: the Forearm and what hangs off it (the twist helpers), never the Hand and below
+         * (fingers, the Weapon bone: the held weapon and items do not move) */
+        char cut_list[160];
+        size_t cut_len = 0;
+        cut_list[0] = 0;
+        for (int i = 0; i < n_bones; ++i) {
+            int fore = 0, hand = 0;
+            for (int k = i; k >= 0; k = arms.parent[k]) {
+                if (k == a->hand) { hand = 1; break; }
+                if (k == a->fore) { fore = 1; break; }
+            }
+            if (!fore || hand) continue;
+            arms.cut_of[i] = (uint8_t)(side + 1);
+            if (cut_len + 8 < sizeof(cut_list)) {
+                const int m = snprintf(cut_list + cut_len, sizeof(cut_list) - cut_len, " %d", i);
+                if (m > 0) cut_len += (size_t)m;
+            }
+        }
+        fprintf(stderr, "VR arms: %s wrist cut bones (the Forearm and its helpers, not the Hand subtree):%s\n",
+                side ? "right" : "left", cut_list);
         a->ok = 1;
         fprintf(stderr, "VR arms: %s arm: UpperArm %d Forearm %d Hand %d Weapon %d twist %d/%d; upper %.3f m, forearm %.3f m, "
                         "shoulder (%.3f %.3f %.3f)\n",
@@ -640,6 +778,15 @@ static int arms_target(int side, const VamArmBind *b, VrVec3 shoulder, float bod
         const BbVrPose *gp = &xr_hands.grip[side], *hd = &xr_hands.head;
         head_p = vr_v3(hd->position[0], hd->position[1], hd->position[2]);
         head_q = vr_qnormalize(vr_q(hd->orientation[0], hd->orientation[1], hd->orientation[2], hd->orientation[3]));
+        /* measured against the head the H1 camera was built from, so the head's motion between the two samples and
+         * the camera's head prediction do not move the hands (findings/24 8.2, arm_head=) */
+        if (!vr_arm_pick_head(arms.head_view, view->head_valid, view->head_pos, view->head_rot, head_p, head_q, &head_p, &head_q) &&
+            arms.head_view && view->head_valid && !arms.head_fallback_logged) {
+            arms.head_fallback_logged = 1;
+            fprintf(stderr, "VR arms: arm_head=view: the camera's head is %.2f m from the controllers' head (another space, "
+                            "BB_XR_STAGE?): measured against the controllers' own head\n",
+                    vam_len(vr_sub(view->head_pos, head_p)));
+        }
         grip_p = vr_v3(gp->position[0], gp->position[1], gp->position[2]);
         grip_q = vr_qnormalize(vr_q(gp->orientation[0], gp->orientation[1], gp->orientation[2], gp->orientation[3]));
     }
@@ -681,6 +828,39 @@ static void arms_roll_clavicle(int side, const ArmView *view, VrXform *old, VrXf
     }
 }
 
+/* The wrist cut now (findings/24 section 9): arm_cut (auto: ARM_CUT_AUTO) in first person while hide= hides the
+ * skin's arms (only the bare hands, group 44, are drawn), else 0. Logged when it changes. */
+static float arms_cut_now(int fp_now) {
+    const int hides = vr_fp_hides_arms();
+    const float cut = fp_now && hides ? (arms.cut_set < 0.0f ? ARM_CUT_AUTO : arms.cut_set) : 0.0f;
+    if (cut != arms.cut_logged) {
+        arms.cut_logged = cut;
+        char set[16];
+        if (arms.cut_set < 0.0f) snprintf(set, sizeof(set), "auto");
+        else snprintf(set, sizeof(set), "%.2f", arms.cut_set);
+        fprintf(stderr, "VR arms: wrist cut %.2f (forearm scale %.2f about the wrist; arm_cut %s, first person %d, skin arms hidden %d)\n",
+                cut, vam_cut_scale(cut), set, fp_now, hides);
+    }
+    return cut;
+}
+
+/* Cuts one side's wrist (the bones of arms.cut_of, scaled about the Hand's origin by k; the Hand subtree is not
+ * touched) into neu / scl. */
+static void arms_cut_side(int side, float k, const VrXform *old, VrXform *neu, const uint8_t *ok, uint8_t *dirty, float *scl,
+                          int n_model) {
+    const ArmBones *a = &arms.arm[side];
+    static _Thread_local unsigned char mask[ARM_MAX_BONES];
+    const VrVec3 wrist = (dirty[a->hand] ? neu[a->hand] : old[a->hand]).t;
+    for (int i = 0; i < n_model; ++i) {
+        mask[i] = arms.cut_of[i] == side + 1 && ok[i];
+        if (!mask[i]) continue;
+        if (!dirty[i]) neu[i] = old[i];
+        dirty[i] = 1;
+        scl[i] = 1.0f;
+    }
+    vam_cut_bones(neu, scl, mask, n_model, wrist, k);
+}
+
 static void arms_edit(uintptr_t pose, int which, uint64_t now) {
     float dt = arms.last_us ? (float)(now - arms.last_us) * 1e-6f : 0.0f;
     arms.last_us = now;
@@ -688,6 +868,7 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
 
     ArmView view;
     const int have_view = arm_view_read(&view) && now - view.time_us < ARM_VIEW_STALE_US;
+    VrQuat lead_turn = vr_qidentity(); /* the snapshot's model frame -> the live one */
     if (have_view) { /* a dodge under face=view: the body is at the game's live yaw, not the snapshot's */
         float live;
         if (vr_fp_yaw_live(&live) && fabsf(live - view.yaw) > 1e-4f) {
@@ -695,7 +876,7 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
             view.cam_pos = vr_qrotate(d, view.cam_pos);
             view.cam_rot = vr_qnormalize(vr_qmul(d, view.cam_rot));
             view.shift = vr_qrotate(d, view.shift);
-            view.rel_vel = vr_qrotate(d, view.rel_vel);
+            lead_turn = d;
             view.yaw = live;
         }
     }
@@ -719,15 +900,22 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
     const int evading = arms.roll_detach && fp_now && vr_evade_move(arms.anim) != NULL;
     const int roll_cap = vr_roll_capturing(&arms.roll, evading);
     vr_roll_step(&arms.roll, evading, dt, VR_ROLL_BLEND_S);
-    /* the view is one render old: in an evade the camera moves against the body, so advance it by that (vr_arms_roll.h) */
-    if (have_view && arms.roll.e > 0.0f) view.cam_pos = vr_roll_lead(view.cam_pos, view.rel_vel, dt, arms.roll.e);
+    /* the view is one render old: in an evade the camera moves against the body, so advance it by one frame of
+     * that, low-passed once per H1 snapshot (findings/24 8.1, 8.2; vr_arms_roll.h) */
+    if (have_view) {
+        const VrVec3 vel = vr_roll_lead_update(&arms.lead, view.seq, view.rel_step, view.rel_gap, arms.lead_alpha);
+        if (arms.lead_on && arms.roll.e > 0.0f) view.cam_pos = vr_roll_lead(view.cam_pos, vr_qrotate(lead_turn, vel), dt, arms.roll.e);
+    } else {
+        vr_roll_lead_reset(&arms.lead);
+    }
     if (evading != arms.roll_was) {
         arms.roll_was = evading;
         if (arms.roll_log)
             fprintf(stderr, "VR arms: %s the arms %s the body (anim a%03d_%06d, pins L %d R %d)\n", evading ? "detach" : "attach",
                     evading ? "from" : "to", arms.anim / 1000000, arms.anim % 1000000, arms.roll.has[0], arms.roll.has[1]);
     }
-    if (arms.w <= 0.0f) return;
+    const float cut = arms_cut_now(fp_now);
+    if (arms.w <= 0.0f && cut <= 0.0f) return; /* the cut also runs while the IK weight is 0 (an attack) */
 
     uintptr_t skel;
     if (!rd_ptr(pose, &skel) || !arms_skeleton(skel)) return;
@@ -749,6 +937,26 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
     for (int side = 0; side < 2; ++side) {
         const int p = arms.parent[arms.arm[side].upper];
         if (p >= 0) ok[p] = (uint8_t)vr_xf_from_qs((const float *)(model + (uintptr_t)p * 48), &old[p]);
+    }
+    /* The wrist cut written last time and still there (a second sync of the same pose, or a frame the animation
+     * did not refresh): undone first, so the IK below rebuilds the chain from the real forearm. scl[i] > 0: the
+     * uniform scale written for bone i. */
+    static _Thread_local float scl[ARM_MAX_BONES];
+    for (int i = 0; i < n_model; ++i) scl[i] = 0.0f;
+    for (int side = 0; side < 2; ++side) {
+        const ArmBones *a = &arms.arm[side];
+        const float k = arms.cut_k[side];
+        if (k >= 1.0f || !ok[a->hand]) continue;
+        for (int i = 0; i < n_model; ++i) {
+            if (arms.cut_of[i] != side + 1 || !ok[i]) continue;
+            const float *qs = (const float *)(model + (uintptr_t)i * 48);
+            if (fabsf(qs[8] - k) > 1e-6f || fabsf(qs[9] - k) > 1e-6f || fabsf(qs[10] - k) > 1e-6f) continue; /* fresh */
+            old[i].t = vam_cut_undo(old[i].t, old[a->hand].t, k);
+            neu[i] = old[i];
+            dirty[i] = 1;
+            scl[i] = 1.0f;
+        }
+        arms.cut_k[side] = 1.0f;
     }
 
     /* The virtual upper body (findings/24 5.4): the shoulders turn about the vertical through their
@@ -774,7 +982,7 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
         }
         body_yaw = arms.body_off;
     }
-    for (int side = 0; side < 2; ++side) {
+    for (int side = 0; side < 2 && arms.w > 0.0f; ++side) {
         const ArmBones *a = &arms.arm[side];
         if (!ok[a->upper] || !ok[a->fore] || !ok[a->hand]) continue;
         {   /* already ours (a second getSynced call in the same frame): leave it */
@@ -841,6 +1049,17 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
         }
     }
 
+    /* The wrist cut (findings/24 section 9), after the IK placed the chain: the Forearm and its helpers scaled about
+     * the wrist. The Hand, fingers and Weapon bones keep the transforms above (model space is absolute: writing a
+     * parent does not move its children). */
+    const float cut_k = vam_cut_scale(cut);
+    if (cut_k < 1.0f)
+        for (int side = 0; side < 2; ++side) {
+            if (!arms.arm[side].ok || !ok[arms.arm[side].hand]) continue;
+            arms_cut_side(side, cut_k, old, neu, ok, dirty, scl, n_model);
+            arms.cut_k[side] = cut_k;
+        }
+
     int written = 0;
     for (int i = 0; i < n_model; ++i) {
         if (!dirty[i]) continue;
@@ -849,8 +1068,20 @@ static void arms_edit(uintptr_t pose, int which, uint64_t now) {
         float *qs = (float *)(model + (uintptr_t)i * 48);
         qs[0] = x.t.x; qs[1] = x.t.y; qs[2] = x.t.z;              /* t.w and the scale stay */
         qs[4] = x.q.x; qs[5] = x.q.y; qs[6] = x.q.z; qs[7] = x.q.w;
+        if (scl[i] > 0.0f) qs[8] = qs[9] = qs[10] = scl[i];   /* the wrist cut's uniform scale (qs[11] stays) */
         if (n_flags) ((uint32_t *)flags)[i] |= 1u;                /* local dirty */
         ++written;
+    }
+    if (have_view) { /* the gun aim's barrel source (findings/27 11): the weapon bones as written, relative to this camera */
+        VrQuat wq[2] = {vr_qidentity(), vr_qidentity()};
+        int have[2] = {0, 0};
+        for (int side = 0; side < 2; ++side) {
+            const int wb = arms.arm[side].weapon;
+            if (wb < 0 || wb >= n_model || !dirty[wb] || !vr_qvalid(neu[wb].q)) continue;
+            wq[side] = vg_weapon_in_cam(view.cam_rot, neu[wb].q);
+            have[side] = 1;
+        }
+        if (have[0] || have[1]) arm_weapon_publish(wq, have, now);
     }
     for (int side = 0; side < 2; ++side)
         if (dirty[arms.arm[side].upper])

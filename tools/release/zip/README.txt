@@ -12,6 +12,12 @@ Expect many bugs and crashes. Please be patient: this is a first public test, no
 An unofficial fan project that runs YOUR copy of Bloodborne (PS4, CUSA03173, version 1.09)
 natively on Windows with a Vulkan renderer and an OpenXR bridge for VR headsets.
 
+LINKS
+-----
+* Download (latest version): https://github.com/laughtt/bloodborne-vr/releases/latest
+* Support the project:      https://ko-fi.com/josemauriciocarpioherrera
+* Follow on X:               https://x.com/carpio_her8717
+
 LEGAL
 -----
 * You must own Bloodborne and use your own legally obtained, decrypted dump. NO game files are
@@ -80,7 +86,7 @@ Picture: controls.png in this folder (a labelled controller map).
   Left stick click         Moving: jump. Standing: open / close the dashboard. Held 1 s: recenter
   Right stick              Turn / camera (smooth or snap: Options > Comfort)
   Right stick click        Open the item wheel
-  Left trigger (hold)      Hold the gun; a left-hand thrust shoots
+  Left trigger             Hold: aim the gun (red laser); release: shoot. A left-hand thrust also shoots
   Right trigger            Nothing in the world (pointer click in the dashboard)
   Left grip                Transform (L1)
   Right grip               Heavy / charge modifier for swings; a quick tap swaps the right weapon

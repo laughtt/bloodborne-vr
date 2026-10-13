@@ -6,7 +6,9 @@
  * attack speed does, so the reaction lasts 1/k as long. Same guards: dt 0 (the hit stop that follows a hit)
  * and hitches (dt > 0.2) are left alone.
  *
- * WHICH CLIPS (sub-id = anim % 1000000): DEFAULT_FROM..DEFAULT_TO = 9000..12999. Evidence, and its limit:
+ * WHICH CLIPS (sub-id = anim % 1000000): DEFAULT_FROM..DEFAULT_TO = 20000..20999, read off the headset run of
+ * 2026-10-13 (findings/27 section 9): a003_020100..a003_020900 start right after an enemy's attack behaviour and
+ * the eye drops (knockdown), and no clip in the old guess 9000..12999 ever played. The old evidence, kept for history:
  * findings/13 section 7.4 lists 9000-12999 as "likely damage" (a TAE-side guess, tag [L]); the DS3 head-tracking
  * rules in findings/11 name 10000-15000 as hurt clips (a sister engine; its 5000-5500 is a plain loop in
  * Bloodborne, a000_005000, so that part is NOT used); the play logs show a003_011100 and a003_012000 as the
@@ -17,9 +19,9 @@
  * Excluded on purpose: 100000..104999 (events, gestures, and the likely home of the victim side of grabs and
  * visceral hits, which are timing-locked to the enemy's clip and could desync when scaled), 13000+ (deaths,
  * unconfirmed), attacks (30000-49999), gun shots (51000-52999), dodges (7000s).
- * OFF BY DEFAULT (VR_HURT_SPEED_DEFAULT = 1.0): the feature is postponed because the anim range above is
- * unconfirmed; the code, the keys and BB_VR_HURT_SPEED stay (BB_VR_HURT_SPEED=2 or hurt_speed=2 turns it on).
- * 1 (or less, or not finite) = off. Stays ON while online (co-op) by user decision; the opt-out is
+ * ON BY DEFAULT at 2x (VR_HURT_SPEED_DEFAULT = 2.0, user request 2026-10-13); BB_VR_HURT_RANGE=<from>-<to> still
+ * corrects the range without a rebuild.
+ * BB_VR_HURT_SPEED / hurt_speed= override the default. 1 (or less, or not finite) = off. Stays ON while online (co-op) by user decision; the opt-out is
  * BB_VR_HURT_SPEED_ONLINE=0 (findings/27 section 8 lists what a peer sees). C11, header only. */
 #ifndef VR_HURT_SPEED_H
 #define VR_HURT_SPEED_H
@@ -28,10 +30,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VR_HURT_SPEED_DEFAULT 1.0f /* OFF by default until the anim range is confirmed; set BB_VR_HURT_SPEED=2 to try it */
+#define VR_HURT_SPEED_DEFAULT 2.0f /* ON by default (2x); BB_VR_HURT_SPEED=1 turns it off */
 #define VR_HURT_SPEED_MAX 4.0f
-#define VR_HURT_ANIM_FROM 9000
-#define VR_HURT_ANIM_TO 13000 /* exclusive */
+#define VR_HURT_ANIM_FROM 20000
+#define VR_HURT_ANIM_TO 21000 /* exclusive */
 #define VR_HURT_DT_MAX 0.2f
 
 typedef struct { int from, to; } VrHurtRange; /* sub-ids from..to-1 */

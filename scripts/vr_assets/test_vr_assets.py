@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bbmodel  # noqa: E402
 import catalog  # noqa: E402
 import extract  # noqa: E402
+import held_extract  # noqa: E402
 import souls  # noqa: E402
 
 GAME = Path(os.environ.get('BB_GAME_DIR', 'C:/games/CUSA03173'))
@@ -124,6 +125,34 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(extract.mask_of('arm'), -1)
 
 
+class HeldFormatTests(unittest.TestCase):
+    """held_extract.py on synthetic data: the FXR model layer and the TAE goods effect."""
+
+    def test_fxr_model_layer_and_scale(self):
+        words = [0] * 8
+        at = len(words) * 4
+        layer = [41, 0, 10002, 0]
+        props_at = at + len(layer) * 4
+        values_at = props_at + 3 * 32
+        props = []
+        for k in range(3):
+            props += [11, 0, values_at + 8 * k, 0, values_at + 8 * k + 4, 0, 1, 0]
+        blob = struct.pack(f'<{len(words) + len(layer) + len(props)}i', *words, *layer, *props)
+        blob += struct.pack('<6f', 0.0, 0.75, 0.0, 0.75, 0.0, 0.75) + bytes(16)
+        self.assertEqual(held_extract.fxr_models(blob), [(10002, (0.75, 0.75, 0.75))])
+        # a record that is not a model layer (no 11 after it) is not one
+        self.assertEqual(held_extract.fxr_models(struct.pack('<12i', 0, 0, 41, 0, 10002, 0, 7, 0, 0, 0, 0, 0)), [])
+
+    def test_tae_goods_effect(self):
+        # type 114: i32 base, i16 -, i16 dummy -> ffx base * 100 + sfxVariationId; type 96: ffx, dummy
+        tae = {'anims': [(100081, [(114, 0.833, 1.333, struct.pack('<ihhi', 200, 0, 1, 2)),
+                                   (96, 0.333, 1.967, struct.pack('<iii', 20156, 1, 1)),
+                                   (114, 0.9, 4.0, struct.pack('<ihhi', 202, 0, 220, 3))])]}
+        got = held_extract.anim_effects(tae, 100081, 75)
+        self.assertEqual([(ffx, dummy) for _t, ffx, dummy, _how in got], [(20156, 1), (20075, 1), (20275, 220)])
+        self.assertEqual([ffx for _t, ffx, _d, _h in held_extract.anim_effects(tae, 100081, -1)], [20156])
+
+
 @unittest.skipUnless(HAVE_DUMP, f'no Bloodborne dump at {GAME} (set BB_GAME_DIR)')
 class DumpTests(unittest.TestCase):
     root = catalog.game_root(GAME)
@@ -180,6 +209,36 @@ class DumpTests(unittest.TestCase):
                                                           out))
             refs = {d['ref'] for d in wdoc['dummies']}
             self.assertTrue({100, 110}.issubset(refs))
+
+    def test_held_models(self):
+        """The game's own in-hand models (held_extract.py): the use-animation chain, the real sizes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            index = held_extract.export(self.root, out, quiet=True)
+            self.assertEqual(index['use_anims']['26'], ['a000_100080'])  # Blood Vial
+            self.assertEqual(index['use_anims']['3'], ['a000_100030'])   # the bottles' throw
+            rows = {r['goods']: r for r in index['items']}
+            expect = {1000: 10002, 703: 10002, 1101: 10022, 1120: 10017, 2030: 10023, 1200: 10010,
+                      1220: 10014, 1230: 10012, 1240: 10016, 1250: 10010, 1260: 10015, 1270: 10009,
+                      1201: 10051, 200: 10005, 205: 10006, 225: 10007, 2050: 10025, 2090: 10020, 700: 11012}
+            for goods, mesh in expect.items():
+                self.assertIn(goods, rows)
+                self.assertEqual(rows[goods]['meshes'], [mesh], goods)
+                self.assertEqual(rows[goods]['confidence'], 'game', goods)
+                self.assertIsNotNone(rows[goods]['socket'], goods)
+                self.assertIsNotNone(rows[goods]['grip_socket'], goods)
+            # the FLVER bone transform is applied: the vial is 17.6 cm, not 61 units
+            self.assertAlmostEqual(max(rows[1000]['size_m']), 0.176, delta=0.01)
+            self.assertAlmostEqual(max(rows[1200]['size_m']), 0.296, delta=0.01)
+            self.assertEqual(rows[1000]['chain']['anim'], 'a000_100080')
+            self.assertEqual(rows[1000]['chain']['ffx'], 20156)
+            self.assertEqual(rows[1101]['chain']['ffx'], 20057)  # 200 x 100 + sfxVariationId 57
+            # no model in the game: the stand-ins stay (papers, pellets, coldblood)
+            missing = {m['goods'] for m in index['missing']}
+            self.assertTrue({1300, 1310, 1320, 1330, 1110, 1500}.issubset(missing))
+            self.assertEqual(rows[1100]['confidence'], 'guess')
+            doc, _blob = bbmodel.load(out / 'held' / '1000.json')
+            self.assertEqual(doc['meshes'][0].get('texture'), 's10002')
 
 
 if __name__ == '__main__':
