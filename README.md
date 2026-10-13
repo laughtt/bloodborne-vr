@@ -5,6 +5,8 @@ own PS4 x86-64 code runs natively on a shadPS4-derived Vulkan renderer; an OpenX
 stereo rendering, head tracking, first-person view, controller-driven arms and weapons, and VR
 menus.
 
+**⬇️ [Download](https://github.com/laughtt/bloodborne-vr/releases/latest)** · **☕ [Support on Ko-fi](https://ko-fi.com/josemauriciocarpioherrera)** · **𝕏 [Follow on X](https://x.com/carpio_her8717)**
+
 > **Early alpha.** Single-player is the supported mode; co-op is experimental. Expect bugs and comfort issues.
 >
 > **No game files are included.** You need your own legally obtained, decrypted dump. This is an
